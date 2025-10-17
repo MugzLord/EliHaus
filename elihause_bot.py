@@ -704,7 +704,7 @@ import asyncio
 ROUND_TICK_SECONDS = 5
 ROUND_TASKS: dict[str, asyncio.Task] = {}
 
-async def _tick_round(channel: discord.abc.MessageableChannel, rid: str, exp_iso: str):
+async def _tick_round(channel: discord.abc.Messageable, rid: str, exp_iso: str):
     try:
         try:
             exp_dt = datetime.fromisoformat(exp_iso)
