@@ -22,6 +22,12 @@ try:
 except Exception:
     TZ = timezone.utc
 
+POLICY_TEXT = os.getenv(
+    "ELIHAUS_POLICY",
+    f"**Policy:** To claim your winnings, you must have **10 items** added from **[Shop YaEli]({SHOP_YAELI_URL})**. "
+    f"Failure to comply is subject to **disqualification**."
+)
+
 STICKY_AFTER_MSGS = 15  # bump after this many chat messages
 STICKY_COUNT: dict[int, int] = {}  # channel_id -> counter since last bump
 
@@ -1505,5 +1511,14 @@ async def eh_leaderboard(
             ephemeral=True
         )
 
+@bot.tree.command(name="eh_policy", description="Show the EliHaus prize/claim policy")
+@app_commands.describe(public="Post in channel (True) or show only to you (False)")
+async def eh_policy(interaction: discord.Interaction, public: bool = False):
+    e = discord.Embed(
+        title="📜 EliHaus Policy",
+        description=POLICY_TEXT,
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=e, ephemeral=not public)
 
 bot.run(TOKEN)
