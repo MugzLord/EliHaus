@@ -767,7 +767,11 @@ def get_balance(uid: str) -> int:
         row = c.fetchone()
         return row[0] if row else 0
 
+ALLOWED_TX_KINDS = {"claim", "bet", "payout", "redeem", "lotto", "starter", "wl_deposit"}
+
 def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
+    if kind not in ALLOWED_TX_KINDS:
+        raise ValueError(f"Balance change blocked for kind='{kind}'.")
     ensure_user(uid)
     with db() as conn:
         c = conn.cursor()
@@ -776,6 +780,7 @@ def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
                   (uid, kind, delta, meta, iso(now_local())))
         c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
         return c.fetchone()[0]
+
 
 # ---- Help (slash) ----
 @bot.tree.command(name="eh_help", description="Show EliHaus commands")
@@ -983,32 +988,69 @@ async def eh_balance(interaction: discord.Interaction, member: discord.Member | 
     bal = get_balance(str(m.id))
     await interaction.response.send_message(f"{m.mention} has **{bal}** coins.", ephemeral=True)
 
-# ---- Admin: deposit/withdraw ----
-@bot.tree.command(name="eh_deposit", description="(Admin) Deposit coins into a user's balance")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(member="Member to deposit to", amount="Positive amount")
-async def eh_deposit(interaction: discord.Interaction, member: discord.Member, amount: int):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+@bot.tree.command(name="eh_deposit", description="Deposit your coins to convert to WL gifts (creates a staff ticket)")
+@app_commands.describe(
+    amount="How many coins to deposit",
+    imvu="Your IMVU username or profile URL",
+    note="Anything staff should know (optional)"
+)
+async def eh_deposit(interaction: discord.Interaction, amount: int, imvu: str, note: str | None = None):
+    uid = str(interaction.user.id)
     if amount <= 0:
         return await interaction.response.send_message("Amount must be positive.", ephemeral=True)
-    new_bal = change_balance(str(member.id), amount, "adjust", f"deposit by {interaction.user.id}")
-    await interaction.response.send_message(f"Deposited **{amount}** to {member.mention}. Balance: **{new_bal}**", ephemeral=True)
 
-@bot.tree.command(name="eh_withdraw", description="(Admin) Withdraw coins from a user's balance")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(member="Member to withdraw from", amount="Positive amount")
-async def eh_withdraw(interaction: discord.Interaction, member: discord.Member, amount: int):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    if amount <= 0:
-        return await interaction.response.send_message("Amount must be positive.", ephemeral=True)
-    uid = str(member.id)
+    # balance check
     bal = get_balance(uid)
     if bal < amount:
-        return await interaction.response.send_message("Insufficient user balance.", ephemeral=True)
-    new_bal = change_balance(uid, -amount, "adjust", f"withdraw by {interaction.user.id}")
-    await interaction.response.send_message(f"Withdrew **{amount}** from {member.mention}. Balance: **{new_bal}**", ephemeral=True)
+        return await interaction.response.send_message(
+            f"Insufficient coins. Need **{amount}**, you have **{bal}**.",
+            ephemeral=True
+        )
+
+    # deduct immediately (kind = wl_deposit)
+    new_bal = change_balance(uid, -amount, "wl_deposit", meta=f"wl_deposit by user; imvu={imvu}")
+
+    # open (or create) the WL tickets category
+    cat = await _get_or_create_tickets_category(interaction.guild)
+    if not cat:
+        return await interaction.response.send_message(
+            "Could not create a ticket channel. Please ping an admin.",
+            ephemeral=True
+        )
+
+    # create a private ticket for this user + staff
+    overwrites = {
+        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
+    }
+    if TICKETS_STAFF_ROLE_ID:
+        role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+
+    ticket_name = f"wl-deposit-{interaction.user.name[:16].lower()}-{int(now_local().timestamp())}"
+    ticket = await interaction.guild.create_text_channel(ticket_name, category=cat, overwrites=overwrites, reason="EliHaus WL deposit")
+
+    # post details in the ticket
+    staff_tag = f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"
+    e = discord.Embed(
+        title="💳 WL Conversion Request",
+        description=f"{interaction.user.mention} deposited **{amount}** coins to convert to wishlist gifts.",
+        color=discord.Color.gold(),
+        timestamp=now_local()
+    )
+    e.add_field(name="IMVU", value=imvu, inline=False)
+    e.add_field(name="Notes", value=(note or "—"), inline=False)
+    e.add_field(name="New Balance", value=str(new_bal), inline=True)
+
+    await ticket.send(content=staff_tag, embed=e)
+
+    # confirm to the user
+    await interaction.response.send_message(
+        f"✅ Deposited **{amount}** coins. Ticket created: {ticket.mention}\n"
+        f"Balance: **{bal} ➜ {new_bal}**",
+        ephemeral=True
+    )
 
 # ---- Roulette: open/status/resolve/cancel ----
 @bot.tree.command(name="eh_openround", description="(Admin) Open a roulette round")
@@ -1376,6 +1418,92 @@ async def on_message(message: discord.Message):
             await _bump_round_message(message.channel, rid)
         except Exception:
             pass
+from datetime import timedelta
+
+def _mention_or_id(guild: discord.Guild | None, uid: str) -> str:
+    m = guild.get_member(int(uid)) if guild else None
+    return m.mention if m else f"<@{uid}>"
+
+@bot.tree.command(name="eh_leaderboard", description="Show top players by balance or roulette net")
+@app_commands.describe(
+    mode="balance (default), roulette_week, or roulette_all",
+    public="Post in channel (True) or show only to you (False)"
+)
+async def eh_leaderboard(
+    interaction: discord.Interaction,
+    mode: str = "balance",
+    public: bool = False
+):
+    # prevent 3s timeout
+    await interaction.response.defer(ephemeral=not public, thinking=True)
+
+    mode = (mode or "balance").lower().strip()
+    guild = interaction.guild
+
+    try:
+        if mode == "balance":
+            with db() as conn:
+                c = conn.cursor()
+                c.execute("SELECT discord_id, balance FROM users ORDER BY balance DESC LIMIT 10")
+                rows = c.fetchall()
+            title = "🏆 EliHaus Leaderboard — Balance"
+            footer = "Top 10 richest players"
+            items = [(_mention_or_id(guild, uid), bal) for uid, bal in rows]
+
+        elif mode in ("roulette_week", "roulette_all"):
+            # net = payouts − bets; bets are stored negative already
+            q_time = ""
+            params = ()
+            if mode == "roulette_week":
+                since = (now_local() - timedelta(days=7)).isoformat()
+                q_time = "AND ts >= ?"
+                params = (since,)
+
+            with db() as conn:
+                c = conn.cursor()
+                c.execute(f"""
+                    SELECT discord_id, COALESCE(SUM(amount),0) AS net
+                    FROM tx
+                    WHERE kind IN ('bet','payout') {q_time}
+                    GROUP BY discord_id
+                    HAVING net != 0
+                    ORDER BY net DESC
+                    LIMIT 10
+                """, params)
+                rows = c.fetchall()
+
+            title = "🎰 Roulette Leaderboard — Weekly Net" if mode == "roulette_week" \
+                    else "🎰 Roulette Leaderboard — All-Time Net"
+            footer = "Net = payouts − bets"
+            items = [(_mention_or_id(guild, uid), net) for uid, net in rows]
+
+        else:
+            await interaction.followup.send(
+                "Unknown mode. Use `balance`, `roulette_week`, or `roulette_all`.",
+                ephemeral=not public
+            )
+            return
+
+        e = discord.Embed(title=title, color=discord.Color.gold(), timestamp=now_local())
+        if not items:
+            e.description = "_No data yet._"
+        else:
+            medals = ["🥇","🥈","🥉"]
+            lines = []
+            for i, (name, val) in enumerate(items, start=1):
+                tag = medals[i-1] if i <= 3 else f"{i:>2}."
+                lines.append(f"{tag} {name} — **{val:,}**")
+            e.description = "\n".join(lines)
+        e.set_footer(text=footer)
+
+        await interaction.followup.send(embed=e, ephemeral=not public)
+
+    except Exception as e:
+        # surface the exact error to you ephemerally
+        await interaction.followup.send(
+            f"⚠️ Leaderboard error: `{type(e).__name__}: {e}`",
+            ephemeral=True
+        )
 
 
 bot.run(TOKEN)
