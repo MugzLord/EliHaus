@@ -130,6 +130,7 @@ def init_db():
         )""")
 init_db()
 
+
 # ---- Helpers ----
 def now_local():
     return datetime.now(TZ)
@@ -222,6 +223,134 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
                        "ready", iso(now_local()), iso(now_local())))
             c.execute("UPDATE prizes SET status='claimed', updated_ts=? WHERE id=?", (iso(now_local()), self.prize_id))
         await interaction.response.send_message("Thanks! Your WL gift claim is queued. An admin will fulfil it shortly. ✅", ephemeral=True)
+
+# ===== UI: Bet Buttons + Modal =====
+# ===== UI: Bet Buttons + Modal (with dropdown colour) =====
+class BetModal(discord.ui.Modal, title="Place Your Bet"):
+    def __init__(self, rid: str, preselect_color: str = "red"):
+        super().__init__()
+        self.rid = rid
+
+        self.amount = discord.ui.TextInput(
+            label="Bet Amount (coins)",
+            placeholder="e.g., 1000",
+            required=True,
+            max_length=10
+        )
+        self.add_item(self.amount)
+
+        # Dropdown for colour (preselect based on the button clicked)
+        class ColorSelect(discord.ui.Select):
+            def __init__(self, default_value: str):
+                options = [
+                    discord.SelectOption(label="red", description="Pays 2×", emoji="🟥", default=(default_value=="red")),
+                    discord.SelectOption(label="black", description="Pays 2×", emoji="⬛", default=(default_value=="black")),
+                    discord.SelectOption(label="green", description=f"Pays {PAYOUT_GREEN}×", emoji="🟩", default=(default_value=="green")),
+                ]
+                super().__init__(placeholder="Choose colour", min_values=1, max_values=1, options=options)
+                self.value_chosen = default_value
+
+            async def callback(self, interaction: discord.Interaction):
+                self.value_chosen = self.values[0]
+                await interaction.response.defer()  # just acknowledge; submit will handle
+
+        self.color_select = ColorSelect(preselect_color)
+        self.add_item(self.color_select)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+
+        # validate round still open
+        o = get_open_round(interaction.channel.id)
+        if not o:
+            return await interaction.response.send_message("No open round in this channel.", ephemeral=True)
+        rid_live, exp = o
+        if rid_live != self.rid:
+            return await interaction.response.send_message("That round closed or changed. Bet again.", ephemeral=True)
+        if now_local() > exp:
+            return await interaction.response.send_message("Betting window is closed for this round.", ephemeral=True)
+
+        # parse amount
+        try:
+            amount = int(str(self.amount.value).replace(",", "").strip())
+        except Exception:
+            return await interaction.response.send_message("Amount must be a number.", ephemeral=True)
+        if amount <= 0 or amount > MAX_STAKE:
+            return await interaction.response.send_message(f"Amount must be between 1 and {MAX_STAKE}.", ephemeral=True)
+
+        # colour from dropdown
+        color = getattr(self.color_select, "value_chosen", "red")
+        if color not in ("red","black","green"):
+            return await interaction.response.send_message("Pick red, black, or green.", ephemeral=True)
+
+        # place bet (same rules as !bet)
+        ensure_user(uid)
+        with db() as conn:
+            c = conn.cursor()
+            if ONE_BET_PER_ROUND:
+                c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
+                if c.fetchone():
+                    return await interaction.response.send_message("You already placed a bet this round.", ephemeral=True)
+
+            c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
+            bal = c.fetchone()[0]
+            if bal < amount:
+                return await interaction.response.send_message(f"Insufficient coins. Balance **{bal}**.", ephemeral=True)
+
+            # escrow & record
+            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (amount, uid))
+            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                      (uid, "bet", -amount, f"roulette:{self.rid}|{color}", iso(now_local())))
+            c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
+                      (self.rid, str(interaction.channel.id), uid, color, amount, iso(now_local())))
+
+        await interaction.response.send_message(
+            f"✅ Bet placed: **{amount}** on **{color.upper()}** for round `{self.rid}`.",
+            ephemeral=True
+        )
+
+        # optional: refresh embed stats
+        try:
+            with db() as conn:
+                c = conn.cursor()
+                c.execute("SELECT message_id FROM rounds WHERE rid=?", (self.rid,))
+                r = c.fetchone()
+            if r and r[0]:
+                msg = await interaction.channel.fetch_message(int(r[0]))
+                with db() as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (self.rid,))
+                    cnt, pool = c.fetchone()
+                if msg.embeds:
+                    e = msg.embeds[0]
+                    e.clear_fields()
+                    # seconds left
+                    _, exp2 = get_open_round(interaction.channel.id)
+                    left = max(0, int((exp2 - now_local()).total_seconds()))
+                    e.add_field(name="Pool", value=str(pool), inline=True)
+                    e.add_field(name="Time", value=f"{left}s left", inline=True)
+                    e.add_field(name="Bets", value=str(cnt), inline=True)
+                    await msg.edit(embed=e)
+        except Exception:
+            pass
+
+
+class BetView(discord.ui.View):
+    def __init__(self, rid: str, timeout: int | None = None):
+        super().__init__(timeout=timeout or 120)
+        self.rid = rid
+
+    @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger, emoji="🟥")
+    async def bet_red(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BetModal(self.rid, preselect_color="red"))
+
+    @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="⬛")
+    async def bet_black(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BetModal(self.rid, preselect_color="black"))
+
+    @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🟩")
+    async def bet_green(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BetModal(self.rid, preselect_color="green"))
 
 # ---- Commands: Coins ----
 @bot.command(name="joinhaus")
@@ -331,13 +460,24 @@ def get_open_round(channel_id: int) -> tuple[str, datetime] | None:
 async def openround(ctx: commands.Context, seconds: int = ROUND_SECONDS_DEFAULT):
     if get_open_round(ctx.channel.id):
         return await ctx.reply("There’s already an open round in this channel.")
+
     rid, exp = open_round(ctx.channel.id, seconds, str(ctx.author.id))
-    embed = discord.Embed(title=f"🎯 Roulette — Round {rid}", description=f"Bet window: **{seconds}s**\nUse `!bet <amount> <red|black|green>`", color=discord.Color.gold())
+
+    embed = discord.Embed(
+        title=f"🎯 Roulette — Round {rid}",
+        description="Click a button to bet. A modal will ask your amount.\n"
+                    "You can still change colour in the modal if you mis-click.",
+        color=discord.Color.gold()
+    )
     embed.add_field(name="Pool", value="0", inline=True)
-    embed.add_field(name="Time", value=f"closes ~ {exp.strftime('%H:%M:%S')}", inline=True)
-    msg = await ctx.reply(embed=embed)
+    embed.add_field(name="Time", value=f"{seconds}s left", inline=True)
+    embed.add_field(name="Bets", value="0", inline=True)
+    view = BetView(rid, timeout=seconds + 30)  # keep the view alive a bit longer than the window
+    msg = await ctx.reply(embed=embed, view=view)
+
     with db() as conn:
         conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
+
 
 @bot.command(name="round")
 async def round_status(ctx: commands.Context):
