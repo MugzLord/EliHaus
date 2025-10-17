@@ -281,7 +281,7 @@ class ClaimView(discord.ui.View):
         return get_state(ClaimView._round_label_key(rid)) or rid
 
     @staticmethod
-       def short_seed(s: str, n: int = 6) -> str:
+    def short_seed(s: str, n: int = 6) -> str:
         return f"{s[:n]}…{s[-n:]}" if s and len(s) > 2 * n else (s or "")
 
     # ---- Claim button ----
