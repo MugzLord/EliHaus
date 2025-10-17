@@ -1524,4 +1524,285 @@ async def eh_policy(interaction: discord.Interaction, public: bool = False):
     )
     await interaction.response.send_message(embed=e, ephemeral=not public)
 
+# =========================
+# 🎰 Emoji Slots (Shared Pot) — FULL ADD-ON
+# =========================
+
+# ---- Config ----
+SLOTS_COST = int(os.getenv("SLOTS_COST", "500"))            # coins per spin
+SLOTS_SEED = int(os.getenv("SLOTS_SEED", "1000"))           # minimum pot floor per channel
+SLOTS_MAX_SPINS = int(os.getenv("SLOTS_MAX_SPINS", "5"))    # spins per modal submission
+SLOTS_EMOJIS = ["🍒", "🍋", "🍇", "🍀", "⭐", "💎", "7️⃣"]
+
+# payout rules (from the pot; pot never goes below seed)
+SLOTS_PAYOUT_TRIPLE = float(os.getenv("SLOTS_PAYOUT_TRIPLE", "0.80"))  # 80% of (pot - seed)
+SLOTS_PAYOUT_DOUBLE = int(os.getenv("SLOTS_PAYOUT_DOUBLE", "2000"))    # flat, capped by available
+
+# ---- DB bootstrap (safe to call multiple times) ----
+def _init_slots_tables():
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS slots_spins(
+            id INTEGER PRIMARY KEY,
+            channel_id TEXT,
+            discord_id TEXT,
+            r1 TEXT, r2 TEXT, r3 TEXT,
+            win INTEGER,            -- amount paid out
+            pot_before INTEGER,     -- pot before paying win
+            ts TEXT
+        )""")
+
+# call it once at import
+_init_slots_tables()
+
+# ---- State keys ----
+def _slots_pot_key(channel_id: int) -> str:
+    return f"slots:pot:{channel_id}"
+
+def _slots_msg_key(channel_id: int) -> str:
+    return f"slots:msg:{channel_id}"
+
+# ---- Pot helpers ----
+def get_slots_pot(channel_id: int) -> int:
+    val = get_state(_slots_pot_key(channel_id))
+    if val is None:
+        set_state(_slots_pot_key(channel_id), str(SLOTS_SEED))
+        return SLOTS_SEED
+    try:
+        return int(val)
+    except Exception:
+        set_state(_slots_pot_key(channel_id), str(SLOTS_SEED))
+        return SLOTS_SEED
+
+def set_slots_pot(channel_id: int, pot: int):
+    # Pot can never fall below the configured seed
+    set_state(_slots_pot_key(channel_id), str(max(pot, SLOTS_SEED)))
+
+# ---- UI: Modal + View ----
+class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
+    spins = discord.ui.TextInput(
+        label=f"How many spins? (1–{SLOTS_MAX_SPINS})",
+        placeholder="1",
+        required=True,
+        max_length=2
+    )
+
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=180)
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # parse count
+        try:
+            n = int(str(self.spins).strip())
+        except Exception:
+            return await interaction.response.send_message("Enter a valid number of spins.", ephemeral=True)
+        if n < 1 or n > SLOTS_MAX_SPINS:
+            return await interaction.response.send_message(
+                f"Spins must be between 1 and {SLOTS_MAX_SPINS}.", ephemeral=True
+            )
+
+        uid = str(interaction.user.id)
+        ensure_user(uid)
+
+        total_cost = SLOTS_COST * n
+        bal = get_balance(uid)
+        if bal < total_cost:
+            return await interaction.response.send_message(
+                f"Insufficient coins. **{total_cost}** required for {n} spin(s). Balance **{bal}**.",
+                ephemeral=True
+            )
+
+        # charge upfront
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (total_cost, uid))
+            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                      (uid, "bet", -total_cost, f"slots|entry x{n}", iso(now_local())))
+
+        # add to pot
+        pot = get_slots_pot(self.channel_id) + total_cost
+        set_slots_pot(self.channel_id, pot)
+
+        total_win = 0
+        lines = []
+        last_roll = "—"
+        last_win = 0
+
+        for i in range(1, n + 1):
+            # spin
+            r1, r2, r3 = random.choice(SLOTS_EMOJIS), random.choice(SLOTS_EMOJIS), random.choice(SLOTS_EMOJIS)
+            available = max(0, pot - SLOTS_SEED)
+            win = 0
+            if r1 == r2 == r3:
+                win = int(available * SLOTS_PAYOUT_TRIPLE)
+            elif (r1 == r2) or (r1 == r3) or (r2 == r3):
+                win = min(SLOTS_PAYOUT_DOUBLE, available)
+
+            pot_before = pot
+            if win > 0:
+                pot -= win
+                set_slots_pot(self.channel_id, pot)
+                total_win += win
+
+            # record spin
+            with db() as conn:
+                c = conn.cursor()
+                c.execute("""INSERT INTO slots_spins(channel_id,discord_id,r1,r2,r3,win,pot_before,ts)
+                             VALUES(?,?,?,?,?,?,?,?)""",
+                          (str(self.channel_id), uid, r1, r2, r3, win, pot_before, iso(now_local())))
+
+            sign = f"+{win}" if win else "—"
+            lines.append(f"{i}. {r1}{r2}{r3} → {sign}")
+            last_roll, last_win = f"{r1}{r2}{r3}", win
+
+        # pay out once after bundle
+        if total_win > 0:
+            with db() as conn:
+                c = conn.cursor()
+                c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (total_win, uid))
+                c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                          (uid, "payout", total_win, f"slots|bundle x{n}", iso(now_local())))
+
+        # refresh the panel
+        try:
+            mid = get_state(_slots_msg_key(self.channel_id))
+            if mid:
+                panel = await interaction.channel.fetch_message(int(mid))
+                if panel.embeds:
+                    e = panel.embeds[0]
+                else:
+                    e = discord.Embed(color=discord.Color.gold())
+                e.clear_fields()
+                e.title = "🎰 Emoji Slots — Shared Pot"
+                e.description = (
+                    f"Entry: **{SLOTS_COST}** coins per spin.\n"
+                    f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
+                    f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**.\n"
+                    f"Pot never drops below seed **{SLOTS_SEED}**."
+                )
+                e.add_field(name="Pot", value=str(get_slots_pot(self.channel_id)), inline=True)
+                e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
+                e.add_field(
+                    name="Last roll",
+                    value=f"{last_roll} → {'+'+str(last_win) if last_win else '—'}",
+                    inline=False
+                )
+                await panel.edit(embed=e, view=SlotsView(self.channel_id))
+        except Exception:
+            pass
+
+        # ephemeral summary
+        show = 6
+        body = "\n".join(lines[:show]) + (f"\n… and {len(lines)-show} more." if len(lines) > show else "")
+        await interaction.response.send_message(
+            f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
+            ephemeral=True
+        )
+
+class SlotsView(discord.ui.View):
+    def __init__(self, channel_id: int, timeout: int | None = None):
+        super().__init__(timeout=timeout or None)
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="Spin 🎰", style=discord.ButtonStyle.primary)
+    async def spin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SlotsModal(self.channel_id))
+
+# ---- Slash Commands ----
+
+# (admin) open a panel in the current channel
+@bot.tree.command(name="slots_open", description="(admin) Open a Shared-Pot Emoji Slots panel here")
+async def slots_open(interaction: discord.Interaction):
+    if not (interaction.user.guild_permissions.manage_guild or interaction.guild.owner_id == interaction.user.id):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+
+    pot = get_slots_pot(interaction.channel.id)
+    e = discord.Embed(
+        title="🎰 Emoji Slots — Shared Pot",
+        description=(
+            f"Entry: **{SLOTS_COST}** coins per spin.\n"
+            f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
+            f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**.\n"
+            f"Pot never drops below seed **{SLOTS_SEED}**."
+        ),
+        color=discord.Color.gold()
+    )
+    e.add_field(name="Pot", value=str(pot), inline=True)
+    e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
+
+    view = SlotsView(interaction.channel.id)
+    msg = await interaction.channel.send(embed=e, view=view)
+
+    set_state(_slots_msg_key(interaction.channel.id), str(msg.id))
+    try:
+        await msg.pin(reason="EliHaus Slots panel")
+    except Exception:
+        pass
+
+    await interaction.response.send_message("Slots panel posted.", ephemeral=True)
+
+# user: get a jump link to panel
+@bot.tree.command(name="slots_panel", description="Get a jump link to the Slots panel")
+async def slots_panel(interaction: discord.Interaction):
+    mid = get_state(_slots_msg_key(interaction.channel.id))
+    if not mid:
+        return await interaction.response.send_message("No Slots panel in this channel.", ephemeral=True)
+    url = f"https://discord.com/channels/{interaction.guild.id}/{interaction.channel.id}/{mid}"
+    await interaction.response.send_message(f"⤵️ Jump to Slots panel:\n{url}", ephemeral=True)
+
+# (admin) reset pot to seed & refresh the panel
+@bot.tree.command(name="slots_reset", description="(admin) Reset the Slots pot to the seed amount")
+async def slots_reset(interaction: discord.Interaction):
+    if not (interaction.user.guild_permissions.manage_guild or interaction.guild.owner_id == interaction.user.id):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+
+    set_slots_pot(interaction.channel.id, SLOTS_SEED)
+
+    # refresh panel if exists
+    try:
+        mid = get_state(_slots_msg_key(interaction.channel.id))
+        if mid:
+            panel = await interaction.channel.fetch_message(int(mid))
+            if panel.embeds:
+                e = panel.embeds[0]
+            else:
+                e = discord.Embed(color=discord.Color.gold())
+            e.clear_fields()
+            e.title = "🎰 Emoji Slots — Shared Pot"
+            e.description = (
+                f"Entry: **{SLOTS_COST}** coins per spin.\n"
+                f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
+                f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**."
+            )
+            e.add_field(name="Pot", value=str(SLOTS_SEED), inline=True)
+            e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
+            await panel.edit(embed=e, view=SlotsView(interaction.channel.id))
+    except Exception:
+        pass
+
+    await interaction.response.send_message("Slots pot reset to seed.", ephemeral=True)
+
+# top winners (by total coins won) in this channel
+@bot.tree.command(name="slots_top", description="Show top Slots winners (by total coins won) for this channel")
+async def slots_top(interaction: discord.Interaction):
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT discord_id, COALESCE(SUM(win),0) AS total
+                     FROM slots_spins
+                     WHERE channel_id=?
+                     GROUP BY discord_id
+                     HAVING total>0
+                     ORDER BY total DESC
+                     LIMIT 10""", (str(interaction.channel.id),))
+        rows = c.fetchall()
+    if not rows:
+        return await interaction.response.send_message("No wins yet.", ephemeral=True)
+    lines = []
+    for i, (uid, total) in enumerate(rows, start=1):
+        m = interaction.guild.get_member(int(uid))
+        name = m.mention if m else f"<@{uid}>"
+        lines.append(f"{i}. {name} — **{total}**")
+    await interaction.response.send_message("**Slots Top Winners**\n" + "\n".join(lines), ephemeral=True)
+
 bot.run(TOKEN)
