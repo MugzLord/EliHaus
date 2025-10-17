@@ -1379,24 +1379,22 @@ async def on_ready():
     except Exception as e:
         print(f"[EliHaus] Slash sync failed: {e}")
 
-@bot.tree.command(name="eh_sync", description="(Admin) Force refresh EliHaus slash commands")
-@app_commands.default_permissions(manage_guild=True)
+@bot.tree.command(name="eh_sync", description="(admin) Re-sync slash commands")
 async def eh_sync(interaction: discord.Interaction):
+    if not (interaction.user.guild_permissions.manage_guild or interaction.guild.owner_id == interaction.user.id):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        # Prefer fast per-guild sync while testing
-        gid = int(os.getenv("TEST_GUILD_ID", "0"))
-        if gid:
-            guild = discord.Object(id=gid)
-            # Clear guild cmds then mirror current globals, then sync
-            bot.tree.clear_commands(guild=guild)
-            bot.tree.copy_global_to(guild=guild)
-            cmds = await bot.tree.sync(guild=guild)
-            return await interaction.response.send_message(f"✅ Synced {len(cmds)} commands to guild {gid}.", ephemeral=True)
-        # Otherwise do global sync
-        cmds = await bot.tree.sync()
-        await interaction.response.send_message(f"✅ Globally synced {len(cmds)} commands.", ephemeral=True)
+        # Fast guild sync (instant)
+        if interaction.guild:
+            await bot.tree.sync(guild=interaction.guild)
+        # Global sync (removes old globals)
+        await bot.tree.sync()
+        msg = "✅ Synced slash commands (guild + global)."
     except Exception as e:
-        await interaction.response.send_message(f"❌ Sync error: {e}", ephemeral=True)
+        msg = f"❌ Sync error: {e!s}"
+    await interaction.followup.send(msg, ephemeral=True)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -1712,35 +1710,51 @@ class SlotsView(discord.ui.View):
 # ---- Slash Commands ----
 
 # (admin) open a panel in the current channel
+from discord import app_commands
+import discord
+
+# Optional: scope to your guild for instant updates (set GUILD_ID earlier)
+# @app_commands.guilds(discord.Object(id=GUILD_ID))
 @bot.tree.command(name="slots_open", description="(admin) Open a Shared-Pot Emoji Slots panel here")
 async def slots_open(interaction: discord.Interaction):
+    # basic admin gate
     if not (interaction.user.guild_permissions.manage_guild or interaction.guild.owner_id == interaction.user.id):
         return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
 
-    pot = get_slots_pot(interaction.channel.id)
-    e = discord.Embed(
-        title="🎰 Emoji Slots — Shared Pot",
-        description=(
-            f"Entry: **{SLOTS_COST}** coins per spin.\n"
-            f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
-            f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**.\n"
-            f"Pot never drops below seed **{SLOTS_SEED}**."
-        ),
-        color=discord.Color.gold()
-    )
-    e.add_field(name="Pot", value=str(pot), inline=True)
-    e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
+    # 1) ACK within 3s so Discord doesn't expire the interaction
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-    view = SlotsView(interaction.channel.id)
-    msg = await interaction.channel.send(embed=e, view=view)
-
-    set_state(_slots_msg_key(interaction.channel.id), str(msg.id))
     try:
-        await msg.pin(reason="EliHaus Slots panel")
-    except Exception:
-        pass
+        pot = get_slots_pot(interaction.channel.id)
 
-    await interaction.response.send_message("Slots panel posted.", ephemeral=True)
+        e = discord.Embed(
+            title="🎰 Emoji Slots — Shared Pot",
+            description=(
+                f"Entry: **{SLOTS_COST}** coins per spin.\n"
+                f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
+                f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**.\n"
+                f"Pot never drops below seed **{SLOTS_SEED}**."
+            ),
+            color=discord.Color.gold()
+        )
+        e.add_field(name="Pot", value=str(pot), inline=True)
+        e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
+
+        view = SlotsView(interaction.channel.id)
+        msg = await interaction.channel.send(embed=e, view=view)
+
+        set_state(_slots_msg_key(interaction.channel.id), str(msg.id))
+        try:
+            await msg.pin(reason="EliHaus Slots panel")
+        except Exception:
+            pass
+
+        # 3) Final reply
+        await interaction.followup.send("Slots panel posted.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to post panel: {e}", ephemeral=True)
+
 
 # user: get a jump link to panel
 @bot.tree.command(name="slots_panel", description="Get a jump link to the Slots panel")
