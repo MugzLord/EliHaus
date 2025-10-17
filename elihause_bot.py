@@ -46,6 +46,18 @@ PAYOUT_GREEN = 14.0             # enable green flavour
 MAX_STAKE = 50_000
 ONE_BET_PER_ROUND = True
 
+# --- Ticket system config ---
+# Option A: set a fixed Category ID via env (recommended)
+TICKETS_CATEGORY_ID = int(os.getenv("TICKETS_CATEGORY_ID", "0"))  # e.g. 123456789012345678
+# Option B: if no ID, bot will look for (or create) a category with this name:
+TICKETS_CATEGORY_NAME = os.getenv("TICKETS_CATEGORY_NAME", "🎟️ wl-claims")
+# Optional staff role who can see all tickets (ID). If 0, only admins + winner can see.
+TICKETS_STAFF_ROLE_ID = int(os.getenv("TICKETS_STAFF_ROLE_ID", "0"))
+
+# --- Shop link used in the policy note (make this your real IMVU shop URL) ---
+SHOP_YAELI_URL = os.getenv("https://www.imvu.com/shop/web_search.php?manufacturers_id=360644281")  # <- put your real shop link here
+
+
 # ---- DB ----
 DB_PATH = os.getenv("ELIHAUS_DB", "elihause.db")
 
@@ -136,6 +148,27 @@ init_db()
 
 
 # ---- Helpers ----
+# ---- State keys for prize announce message & ticket channel ----
+def _prize_msg_key(prize_id: int) -> str:
+    return f"prize_msg:{prize_id}"
+
+def _prize_ticket_key(prize_id: int) -> str:
+    return f"prize_ticket:{prize_id}"
+
+async def _get_or_create_tickets_category(guild: discord.Guild) -> discord.CategoryChannel | None:
+    if TICKETS_CATEGORY_ID:
+        cat = guild.get_channel(TICKETS_CATEGORY_ID)
+        if isinstance(cat, discord.CategoryChannel):
+            return cat
+    # fallback: by name
+    for ch in guild.categories:
+        if ch.name == TICKETS_CATEGORY_NAME:
+            return ch
+    try:
+        return await guild.create_category(TICKETS_CATEGORY_NAME, reason="EliHaus WL claims")
+    except Exception:
+        return None
+
 def now_local():
     return datetime.now(TZ)
 
@@ -190,6 +223,12 @@ def round_key(channel_id: int) -> str:
     return f"round:{channel_id}"
 
 # ---- Views/Modals for prize claim ----
+class DisabledClaimView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        btn = discord.ui.Button(label="Claim WL Gifts", style=discord.ButtonStyle.secondary, disabled=True)
+        self.add_item(btn)
+
 class ClaimView(discord.ui.View):
     def __init__(self, prize_id: int, timeout: int = 600):
         super().__init__(timeout=timeout)
@@ -197,9 +236,21 @@ class ClaimView(discord.ui.View):
 
     @discord.ui.button(label="Claim WL Gifts", style=discord.ButtonStyle.primary)
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # remember the announce message ID so we can grey the button later
+        set_state(_prize_msg_key(self.prize_id), str(interaction.message.id))
+
         if str(interaction.user.id) != self._winner_id_from_prize(self.prize_id):
             return await interaction.response.send_message("Only the winner can claim this prize.", ephemeral=True)
+
+        # disable immediately to prevent double-click spam
+        try:
+            await interaction.message.edit(view=DisabledClaimView())
+        except Exception:
+            pass
+        # then open the modal:
         await interaction.response.send_modal(ClaimModal(self.prize_id))
+
+   
 
     def _winner_id_from_prize(self, pid: int) -> str:
         with db() as conn:
@@ -207,6 +258,7 @@ class ClaimView(discord.ui.View):
             c.execute("SELECT winner_id FROM prizes WHERE id=?", (pid,))
             row = c.fetchone()
             return row[0] if row else ""
+
 
     # ---- Pretty round labels (per channel) ----
     def _round_counter_key(channel_id: int) -> str:
@@ -227,8 +279,9 @@ class ClaimView(discord.ui.View):
     def get_round_label(rid: str) -> str:
         return get_state(_round_label_key(rid)) or rid  # fallback to full rid if missing
 
-    def short_seed(s: str, n: int = 8) -> str:
-        return f"{s[:n]}…{s[-n:]}" if s and len(s) > 2*n else s
+    # Shorten long strings like seeds
+    def short_seed(s: str, n: int = 6) -> str:
+        return f"{s[:n]}…{s[-n:]}" if s and len(s) > 2 * n else s
 
     ROUND_STATE_FILE = "roulette_rounds.json"
 
@@ -261,87 +314,135 @@ class ClaimView(discord.ui.View):
     
 
 class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
-    imvu_name = discord.ui.TextInput(label="IMVU Username", required=True, max_length=60)
-    imvu_profile = discord.ui.TextInput(label="IMVU Profile Link (optional)", required=False, max_length=200, placeholder="https://www.imvu.com/…")
-    note = discord.ui.TextInput(label="Notes (optional)", required=False, style=discord.TextStyle.paragraph, max_length=200)
+    # SINGLE field that accepts either a username or a full IMVU profile link
+    handle_or_url = discord.ui.TextInput(
+        label="IMVU Username OR Profile URL",
+        placeholder="e.g. YaEli   OR   https://www.imvu.com/…",
+        required=True,
+        max_length=200
+    )
+    note = discord.ui.TextInput(
+        label="Notes (optional)",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=200,
+        placeholder="Anything staff should know (order, size, color, etc.)"
+    )
 
     def __init__(self, prize_id: int):
         super().__init__()
         self.prize_id = prize_id
 
+    # --- helpers to normalize what the user entered ---
+    def _extract_username(self, text: str) -> tuple[str|None, str|None, str|None]:
+        """
+        Returns (username, profile_url, wishlist_url)
+        Accepts either a bare username or a profile URL.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return None, None, None
+
+        # If it's a URL, try to extract the username from common IMVU patterns
+        if raw.startswith("http://") or raw.startswith("https://"):
+            url = raw
+            # Try to parse `av=<username>` query param first
+            import urllib.parse as _u
+            try:
+                p = _u.urlparse(url)
+                q = _u.parse_qs(p.query)
+                if "av" in q and q["av"]:
+                    uname = q["av"][0]
+                else:
+                    # fallback: sometimes profile URLs end with the name (best effort)
+                    uname = p.path.strip("/").split("/")[-1] or None
+            except Exception:
+                uname = None
+            profile_url = url
+        else:
+            # Treat as plain username
+            uname = raw
+            # Old profile style works reliably with ?av=
+            profile_url = f"https://www.imvu.com/catalog/web_mypage.php?av={uname}"
+
+        # Build a wishlist URL (two common patterns; choose the first)
+        wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?av={uname}" if uname else None
+        return uname, profile_url, wishlist_url
+
     async def on_submit(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
+
+        # idempotence: if a ticket already exists for this prize, just send link
+        existing_ticket_id = get_state(_prize_ticket_key(self.prize_id))
+        if existing_ticket_id:
+            ch = interaction.guild.get_channel(int(existing_ticket_id))
+            if ch:
+                return await interaction.response.send_message(f"You already opened a ticket: {ch.mention}", ephemeral=True)
+
+        # Parse username / URLs
+        uname, profile_url, wishlist_url = self._extract_username(str(self.handle_or_url))
+        if not uname:
+            return await interaction.response.send_message("Please enter a valid IMVU username or profile link.", ephemeral=True)
+
+        # queue entry + mark prize claimed (store wishlist/profile in imvu_profile field)
         with db() as conn:
             c = conn.cursor()
             c.execute("""INSERT INTO prize_queue(prize_id,winner_id,imvu_name,imvu_profile,note,status,created_ts,updated_ts)
                          VALUES(?,?,?,?,?,?,?,?)""",
-                      (self.prize_id, uid, str(self.imvu_name), str(self.imvu_profile), str(self.note or ""),
+                      (self.prize_id, uid, uname, wishlist_url or profile_url or "", str(self.note or ""),
                        "ready", iso(now_local()), iso(now_local())))
             c.execute("UPDATE prizes SET status='claimed', updated_ts=? WHERE id=?", (iso(now_local()), self.prize_id))
-        await interaction.response.send_message("Thanks! Your WL gift claim is queued. An admin will fulfil it shortly. ✅", ephemeral=True)
 
-# ===== UI: Bet Buttons + Amount-only Modal =====
-class BetModal(discord.ui.Modal, title="Place Your Bet"):
-    def __init__(self, rid: str, color: str):
-        super().__init__()
-        self.rid = rid
-        self.color = color  # from the button clicked
+        # create a private ticket channel
+        cat = await _get_or_create_tickets_category(interaction.guild)
+        if not cat:
+            return await interaction.response.send_message("Could not create a ticket channel (no category). Please ping an admin.", ephemeral=True)
 
-        self.amount = discord.ui.TextInput(
-            label=f"Bet Amount on {color.upper()} (coins)",
-            placeholder="e.g., 1000",
-            required=True,
-            max_length=10
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
+        }
+        if TICKETS_STAFF_ROLE_ID:
+            role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+
+        ticket_name = f"wl-{interaction.user.name[:16].lower()}-{self.prize_id}"
+        ticket = await interaction.guild.create_text_channel(ticket_name, category=cat, overwrites=overwrites, reason="EliHaus WL claim ticket")
+
+        # remember ticket channel
+        set_state(_prize_ticket_key(self.prize_id), str(ticket.id))
+
+        # Post ticket intro with clickable links + policy note (with clickable Shop link)
+        staff_tag = f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"
+        profile_line = f"[{uname}]({profile_url})" if profile_url else uname
+        wishlist_line = f"[Open Wishlist]({wishlist_url})" if wishlist_url else "—"
+
+        policy = (
+            f"**Policy:** To claim your winnings, you must have **10 items** added from **[Shop YaEli]({SHOP_YAELI_URL})**. "
+            f"Failure to comply is subject to **disqualification**."
         )
-        self.add_item(self.amount)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        uid = str(interaction.user.id)
+        await ticket.send(
+            f"{staff_tag} New WL claim for {interaction.user.mention}\n"
+            f"IMVU: {profile_line}\n"
+            f"Wishlist: {wishlist_line}\n"
+            f"Notes: {str(self.note or '—')}\n\n"
+            f"{policy}"
+        )
 
-        # validate open round
-        o = get_open_round(interaction.channel.id)
-        if not o:
-            return await interaction.response.send_message("No open round in this channel.", ephemeral=True)
-        rid_live, exp = o
-        if rid_live != self.rid:
-            return await interaction.response.send_message("That round closed or changed. Bet again.", ephemeral=True)
-        if now_local() > exp:
-            return await interaction.response.send_message("Betting window is closed for this round.", ephemeral=True)
-
-        # parse amount
+        # Grey-out / disable the original button on the announce message
         try:
-            amount = int(str(self.amount.value).replace(",", "").strip())
+            msg_id = get_state(_prize_msg_key(self.prize_id))
+            if msg_id:
+                msg = await interaction.channel.fetch_message(int(msg_id))
+                await msg.edit(view=DisabledClaimView())
         except Exception:
-            return await interaction.response.send_message("Amount must be a number.", ephemeral=True)
-        if amount <= 0 or amount > MAX_STAKE:
-            return await interaction.response.send_message(f"Amount must be between 1 and {MAX_STAKE}.", ephemeral=True)
+            pass
 
-        color = self.color  # fixed by button
-        ensure_user(uid)
-        with db() as conn:
-            c = conn.cursor()
-            if ONE_BET_PER_ROUND:
-                c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
-                if c.fetchone():
-                    return await interaction.response.send_message("You already placed a bet this round.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Ticket created: {ticket.mention}", ephemeral=True)
 
-            # balance check
-            c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
-            bal = c.fetchone()[0]
-            if bal < amount:
-                return await interaction.response.send_message(f"Insufficient coins. Balance **{bal}**.", ephemeral=True)
 
-            # escrow & record
-            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (amount, uid))
-            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                      (uid, "bet", -amount, f"roulette:{self.rid}|{color}", iso(now_local())))
-            c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
-                      (self.rid, str(interaction.channel.id), uid, color, amount, iso(now_local())))
-
-        await interaction.response.send_message(
-            f"✅ Bet placed: **{amount}** on **{color.upper()}** for round `{self.rid}`.",
-            ephemeral=True
-        )
 
         # optional: refresh the round embed stats
         try:
@@ -699,11 +800,13 @@ async def drawlotto(ctx: commands.Context):
         all_tix = c.fetchall()
     if not all_tix:
         return await ctx.reply(f"No tickets for Week {wk}.")
+
+    # keep seed internal (not displayed)
     seed = f"LOTTO-{wk}-{int(now_local().timestamp())}-{random.randint(1, 1_000_000)}"
     random.seed(seed)
     winner_ticket = random.choice(all_tix)
     winner_id = winner_ticket[1]
-    # record draw + create prize
+
     with db() as conn:
         c = conn.cursor()
         c.execute("INSERT INTO lotto_draws(week_id,run_at,winner_id,seed,status) VALUES(?,?,?,?,?)",
@@ -712,14 +815,20 @@ async def drawlotto(ctx: commands.Context):
                      VALUES(?,?,?,?,?,?,?)""",
                   (winner_id, "wl", LOTTO_WL_COUNT, json.dumps({"shop": SHOP_NAME, "week": wk}), "pending", iso(now_local()), iso(now_local())))
         prize_id = c.lastrowid
+
     member = ctx.guild.get_member(int(winner_id))
     mention = member.mention if member else f"<@{winner_id}>"
+
     embed = discord.Embed(
         title="🎉 Weekly Lotto Winner!",
-        description=f"{mention} wins **{LOTTO_WL_COUNT}** wishlist gifts from **{SHOP_NAME}**.\nSeed: `{seed}`",
+        description=f"{mention} wins **{LOTTO_WL_COUNT}** wishlist gifts from **{SHOP_NAME}**.",
         color=discord.Color.gold()
     )
+    # Optional: include claim instructions
+    # embed.add_field(name="How to claim", value=f"Add **10 items** from **[Shop YaEli]({SHOP_YAELI_URL})** to your wishlist, then press the button below.", inline=False)
+
     await ctx.reply(embed=embed, view=ClaimView(prize_id))
+
 
 # ---- Prize fulfilment (admins) ----
 @commands.has_permissions(manage_guild=True)
