@@ -983,4 +983,24 @@ async def on_ready():
     except Exception as e:
         print(f"[EliHaus] Slash sync failed: {e}")
 
+@bot.tree.command(name="eh_sync", description="(Admin) Force refresh EliHaus slash commands")
+@app_commands.default_permissions(manage_guild=True)
+async def eh_sync(interaction: discord.Interaction):
+    try:
+        # Prefer fast per-guild sync while testing
+        gid = int(os.getenv("TEST_GUILD_ID", "0"))
+        if gid:
+            guild = discord.Object(id=gid)
+            # Clear guild cmds then mirror current globals, then sync
+            bot.tree.clear_commands(guild=guild)
+            bot.tree.copy_global_to(guild=guild)
+            cmds = await bot.tree.sync(guild=guild)
+            return await interaction.response.send_message(f"✅ Synced {len(cmds)} commands to guild {gid}.", ephemeral=True)
+        # Otherwise do global sync
+        cmds = await bot.tree.sync()
+        await interaction.response.send_message(f"✅ Globally synced {len(cmds)} commands.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Sync error: {e}", ephemeral=True)
+
+
 bot.run(TOKEN)
