@@ -21,6 +21,11 @@ try:
     TZ = ZoneInfo(TIMEZONE_NAME)
 except Exception:
     TZ = timezone.utc
+# --- Coin → WL conversion (user-initiated withdraw) ---
+# How many coins = 1 WL gift
+WL_COINS_PER_GIFT = int(os.getenv("WL_COINS_PER_GIFT", "5000"))  # default 10k coins = 1 WL
+MIN_WL_GIFTS = int(os.getenv("MIN_WL_GIFTS", "1"))
+MAX_WL_GIFTS = int(os.getenv("MAX_WL_GIFTS", "40"))
 
 
 STICKY_AFTER_MSGS = 15  # bump after this many chat messages
@@ -156,6 +161,23 @@ def init_db():
             created_ts TEXT,
             updated_ts TEXT
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS withdraw_requests(
+            id INTEGER PRIMARY KEY,
+            discord_id TEXT,
+            coins INTEGER,
+            gifts INTEGER,
+            imvu_name TEXT,
+            imvu_profile TEXT,  -- wishlist or profile URL
+            note TEXT,
+            status TEXT,        -- 'pending','approved','rejected'
+            ticket_channel_id TEXT,
+            message_id TEXT,    -- review message id inside ticket
+            reviewer_id TEXT,   -- admin who approved/rejected
+            review_note TEXT,
+            created_ts TEXT,
+            updated_ts TEXT
+        )""")
+
 init_db()
 
 # ---------------- Time / State helpers ----------------
@@ -188,6 +210,15 @@ def week_id(dt: datetime | None = None) -> str:
     dt = dt or now_local()
     y, w, _ = dt.isocalendar()
     return f"{y}-{w:02d}"
+
+def _is_admin_member(guild: discord.Guild, member: discord.Member) -> bool:
+    if member.guild_permissions.manage_guild or guild.owner_id == member.id:
+        return True
+    if 'ADMIN_ROLE_ID' in globals() and ADMIN_ROLE_ID:
+        role = guild.get_role(ADMIN_ROLE_ID)
+        if role and role in member.roles:
+            return True
+    return False
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
@@ -638,7 +669,291 @@ class BetView(discord.ui.View):
             f"Balance: **{bal}**",
             ephemeral=True
         )
+class WithdrawWLModal(discord.ui.Modal, title="Withdraw → WL Gifts"):
+    amount_coins = discord.ui.TextInput(
+        label=f"Coins to convert (multiple of {WL_COINS_PER_GIFT})",
+        placeholder=str(WL_COINS_PER_GIFT),
+        required=True,
+        max_length=12
+    )
+    imvu_handle_or_url = discord.ui.TextInput(
+        label="IMVU Username or Profile URL",
+        placeholder="e.g. YaEli   or   https://www.imvu.com/…",
+        required=True,
+        max_length=200
+    )
+    note = discord.ui.TextInput(
+        label="Notes for staff (optional)",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=200
+    )
 
+    def _extract_username(self, text: str):
+        raw = (text or "").strip()
+        if not raw: return None, None, None
+        if raw.startswith(("http://","https://")):
+            import urllib.parse as _u
+            try:
+                p = _u.urlparse(raw)
+                q = _u.parse_qs(p.query)
+                if "av" in q and q["av"]:
+                    uname = q["av"][0]
+                else:
+                    uname = p.path.strip("/").split("/")[-1] or None
+            except Exception:
+                uname = None
+            profile_url = raw
+        else:
+            uname = raw
+            profile_url = f"https://www.imvu.com/catalog/web_mypage.php?av={uname}"
+        wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?av={uname}" if uname else None
+        return uname, profile_url, wishlist_url
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        ensure_user(uid)
+
+        # parse amount / validate
+        try:
+            coins = int(str(self.amount_coins).strip().replace("_",""))
+        except Exception:
+            return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
+        if coins <= 0 or coins % WL_COINS_PER_GIFT != 0:
+            return await interaction.response.send_message(
+                f"Amount must be a positive multiple of **{WL_COINS_PER_GIFT}**.", ephemeral=True
+            )
+        gifts = coins // WL_COINS_PER_GIFT
+        if gifts < MIN_WL_GIFTS or gifts > MAX_WL_GIFTS:
+            return await interaction.response.send_message(
+                f"Gift count must be between **{MIN_WL_GIFTS}** and **{MAX_WL_GIFTS}**.", ephemeral=True
+            )
+
+        bal = get_balance(uid)
+        if bal < coins:
+            return await interaction.response.send_message(
+                f"Insufficient coins. Need **{coins}**, you have **{bal}**.", ephemeral=True
+            )
+
+        uname, profile_url, wishlist_url = self._extract_username(str(self.imvu_handle_or_url))
+        if not uname:
+            return await interaction.response.send_message("Please enter a valid IMVU username or profile link.", ephemeral=True)
+
+        # create ticket (private to user + staff)
+        cat = await _get_or_create_tickets_category(interaction.guild)
+        if not cat:
+            return await interaction.response.send_message("Could not create a ticket channel. Please ping an admin.", ephemeral=True)
+
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
+        }
+        if TICKETS_STAFF_ROLE_ID:
+            role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+
+        # store request (pending)
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("""INSERT INTO withdraw_requests(discord_id,coins,gifts,imvu_name,imvu_profile,note,status,created_ts,updated_ts)
+                         VALUES(?,?,?,?,?,?,?,?,?)""",
+                      (uid, coins, gifts, uname, wishlist_url or profile_url or "", str(self.note or ""),
+                       "pending", iso(now_local()), iso(now_local())))
+            req_id = c.lastrowid
+
+        ticket = await interaction.guild.create_text_channel(
+            f"wl-withdraw-{interaction.user.name[:16].lower()}-{req_id}",
+            category=cat, overwrites=overwrites, reason="WL withdraw request"
+        )
+
+        # post admin review panel inside ticket
+        embed = discord.Embed(
+            title=f"WL Withdraw Request #{req_id}",
+            description=(f"User: <@{uid}>\n"
+                         f"Coins → WL: **{coins} → {gifts}** (rate {WL_COINS_PER_GIFT}/WL)\n"
+                         f"IMVU: **{uname}**\n"
+                         f"[Profile/Wishlist]({wishlist_url or profile_url})"),
+            color=discord.Color.gold()
+        )
+        if self.note:
+            embed.add_field(name="User note", value=str(self.note)[:200], inline=False)
+        embed.set_footer(text="Staff: review and approve or reject below.")
+
+        view = AdminWithdrawReviewView(req_id)
+        msg = await ticket.send(embed=embed, view=view)
+
+        # save ticket & message
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE withdraw_requests SET ticket_channel_id=?, message_id=?, updated_ts=? WHERE id=?",
+                      (str(ticket.id), str(msg.id), iso(now_local()), req_id))
+
+        await interaction.response.send_message(
+            f"✅ Request submitted. A private ticket was opened: {ticket.mention}", ephemeral=True
+        )
+class AdminApproveWithdrawModal(discord.ui.Modal, title="Approve WL Withdraw"):
+    coins = discord.ui.TextInput(
+        label="Confirm coins to deduct",
+        placeholder="e.g. 20000",
+        required=True,
+        max_length=12
+    )
+    note = discord.ui.TextInput(
+        label="Internal note (optional)",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=200
+    )
+
+    def __init__(self, request_id: int):
+        super().__init__(timeout=180)
+        self.request_id = request_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not _is_admin_member(interaction.guild, interaction.user):
+            return await interaction.response.send_message("You don’t have permission to approve.", ephemeral=True)
+
+        # load request
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("""SELECT discord_id, coins, gifts, status, ticket_channel_id, message_id, imvu_name, imvu_profile
+                         FROM withdraw_requests WHERE id=?""", (self.request_id,))
+            row = c.fetchone()
+        if not row:
+            return await interaction.response.send_message("Request not found.", ephemeral=True)
+
+        uid, coins_req, gifts_req, status, tchid, mid, uname, prof = row
+        if status != "pending":
+            return await interaction.response.send_message(f"Request is already **{status}**.", ephemeral=True)
+
+        # parse confirmed coins
+        try:
+            coins_final = int(str(self.coins).strip().replace("_",""))
+        except Exception:
+            return await interaction.response.send_message("Enter a valid coin amount.", ephemeral=True)
+        if coins_final <= 0 or coins_final % WL_COINS_PER_GIFT != 0:
+            return await interaction.response.send_message(
+                f"Amount must be a positive multiple of **{WL_COINS_PER_GIFT}**.", ephemeral=True
+            )
+        gifts_final = coins_final // WL_COINS_PER_GIFT
+        if gifts_final < MIN_WL_GIFTS or gifts_final > MAX_WL_GIFTS:
+            return await interaction.response.send_message(
+                f"Gift count must be between **{MIN_WL_GIFTS}** and **{MAX_WL_GIFTS}**.", ephemeral=True
+            )
+
+        # balance check at approval time
+        bal = get_balance(uid)
+        if bal < coins_final:
+            return await interaction.response.send_message(
+                f"User balance changed. Needs **{coins_final}**, has **{bal}**. Adjust and try again.", ephemeral=True
+            )
+
+        # deduct & create prize + queue
+        with db() as conn:
+            c = conn.cursor()
+            # deduct
+            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (coins_final, uid))
+            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                      (uid, "adjust", -coins_final, f"withdraw_to_wl:{gifts_final} gifts", iso(now_local())))
+            # prize + queue
+            c.execute("""INSERT INTO prizes(winner_id,kind,amount,meta,status,created_ts,updated_ts)
+                         VALUES(?,?,?,?,?,?,?)""",
+                      (uid, "wl", gifts_final, json.dumps({"shop": SHOP_NAME, "source": "user_withdraw"}), "pending",
+                       iso(now_local()), iso(now_local())))
+            prize_id = c.lastrowid
+            c.execute("""INSERT INTO prize_queue(prize_id,winner_id,imvu_name,imvu_profile,note,status,created_ts,updated_ts)
+                         VALUES(?,?,?,?,?,?,?,?)""",
+                      (prize_id, uid, uname, prof or "", str(self.note or ""), "ready", iso(now_local()), iso(now_local())))
+            # mark request
+            c.execute("""UPDATE withdraw_requests SET status='approved', reviewer_id=?, review_note=?, coins=?, gifts=?, updated_ts=?
+                         WHERE id=?""",
+                      (str(interaction.user.id), str(self.note or ""), coins_final, gifts_final, iso(now_local()), self.request_id))
+
+        # update the ticket message (disable buttons)
+        try:
+            channel = interaction.guild.get_channel(int(tchid)) if tchid else None
+            if channel and mid:
+                msg = await channel.fetch_message(int(mid))
+                if msg.embeds:
+                    e = msg.embeds[0]
+                else:
+                    e = discord.Embed(color=discord.Color.gold())
+                e.add_field(name="Status", value=f"✅ **Approved** by {interaction.user.mention}\n"
+                                                 f"Coins: {coins_final} → WL: {gifts_final}", inline=False)
+                await msg.edit(embed=e, view=DisabledReviewView())
+        except Exception:
+            pass
+
+        await interaction.response.send_message("Approved and deducted. Prize queued for fulfilment. ✅", ephemeral=True)
+
+class AdminRejectWithdrawModal(discord.ui.Modal, title="Reject WL Withdraw"):
+    reason = discord.ui.TextInput(label="Reason (shown to user)", required=True, max_length=200)
+
+    def __init__(self, request_id: int):
+        super().__init__(timeout=180)
+        self.request_id = request_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not _is_admin_member(interaction.guild, interaction.user):
+            return await interaction.response.send_message("You don’t have permission to reject.", ephemeral=True)
+
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("""SELECT ticket_channel_id, message_id, status FROM withdraw_requests WHERE id=?""",
+                      (self.request_id,))
+            row = c.fetchone()
+        if not row:
+            return await interaction.response.send_message("Request not found.", ephemeral=True)
+        tchid, mid, status = row
+        if status != "pending":
+            return await interaction.response.send_message(f"Request is already **{status}**.", ephemeral=True)
+
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("""UPDATE withdraw_requests SET status='rejected', reviewer_id=?, review_note=?, updated_ts=?
+                         WHERE id=?""",
+                      (str(interaction.user.id), str(self.reason), iso(now_local()), self.request_id))
+
+        try:
+            channel = interaction.guild.get_channel(int(tchid)) if tchid else None
+            if channel and mid:
+                msg = await channel.fetch_message(int(mid))
+                if msg.embeds:
+                    e = msg.embeds[0]
+                else:
+                    e = discord.Embed(color=discord.Color.gold())
+                e.add_field(name="Status", value=f"❌ **Rejected** by {interaction.user.mention}\n"
+                                                 f"Reason: {str(self.reason)}", inline=False)
+                await msg.edit(embed=e, view=DisabledReviewView())
+        except Exception:
+            pass
+
+        await interaction.response.send_message("Rejected and left balance unchanged. ❌", ephemeral=True)
+
+class DisabledReviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for label, style in [("Approved", discord.ButtonStyle.success),
+                             ("Rejected", discord.ButtonStyle.danger)]:
+            self.add_item(discord.ui.Button(label=label, style=style, disabled=True))
+
+class AdminWithdrawReviewView(discord.ui.View):
+    def __init__(self, request_id: int):
+        super().__init__(timeout=None)
+        self.request_id = request_id
+
+    @discord.ui.button(label="Approve & Deduct", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_admin_member(interaction.guild, interaction.user):
+            return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+        await interaction.response.send_modal(AdminApproveWithdrawModal(self.request_id))
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="🛑")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_admin_member(interaction.guild, interaction.user):
+            return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+        await interaction.response.send_modal(AdminRejectWithdrawModal(self.request_id))
 
 # ---------------- Roulette core ----------------
 def open_round(channel_id: int, seconds: int, opener_id: str) -> tuple[str, datetime]:
@@ -702,6 +1017,7 @@ def get_open_or_last_round(channel_id: int):
         except Exception:
             return row[0], now_local()
     return None
+
 
 async def _bump_round_message(channel, rid: str):
     # read latest totals + the old message id
@@ -792,6 +1108,10 @@ def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
 
 
 # ---- Help (slash) ----
+@bot.tree.command(name="withdraw_wl", description="Convert your coins to WL gifts (opens a ticket; admin approves)")
+async def withdraw_wl(interaction: discord.Interaction):
+    await interaction.response.send_modal(WithdrawWLModal())
+
 @bot.tree.command(name="eh_help", description="Show EliHaus commands")
 async def eh_help(interaction: discord.Interaction):
     is_admin = user_is_admin(interaction.user)
@@ -808,7 +1128,7 @@ async def eh_help(interaction: discord.Interaction):
         "`/eh_openround` – open roulette round",
         "`/eh_resolve` – resolve round",
         "`/eh_cancelround` – cancel round",
-        "`/eh_deposit` / `/eh_withdraw` – adjust balance",
+        "`/eh_withdrawal` / `/eh_withdraw` – adjust balance",
         "`/eh_drawlotto` – draw weekly winner",
         "`/eh_fulfil_next` / `/eh_fulfil_done` – fulfil WL claims",
         "`/eh_roundreset` – unlock stuck round",
