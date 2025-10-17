@@ -473,6 +473,38 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
         if now_local() > exp_dt:
             return await interaction.response.send_message("Betting window is closed.", ephemeral=True)
 
+        # --- refresh the round embed (pool, bets, time) ---
+        try:
+            with db() as conn:
+                c = conn.cursor()
+                c.execute("SELECT message_id, expires_at FROM rounds WHERE rid=?", (self.rid,))
+                r = c.fetchone()
+                if r and r[0]:
+                    msg_id, exp_iso = r[0], r[1]
+                    c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (self.rid,))
+                    cnt, pool = c.fetchone()
+
+            # compute remaining seconds
+            try:
+                exp_dt = datetime.fromisoformat(exp_iso)
+            except Exception:
+                exp_dt = now_local()
+            left = max(0, int((exp_dt - now_local()).total_seconds()))
+
+            # fetch and update the embed
+            msg = await interaction.channel.fetch_message(int(msg_id))
+            if msg.embeds:
+                e = msg.embeds[0]
+                e.clear_fields()
+                e.add_field(name="Pool", value=str(pool), inline=True)
+                e.add_field(name="Time", value=f"{left}s left", inline=True)
+                e.add_field(name="Bets", value=str(cnt), inline=True)
+                await msg.edit(embed=e)
+        except Exception:
+            # never block the user’s modal reply if refresh fails
+            pass
+
+
         uid = str(interaction.user.id)
         ensure_user(uid)
         bal = get_balance(uid)
