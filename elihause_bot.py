@@ -22,11 +22,6 @@ try:
 except Exception:
     TZ = timezone.utc
 
-POLICY_TEXT = os.getenv(
-    "ELIHAUS_POLICY",
-    f"**Policy:** To claim your winnings, you must have **10 items** added from **[Shop YaEli]({SHOP_YAELI_URL})**. "
-    f"Failure to comply is subject to **disqualification**."
-)
 
 STICKY_AFTER_MSGS = 15  # bump after this many chat messages
 STICKY_COUNT: dict[int, int] = {}  # channel_id -> counter since last bump
@@ -50,10 +45,18 @@ TICKET_COST = 10_000
 LOTTO_WINNERS = 1
 LOTTO_WL_COUNT = 10
 SHOP_NAME = "Shop YaEli"
+# Keep SHOP_YAELI_URL defined first
 SHOP_YAELI_URL = os.getenv(
     "SHOP_YAELI_URL",
     "https://www.imvu.com/shop/web_search.php?manufacturers_id=360644281"
 )
+
+# Then define the policy (can be overridden via ELIHAUS_POLICY env var)
+DEFAULT_POLICY_TEXT = (
+    f"**Policy:** To claim your winnings, you must have **10 items** added from "
+    f"**[Shop YaEli]({SHOP_YAELI_URL})**. Failure to comply is subject to **disqualification**."
+)
+POLICY_TEXT = os.getenv("ELIHAUS_POLICY", DEFAULT_POLICY_TEXT)
 
 # Roulette (admin-led)
 ROUND_SECONDS_DEFAULT = 120
