@@ -313,6 +313,79 @@ class ClaimView(discord.ui.View):
         _save_round_state(state)
         return today, n
 
+# ==== Role-aware Help (single embed, filtered) ====
+# If you already have ADMIN_ROLE_ID in env/config, keep it. Otherwise set to 0.
+ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))  # optional: set to your @Admin role ID
+
+def _user_is_admin(ctx: commands.Context) -> bool:
+    if ctx.author.guild_permissions.manage_guild or ctx.guild.owner_id == ctx.author.id:
+        return True
+    if ADMIN_ROLE_ID:
+        role = ctx.guild.get_role(ADMIN_ROLE_ID)
+        if role and role in ctx.author.roles:
+            return True
+    return False
+
+class EliHausHelp(commands.MinimalHelpCommand):
+    def get_command_signature(self, command):
+        return f"!{command.qualified_name} {command.signature}".strip()
+
+    async def send_bot_help(self, mapping):
+        ctx = self.context
+        is_admin = _user_is_admin(ctx)
+
+        # Define buckets
+        player_names = [
+            "joinhaus","daily","weekly","balance","bet","round","buyticket","lotto"
+        ]
+        admin_names = [
+            "openround","resolve","cancelround","deposit","withdraw",
+            "drawlotto","fulfil_next","fulfil_done",
+            "lottoboard","lottoexport","roundreset","settickets","diag"
+        ]
+
+        # Collect commands that actually exist (in case some were not added)
+        all_cmds = {c.qualified_name: c for c in ctx.bot.commands}
+
+        def fmt(names):
+            lines = []
+            for n in names:
+                cmd = all_cmds.get(n)
+                if not cmd:
+                    continue
+                sig = self.get_command_signature(cmd)
+                brief = f" — {cmd.brief}" if getattr(cmd, "brief", None) else ""
+                lines.append(f"• `{sig}`{brief}")
+            return "\n".join(lines) if lines else "_None_"
+
+        e = discord.Embed(
+            title="📖 EliHaus Commands",
+            description="**Tip:** Use `!help <command>` for details.",
+            color=discord.Color.gold()
+        )
+        e.add_field(name="🎮 Player Commands", value=fmt(player_names), inline=False)
+
+        if is_admin:
+            e.add_field(name="🛠️ Admin Commands", value=fmt(admin_names), inline=False)
+            e.set_footer(text="You are an admin: admin commands shown.")
+        else:
+            e.set_footer(text="Admin commands are hidden. Ask a mod if you need help.")
+
+        await self.get_destination().send(embed=e)
+
+    async def send_command_help(self, command):
+        e = discord.Embed(
+            title=f"❓ Help: !{command.qualified_name}",
+            color=discord.Color.gold()
+        )
+        e.add_field(name="Usage", value=f"`{self.get_command_signature(command) or '!'+command.qualified_name}`", inline=False)
+        if command.help:
+            e.add_field(name="Description", value=command.help, inline=False)
+        await self.get_destination().send(embed=e)
+
+# Activate it (once, after you create the bot)
+bot.help_command = EliHausHelp()
+
     
 
 class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
