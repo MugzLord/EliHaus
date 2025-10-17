@@ -150,6 +150,40 @@ init_db()
 
 
 # ---- Helpers ----
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
+
+LONDON_TZ = ZoneInfo("Europe/London")  # uses DST automatically
+
+def now_london() -> datetime:
+    return datetime.now(LONDON_TZ)
+
+def next_draw_dt(ref: datetime | None = None) -> datetime:
+    """
+    Next Saturday at 20:00 London time.
+    """
+    ref = ref or now_london()
+    target_wd = 5  # Monday=0 ... Saturday=5, Sunday=6
+    days_ahead = (target_wd - ref.weekday()) % 7
+    candidate = (ref + timedelta(days=days_ahead)).replace(
+        hour=20, minute=0, second=0, microsecond=0
+    )
+    if candidate <= ref:
+        candidate += timedelta(days=7)
+    return candidate
+
+def human_left(dt: datetime, ref: datetime | None = None) -> str:
+    ref = ref or now_london()
+    secs = max(0, int((dt - ref).total_seconds()))
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m and not d: parts.append(f"{m}m")
+    return " ".join(parts) or "less than 1m"
+
 # ---- State keys for prize announce message & ticket channel ----
 def _prize_msg_key(prize_id: int) -> str:
     return f"prize_msg:{prize_id}"
@@ -668,18 +702,33 @@ def open_round(channel_id: int, seconds: int, opener_id: str) -> tuple[str, date
     set_state(round_key(channel_id), rid)
     return rid, expires
 
-def get_open_round(channel_id: int) -> tuple[str, datetime] | None:
-    rid = get_state(round_key(channel_id))
+def get_open_round(channel_id: int):
+    """Return (rid, expires_at_dt) if truly open; otherwise auto-clear stale state and return None."""
+    rk = round_key(channel_id)
+    rid = get_state(rk)
     if not rid:
         return None
     with db() as conn:
         c = conn.cursor()
-        c.execute("SELECT expires_at FROM rounds WHERE rid=? AND status='OPEN'", (rid,))
-        r = c.fetchone()
-        if not r: 
-            return None
-        exp = datetime.fromisoformat(r[0]).astimezone(TZ)
-        return rid, exp
+        c.execute("SELECT status, expires_at FROM rounds WHERE rid=? LIMIT 1", (rid,))
+        row = c.fetchone()
+    if not row:
+        # state points to a non-existent round
+        set_state(rk, None)
+        return None
+    status, exp = row
+    try:
+        exp_dt = datetime.fromisoformat(exp)
+    except Exception:
+        exp_dt = now_local()  # treat bad value as expired
+
+    # if not OPEN or expired, clear lock and report none
+    if status != "OPEN" or now_local() > exp_dt:
+        set_state(rk, None)
+        return None
+
+    return rid, exp_dt
+
 
 
 # --- Roulette round id (date + per-day counter, per guild) ---
@@ -716,9 +765,11 @@ def next_round_label(guild_id: int):
     return today, n
 
 
-@commands.has_permissions(manage_guild=True)
+@is_admin()
 @bot.command(name="openround")
-async def openround(ctx: commands.Context, seconds: int = ROUND_SECONDS_DEFAULT):
+async def openround(ctx, seconds: int = ROUND_SECONDS_DEFAULT):
+    seconds = max(10, min(seconds, 600))
+    # self-healing get_open_round already clears stale; just check
     if get_open_round(ctx.channel.id):
         return await ctx.reply("There’s already an open round in this channel.")
 
@@ -746,6 +797,18 @@ async def openround(ctx: commands.Context, seconds: int = ROUND_SECONDS_DEFAULT)
 
     with db() as conn:
         conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
+
+    stale = get_open_round(ctx.channel.id)
+    if stale:
+        rid_stale, exp = stale
+        if now_local() > exp:
+            with db() as conn:
+                conn.execute("UPDATE rounds SET status='CANCELLED', resolved_at=? WHERE rid=?",
+                             (iso(now_local()), rid_stale))
+            set_state(round_key(ctx.channel.id), None)
+        else:
+            return await ctx.reply("There’s already an open round in this channel.")
+
 
 @bot.command(name="round")
 async def round_status(ctx: commands.Context):
@@ -799,11 +862,9 @@ async def resolve_round(ctx: commands.Context):
     if not o:
         return await ctx.reply("No open round to resolve.")
     rid, _exp = o
-    set_state(round_key(ctx.channel.id), None)
+    set_state(round_key(ctx.channel.id), None)   # after updating rounds.status
 
-    # ... outcome logic unchanged ...
-
-    # Build display label
+   
     # Build display label (NEW)
     rlabel = get_round_label(rid)
     
@@ -874,13 +935,25 @@ async def buyticket(ctx: commands.Context, count: int = 1):
 async def lotto(ctx: commands.Context):
     wk = week_id()
     uid = str(ctx.author.id)
+    
+    draw_dt = next_draw_dt()
+    draw_str = draw_dt.strftime("%a %d %b %Y • %I:%M %p %Z")  # e.g., Sat 18 Oct 2025 • 08:00 PM BST
+    left = human_left(draw_dt)
+
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=?", (wk,))
         total = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=? AND discord_id=?", (wk, uid))
         mine = c.fetchone()[0]
+        embed.add_field(
+        name="Draw time",
+        value=f"{draw_str}  _(in {left})_",
+        inline=False
+    )
+
     await ctx.reply(f"🎟️ **Weekly Lotto** — Week {wk}\nTotal tickets: **{total}** • Your tickets: **{mine}**\nPrize: **{LOTTO_WL_COUNT} WL gifts** from **{SHOP_NAME}** to **1 winner**.")
+
 
 @commands.has_permissions(manage_guild=True)
 @bot.command(name="drawlotto")
@@ -1035,6 +1108,20 @@ class EliHausHelp(commands.MinimalHelpCommand):
         if command.help:
             e.add_field(name="Description", value=command.help, inline=False)
         await self.get_destination().send(embed=e)
+        
+@is_admin()
+@bot.command(name="roundreset", brief="(admin) Force-unlock this channel if a round is stuck")
+async def roundreset(ctx):
+    rid = get_state(round_key(ctx.channel.id))
+    if not rid:
+        return await ctx.reply("No open round to reset (state already clear).")
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE rounds SET status='CANCELLED', resolved_at=? WHERE rid=?",
+                  (iso(now_local()), rid))
+    set_state(round_key(ctx.channel.id), None)
+    await ctx.reply(f"Force-reset round `{rid}` — channel unlocked.")
+
 
 
 # ---- Run ----
