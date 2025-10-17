@@ -209,6 +209,47 @@ def human_left(dt: datetime, ref: datetime | None = None) -> str:
     if m and not d: parts.append(f"{m}m")
     return " ".join(parts) or "less than 1m"
 
+# --- Roulette result embed builder ---
+ROULETTE_THUMB_URL = os.getenv("ROULETTE_THUMB_URL", "")  # optional small logo for vibe
+
+def _result_color(outcome: str) -> discord.Color:
+    if outcome == "red":
+        return discord.Color.red()
+    if outcome == "black":
+        return discord.Color.dark_grey()
+    return discord.Color.green()
+
+#added for winners embed
+def _result_emoji(outcome: str) -> str:
+    return {"red": "🟥", "black": "⬛", "green": "🟩"}.get(outcome, "🎯")
+
+def build_roulette_result_embed(
+    rlabel: str,
+    outcome: str,
+    total_bets: int,
+    total_pool: int,
+    winners_mentions: list[str],
+    seed_display: str,
+) -> discord.Embed:
+    e = discord.Embed(
+        title=f"🎰 EliHaus Roulette — Round {rlabel}",
+        description=f"**RESULT:** {_result_emoji(outcome)} **{outcome.upper()}**",
+        color=_result_color(outcome),
+        timestamp=now_local(),
+    )
+    e.add_field(name="Total Bets", value=str(total_bets), inline=True)
+    e.add_field(name="Pool", value=str(total_pool), inline=True)
+    e.add_field(
+        name="Winners (top)",
+        value=(", ".join(winners_mentions) if winners_mentions else "—"),
+        inline=False,
+    )
+    e.set_footer(text=f"Seed: {seed_display}")
+    if ROULETTE_THUMB_URL:
+        e.set_thumbnail(url=ROULETTE_THUMB_URL)
+    return e
+
+
 # ---------------- Admin check helpers ----------------
 def user_is_admin(member: discord.Member) -> bool:
     if getattr(member.guild_permissions, "manage_guild", False) or member.id == getattr(member.guild, "owner_id", 0):
@@ -848,29 +889,36 @@ async def _tick_round(channel: discord.abc.Messageable, rid: str, exp_iso: str):
                                   (outcome, seed, iso(now_local()), rid))
                     set_state(round_key(int(str(channel.id))), None)
 
-                    # edit embed + summary
+                    # edit original embed to show result + remove buttons
                     try:
                         msg = await channel.fetch_message(int(msg_id))
                         rlabel = ClaimView.get_round_label(rid)
                         seed_display = ClaimView.short_seed(seed, 8)
-                        e = msg.embeds[0] if msg.embeds else discord.Embed(color=discord.Color.gold())
+                        e = msg.embeds[0] if msg.embeds else discord.Embed(color=_result_color(outcome))
                         e.title = f"🎯 Roulette — Round {rlabel}"
                         e.description = f"**RESULT:** {outcome.upper()}"
                         e.set_footer(text=f"Seed: {seed_display}")
                         await msg.edit(embed=e, view=None)
-
-                        top_mentions = []
-                        guild = getattr(channel, "guild", None)
-                        for uid, _win in sorted(winners, key=lambda x: x[1], reverse=True)[:5]:
-                            m = guild.get_member(int(uid)) if guild else None
-                            top_mentions.append(m.mention if m else f"<@{uid}>")
-                        summary_text = (f"🎯 **Round {rlabel} → {outcome.upper()}**\n"
-                                        f"Total bets: **{len(rows)}** • Pool: **{total_pool}**\n"
-                                        f"Winners (top): {', '.join(top_mentions) if top_mentions else 'None'}\n"
-                                        f"Seed: `{seed_display}`")
-                        await channel.send(summary_text)
                     except Exception:
                         pass
+                    
+                    # casino-style result card
+                    top_mentions = []
+                    guild = getattr(channel, "guild", None)
+                    for uid, _win in sorted(winners, key=lambda x: x[1], reverse=True)[:5]:
+                        m = guild.get_member(int(uid)) if guild else None
+                        top_mentions.append(m.mention if m else f"<@{uid}>")
+                    
+                    result_embed = build_roulette_result_embed(
+                        rlabel=rlabel,
+                        outcome=outcome,
+                        total_bets=len(rows),
+                        total_pool=total_pool,
+                        winners_mentions=top_mentions,
+                        seed_display=seed_display,
+                    )
+                    await channel.send(embed=result_embed)
+
                 finally:
                     break
 
@@ -1077,26 +1125,30 @@ async def eh_resolve(interaction: discord.Interaction):
         m = interaction.guild.get_member(int(uid))
         top_mentions.append(m.mention if m else f"<@{uid}>")
 
-    summary_text = (f"🎯 **Round {rlabel} → {outcome.upper()}**\n"
-                    f"Total bets: **{len(rows)}** • Pool: **{total_pool}**\n"
-                    f"Winners (top): {', '.join(top_mentions) if top_mentions else 'None'}\n"
-                    f"Seed: `{seed_display}`")
-
+    # --- Casino-style result embed ---
+    result_embed = build_roulette_result_embed(
+        rlabel=rlabel,
+        outcome=outcome,
+        total_bets=len(rows),
+        total_pool=total_pool,
+        winners_mentions=top_mentions,
+        seed_display=seed_display,
+    )
+    
     if msg_id:
         try:
             msg = await interaction.channel.fetch_message(msg_id)
-            e = msg.embeds[0] if msg.embeds else discord.Embed(color=discord.Color.gold())
+            e = msg.embeds[0] if msg.embeds else discord.Embed(color=_result_color(outcome))
             e.title = f"🎯 Roulette — Round {rlabel}"
             e.description = f"**RESULT:** {outcome.upper()}"
             e.set_footer(text=f"Seed: {seed_display}")
             await msg.edit(embed=e, view=None)
-            await interaction.channel.send(summary_text)
         except Exception:
-            await interaction.channel.send(summary_text)
-    else:
-        await interaction.channel.send(summary_text)
-
+            pass
+    
+    await interaction.channel.send(embed=result_embed)
     await interaction.response.send_message("Round resolved.", ephemeral=True)
+
 
 @bot.tree.command(name="eh_cancelround", description="(Admin) Cancel the current roulette round and refund")
 @app_commands.default_permissions(manage_guild=True)
