@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import discord
 from discord.ext import commands
-worker: python Eli.py
+worker: python elihause_bot.py
+
 
 # ---- Config ----
 TOKEN = os.getenv("DISCORD_TOKEN")
