@@ -1273,7 +1273,7 @@ async def eh_join(interaction: discord.Interaction):
         c.execute("SELECT 1 FROM tx WHERE discord_id=? AND kind='starter' LIMIT 1", (uid,))
         has_starter = c.fetchone() is not None
     if has_starter:
-        return await interaction.response.send_message("You’ve already joined EliHaus. Use `/eh_daily` and `/eh_weeklyw` to build coins.", ephemeral=True)
+        return await interaction.response.send_message("You’ve already joined EliHaus. Use `/eh_daily` and `/eh_weekly` to build coins.", ephemeral=True)
     new_bal = change_balance(uid, STARTER_AMOUNT, "starter", "joinhaus starter")
     await interaction.response.send_message(f"Welcome to **EliHaus**. Starter pack: **{STARTER_AMOUNT}** coins. Balance: **{new_bal}**", ephemeral=True)
 
@@ -1296,8 +1296,8 @@ async def eh_daily(interaction: discord.Interaction):
         c.execute("UPDATE users SET last_daily=? WHERE discord_id=?", (iso(now), uid))
     await interaction.response.send_message(f"Daily claimed: **{DAILY_AMOUNT}** coins. New balance: **{new_bal}**", ephemeral=True)
 
-@bot.tree.command(name="eh_weeklyw", description="Claim your weekly coins")
-async def eh_weeklyw(interaction: discord.Interaction):
+@bot.tree.command(name="eh_weekly", description="Claim your weekly coins")
+async def eh_weekly(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     ensure_user(uid)
     with db() as conn:
