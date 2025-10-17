@@ -7,6 +7,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from zoneinfo import ZoneInfo  # proper DST (e.g., Europe/London)
+import io, time
+
 
 # ---------------- Config ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -2017,7 +2019,35 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
             f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
             ephemeral=True
         )
+        
+        # --- Public attachment with full result for everyone ---
+        import io, time  # put these at top of file if not already imported
+        
+        try:
+            details = []
+            details.append(f"User: {interaction.user} ({interaction.user.id})")
+            details.append(f"Spins: {n}")
+            details.extend(lines)  # the per-spin lines you already built
+            details.append("")
+            details.append(f"Total won: {total_win}")
+            details.append(f"Pot now: {get_slots_pot(self.channel_id)}")
+            txt = "\n".join(details)
+        
+            buf = io.BytesIO(txt.encode("utf-8"))
+            filename = f"slots_{interaction.user.id}_{int(time.time())}.txt"
+            file = discord.File(buf, filename=filename)
+        
+            public_summary = (
+                f"🎰 {interaction.user.mention} spun **{n}x** → "
+                f"{'+'+str(total_win) if total_win else 'no win'} • "
+                f"Pot **{get_slots_pot(self.channel_id)}**"
+            )
+            # since you've already responded ephemerally above, use followup for the public post
+            await interaction.followup.send(public_summary, file=file)
+        except Exception:
+            pass
 
+        
 class SlotsView(discord.ui.View):
     def __init__(self, channel_id: int, timeout: int | None = None):
         super().__init__(timeout=timeout or None)
