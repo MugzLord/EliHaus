@@ -796,15 +796,12 @@ def next_round_label(guild_id: int):
 @bot.command(name="openround")
 async def openround(ctx, seconds: int = ROUND_SECONDS_DEFAULT):
     seconds = max(10, min(seconds, 600))
-    # self-healing get_open_round already clears stale; just check
     if get_open_round(ctx.channel.id):
         return await ctx.reply("There’s already an open round in this channel.")
 
-    # safety clamp (avoid silly values)
-    seconds = max(10, min(seconds, 600))
-
     rid, exp = open_round(ctx.channel.id, seconds, str(ctx.author.id))
 
+    # make a human label (#1, #2, ...)
     rnum = next_round_number(ctx.channel.id)
     rlabel = f"#{rnum}"
     set_round_label(rid, rlabel)
@@ -814,6 +811,8 @@ async def openround(ctx, seconds: int = ROUND_SECONDS_DEFAULT):
         description="Click a button to bet. A modal will ask your amount.",
         color=discord.Color.gold()
     )
+    ...
+
     embed.add_field(name="Pool", value="0", inline=True)
     embed.add_field(name="Time", value=f"{seconds}s left", inline=True)
     embed.add_field(name="Bets", value="0", inline=True)
@@ -894,6 +893,8 @@ async def resolve_round(ctx: commands.Context):
    
     # Build display label (NEW)
     rlabel = get_round_label(rid)
+    embed.title = f"🎯 Roulette — Round {rlabel}"
+
     
     # Optional: short seed in messages
     seed_display = short_seed(seed, 8)
