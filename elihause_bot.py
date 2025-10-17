@@ -5,6 +5,10 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 import discord
 from discord.ext import commands
+import json, os
+from datetime import datetime
+from zoneinfo import ZoneInfo  # proper DST for London
+
 
 # ---- Config ----
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -224,7 +228,35 @@ class ClaimView(discord.ui.View):
         return get_state(_round_label_key(rid)) or rid  # fallback to full rid if missing
 
     def short_seed(s: str, n: int = 8) -> str:
-    return f"{s[:n]}…{s[-n:]}" if s and len(s) > 2*n else s
+        return f"{s[:n]}…{s[-n:]}" if s and len(s) > 2*n else s
+
+    ROUND_STATE_FILE = "roulette_rounds.json"
+
+    def _load_round_state():
+        try:
+            with open(ROUND_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            return {}
+    
+    def _save_round_state(state: dict):
+        tmp = ROUND_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, ROUND_STATE_FILE)
+    
+    def next_round_label(guild_id: int):
+        """Returns ('YYYY-MM-DD', round_number_int) and persists it per-guild/per-day."""
+        state = _load_round_state()
+        g = str(guild_id)
+        today = datetime.utcnow().strftime("%Y-%m-%d")  # use UTC; swap to local if you prefer
+        gstate = state.setdefault(g, {})
+        n = int(gstate.get(today, 0)) + 1
+        gstate[today] = n
+        _save_round_state(state)
+        return today, n
 
     
 
@@ -456,6 +488,41 @@ def get_open_round(channel_id: int) -> tuple[str, datetime] | None:
         exp = datetime.fromisoformat(r[0]).astimezone(TZ)
         return rid, exp
 
+
+# --- Roulette round id (date + per-day counter, per guild) ---
+ROUND_STATE_FILE = "roulette_rounds.json"
+LONDON_TZ = ZoneInfo("Europe/London")  # respects BST/GMT
+
+def _load_round_state():
+    try:
+        with open(ROUND_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+def _save_round_state(state: dict):
+    tmp = ROUND_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, ROUND_STATE_FILE)
+
+def next_round_label(guild_id: int):
+    """
+    Returns ('YYYY-MM-DD', round_number_int) and persists it per-guild/per-day
+    using London local date.
+    """
+    state = _load_round_state()
+    g = str(guild_id)
+    today = datetime.now(LONDON_TZ).strftime("%Y-%m-%d")
+    gstate = state.setdefault(g, {})
+    n = int(gstate.get(today, 0)) + 1
+    gstate[today] = n
+    _save_round_state(state)
+    return today, n
+
+
 @commands.has_permissions(manage_guild=True)
 @bot.command(name="openround")
 async def openround(ctx: commands.Context, seconds: int = ROUND_SECONDS_DEFAULT):
@@ -471,7 +538,7 @@ async def openround(ctx: commands.Context, seconds: int = ROUND_SECONDS_DEFAULT)
 
     embed = discord.Embed(
         title=f"🎯 Roulette — Round {rlabel}",
-        description="Click a button to bet. A modal will ask your amount.",
+        description="Pick your colour and enter your bet.",
         color=discord.Color.gold()
     )
     embed.add_field(name="Pool", value="0", inline=True)
