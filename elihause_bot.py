@@ -15,7 +15,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Qatar")
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/London")
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo(TIMEZONE_NAME)
@@ -40,7 +40,7 @@ LOTTO_WL_COUNT = 10             # 10 wishlist gifts to the winner
 SHOP_NAME = "Shop X"            # display name in winner message
 
 # Roulette knobs (admin-led, manual resolve)
-ROUND_SECONDS_DEFAULT = 30
+ROUND_SECONDS_DEFAULT = 120
 PAYOUT_RED_BLACK = 2.0
 PAYOUT_GREEN = 14.0             # enable green flavour
 MAX_STAKE = 50_000
@@ -529,29 +529,30 @@ async def openround(ctx: commands.Context, seconds: int = ROUND_SECONDS_DEFAULT)
     if get_open_round(ctx.channel.id):
         return await ctx.reply("There’s already an open round in this channel.")
 
+    # safety clamp (avoid silly values)
+    seconds = max(10, min(seconds, 600))
+
     rid, exp = open_round(ctx.channel.id, seconds, str(ctx.author.id))
 
-    # NEW: make a short label like #104 (per channel counter)
     rnum = next_round_number(ctx.channel.id)
     rlabel = f"#{rnum}"
     set_round_label(rid, rlabel)
 
     embed = discord.Embed(
         title=f"🎯 Roulette — Round {rlabel}",
-        description="Pick your colour and enter your bet.",
+        description="Click a button to bet. A modal will ask your amount.",
         color=discord.Color.gold()
     )
     embed.add_field(name="Pool", value="0", inline=True)
     embed.add_field(name="Time", value=f"{seconds}s left", inline=True)
     embed.add_field(name="Bets", value="0", inline=True)
 
+    # keep buttons alive slightly longer than the window
     view = BetView(rid, timeout=seconds + 30)
     msg = await ctx.reply(embed=embed, view=view)
 
     with db() as conn:
         conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
-
-
 
 @bot.command(name="round")
 async def round_status(ctx: commands.Context):
