@@ -7,6 +7,10 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from zoneinfo import ZoneInfo  # proper DST (e.g., Europe/London)
+import asyncio
+ROUND_TICK_SECONDS = 5
+ROUND_TASKS: dict[str, asyncio.Task] = {}
+
 
 # ---------------- Config ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -415,7 +419,7 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
         self.rid = rid
         self.color = color
 
-    async def on_submit(self, interaction: discord.Interaction):
+        async def on_submit(self, interaction: discord.Interaction):
         try:
             amt = int(str(self.amount).strip().replace("_",""))
         except Exception:
@@ -438,7 +442,43 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
         if now_local() > exp_dt:
             return await interaction.response.send_message("Betting window is closed.", ephemeral=True)
 
-        # --- refresh the round embed (pool, bets, time) ---
+        uid = str(interaction.user.id)
+
+        # Check if already bet (before any updates)
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("""SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1""", (self.rid, uid))
+            existing = c.fetchone()
+        if ONE_BET_PER_ROUND and existing:
+            # Show what they already have + current balance
+            bal_now = get_balance(uid)
+            return await interaction.response.send_message(
+                f"⚠️ You’ve already placed a bet this round.\n"
+                f"Your bet: **{existing[1]}** on **{existing[0].upper()}**\n"
+                f"Balance: **{bal_now}**",
+                ephemeral=True
+            )
+
+        # Balance check
+        bal_before = get_balance(uid)
+        if bal_before < amt:
+            return await interaction.response.send_message(
+                f"Insufficient coins. Need **{amt}**, you have **{bal_before}**.",
+                ephemeral=True
+            )
+
+        # Record bet + deduct
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (amt, uid))
+            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                      (uid, "bet", -amt, f"roulette:{self.rid}|{self.color}", iso(now_local())))
+            c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
+                      (self.rid, str(interaction.channel.id), uid, self.color, amt, iso(now_local())))
+
+        bal_after = bal_before - amt
+
+        # Try to refresh the public round embed (pool/bets/time) silently
         try:
             with db() as conn:
                 c = conn.cursor()
@@ -448,15 +488,8 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
                     msg_id, exp_iso = r[0], r[1]
                     c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (self.rid,))
                     cnt, pool = c.fetchone()
-
-            # compute remaining seconds
-            try:
-                exp_dt = datetime.fromisoformat(exp_iso)
-            except Exception:
-                exp_dt = now_local()
+            exp_dt = datetime.fromisoformat(exp_iso) if exp_iso else now_local()
             left = max(0, int((exp_dt - now_local()).total_seconds()))
-
-            # fetch and update the embed
             msg = await interaction.channel.fetch_message(int(msg_id))
             if msg.embeds:
                 e = msg.embeds[0]
@@ -468,31 +501,13 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
         except Exception:
             pass
 
-        uid = str(interaction.user.id)
-        # ensure user + balance checks
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""INSERT OR IGNORE INTO users(discord_id,balance,last_daily,last_weekly,joined_at)
-                         VALUES(?,?,?,?,?)""", (uid, 0, None, None, iso(now_local())))
-            c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
-            row = c.fetchone()
-            bal = row[0] if row else 0
-        if bal < amt:
-            return await interaction.response.send_message(f"Insufficient coins. Balance **{bal}**.", ephemeral=True)
+        # Clear + friendly confirmation (ephemeral)
+        await interaction.response.send_message(
+            f"✅ Bet placed — **{amt}** on **{self.color.upper()}**\n"
+            f"Balance: **{bal_before} ➜ {bal_after}**",
+            ephemeral=True
+        )
 
-        with db() as conn:
-            c = conn.cursor()
-            if ONE_BET_PER_ROUND:
-                c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
-                if c.fetchone():
-                    return await interaction.response.send_message("You’ve already placed a bet this round.", ephemeral=True)
-            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (amt, uid))
-            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                      (uid, "bet", -amt, f"roulette:{self.rid}|{self.color}", iso(now_local())))
-            c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
-                      (self.rid, str(interaction.channel.id), uid, self.color, amt, iso(now_local())))
-
-        await interaction.response.send_message("✅ Bet placed!", ephemeral=True)
 
 class BetView(discord.ui.View):
     def __init__(self, rid: str, timeout: int | None = None):
@@ -510,6 +525,42 @@ class BetView(discord.ui.View):
     @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🟩")
     async def bet_green(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(BetModal(self.rid, color="green"))
+
+    # NEW: quick check button (ephemeral, no slash command needed)
+    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="❔")
+    async def my_bet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        # Look up this user’s bet for this round
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
+            row = c.fetchone()
+        bal = get_balance(uid)
+        if not row:
+            return await interaction.response.send_message(
+                f"You have **no bet** this round.\nBalance: **{bal}**",
+                ephemeral=True
+            )
+        choice, stake = row
+        # Remaining time (optional)
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT expires_at FROM rounds WHERE rid=?", (self.rid,))
+            r = c.fetchone()
+        remain = 0
+        if r and r[0]:
+            try:
+                exp_dt = datetime.fromisoformat(r[0])
+                remain = max(0, int((exp_dt - now_local()).total_seconds()))
+            except Exception:
+                pass
+        await interaction.response.send_message(
+            f"Your bet: **{stake}** on **{choice.upper()}**\n"
+            f"Time left: **{remain}s**\n"
+            f"Balance: **{bal}**",
+            ephemeral=True
+        )
+
 
 # ---------------- Roulette core ----------------
 def open_round(channel_id: int, seconds: int, opener_id: str) -> tuple[str, datetime]:
@@ -543,6 +594,36 @@ def get_open_round(channel_id: int):
         set_state(rk, None)
         return None
     return rid, exp_dt
+    
+def get_open_or_last_round(channel_id: int):
+    """Return the current open round, or the latest OPEN row even if the timer already elapsed."""
+    rk = round_key(channel_id)
+    rid = get_state(rk)
+    if rid:
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT status, expires_at FROM rounds WHERE rid=? LIMIT 1", (rid,))
+            row = c.fetchone()
+        if row and row[0] == "OPEN":
+            try:
+                return rid, datetime.fromisoformat(row[1])
+            except Exception:
+                return rid, now_local()
+
+    # Fallback: latest OPEN round in DB for this channel
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT rid, expires_at
+                     FROM rounds
+                     WHERE channel_id=? AND status='OPEN'
+                     ORDER BY opened_at DESC LIMIT 1""", (str(channel_id),))
+        row = c.fetchone()
+    if row:
+        try:
+            return row[0], datetime.fromisoformat(row[1])
+        except Exception:
+            return row[0], now_local()
+    return None
 
 # ---------------- Slash Commands (eh_*) ----------------
 def ensure_user(uid: str):
@@ -593,6 +674,108 @@ async def eh_help(interaction: discord.Interaction):
     ]
     lines = public + (["\n**Admin**"] + admin if is_admin else [])
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+async def _tick_round(channel: discord.abc.MessageableChannel, rid: str, exp_iso: str):
+    """Update the embed every few seconds and auto-resolve at 0s."""
+    try:
+        try:
+            exp_dt = datetime.fromisoformat(exp_iso)
+        except Exception:
+            exp_dt = now_local()
+
+        while True:
+            # Read status + message + pool
+            with db() as conn:
+                c = conn.cursor()
+                c.execute("SELECT message_id, status FROM rounds WHERE rid=?", (rid,))
+                row = c.fetchone()
+                if not row:
+                    break
+                msg_id, status = row
+                c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
+                cnt, pool = c.fetchone()
+
+            if status != "OPEN":
+                break
+
+            remain = max(0, int((exp_dt - now_local()).total_seconds()))
+
+            # Update embed fields
+            try:
+                msg = await channel.fetch_message(int(msg_id))
+                if msg.embeds:
+                    e = msg.embeds[0]
+                    e.clear_fields()
+                    e.add_field(name="Pool", value=str(pool), inline=True)
+                    e.add_field(name="Time", value=f"{remain}s left", inline=True)
+                    e.add_field(name="Bets", value=str(cnt), inline=True)
+                    await msg.edit(embed=e)
+            except Exception:
+                pass
+
+            if remain <= 0:
+                # Auto resolve when time hits zero
+                try:
+                    # call the same body as /eh_resolve but inline
+                    # minimal duplication — reuse the logic below:
+                    o = (rid, exp_dt)
+                    # --- begin resolve body (trimmed) ---
+                    seed = f"ROUL-{rid}-{int(now_local().timestamp())}-{random.randint(1, 1_000_000)}"
+                    random.seed(seed)
+                    roll = random.randint(0, 36)
+                    red_nums = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+                    if roll == 0:
+                        outcome = "green"; multiplier = PAYOUT_GREEN
+                    else:
+                        outcome = "red" if roll in red_nums else "black"; multiplier = PAYOUT_RED_BLACK
+
+                    total_pool = 0; winners = []; rows = []
+                    with db() as conn:
+                        c = conn.cursor()
+                        c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,))
+                        rows = c.fetchall()
+                        for uid, ch, stake in rows:
+                            total_pool += stake
+                        for uid, ch, stake in rows:
+                            if ch == outcome:
+                                win = int(stake * multiplier)
+                                c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (win, uid))
+                                c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                                          (uid, "payout", win, f"roulette:{rid}|{outcome}", iso(now_local())))
+                                winners.append((uid, win))
+                        c.execute("UPDATE rounds SET status='RESOLVED', outcome=?, seed=?, resolved_at=? WHERE rid=?",
+                                  (outcome, seed, iso(now_local()), rid))
+                    set_state(round_key(int(str(channel.id))), None)
+
+                    # Update embed + post summary
+                    msg = await channel.fetch_message(int(msg_id))
+                    rlabel = ClaimView.get_round_label(rid)
+                    seed_display = ClaimView.short_seed(seed, 8)
+                    e = msg.embeds[0] if msg.embeds else discord.Embed(color=discord.Color.gold())
+                    e.title = f"🎯 Roulette — Round {rlabel}"
+                    e.description = f"**RESULT:** {outcome.upper()}"
+                    e.set_footer(text=f"Seed: {seed_display}")
+                    await msg.edit(embed=e, view=None)
+
+                    top_mentions = []
+                    guild = getattr(channel, "guild", None)
+                    for uid, _win in sorted(winners, key=lambda x: x[1], reverse=True)[:5]:
+                        m = guild.get_member(int(uid)) if guild else None
+                        top_mentions.append(m.mention if m else f"<@{uid}>")
+                    summary_text = (f"🎯 **Round {rlabel} → {outcome.upper()}**\n"
+                                    f"Total bets: **{len(rows)}** • Pool: **{total_pool}**\n"
+                                    f"Winners (top): {', '.join(top_mentions) if top_mentions else 'None'}\n"
+                                    f"Seed: `{seed_display}`")
+                    await channel.send(summary_text)
+                    # --- end resolve body ---
+
+                finally:
+                    break
+
+            await asyncio.sleep(ROUND_TICK_SECONDS)
+    finally:
+        ROUND_TASKS.pop(rid, None)
+
 
 # ---- Player: join/daily/weekly/balance ----
 @bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
@@ -707,6 +890,12 @@ async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SE
     msg = await interaction.channel.send(embed=embed, view=view)
     with db() as conn:
         conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
+
+    # NEW: launch a background ticker for this round
+    try:
+        ROUND_TASKS[rid] = bot.loop.create_task(_tick_round(interaction.channel, rid, iso(exp)))
+    except Exception:
+        pass
     await interaction.response.send_message(f"Opened roulette round {rlabel}.", ephemeral=True)
 
 @bot.tree.command(name="eh_table", description="Show current roulette round status in this channel")
@@ -730,9 +919,10 @@ async def eh_table(interaction: discord.Interaction):
 async def eh_resolve(interaction: discord.Interaction):
     if not user_is_admin(interaction.user):
         return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    o = get_open_round(interaction.channel.id)
+        
+    o = get_open_or_last_round(interaction.channel.id)
     if not o:
-        return await interaction.response.send_message("No open round to resolve.", ephemeral=True)
+        return await interaction.response.send_message("No round found to resolve in this channel.", ephemeral=True)
     rid, _exp = o
 
     # roll an outcome with a reproducible seed
