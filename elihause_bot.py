@@ -9,6 +9,24 @@ import json, os
 from datetime import datetime
 from zoneinfo import ZoneInfo  # proper DST for London
 
+# ---- Admin check (owner OR Manage Server OR optional ADMIN_ROLE_ID) ----
+import os
+from discord.ext import commands
+
+ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))  # set in env if you want a role-based admin
+
+def is_admin():
+    async def predicate(ctx: commands.Context):
+        # Owner or has Manage Server
+        if ctx.author.guild_permissions.manage_guild or ctx.guild.owner_id == ctx.author.id:
+            return True
+        # Or has the configured admin role
+        if ADMIN_ROLE_ID:
+            role = ctx.guild.get_role(ADMIN_ROLE_ID)
+            if role and role in ctx.author.roles:
+                return True
+        return False
+    return commands.check(predicate)
 
 # ---- Config ----
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -887,7 +905,6 @@ async def resolve_round(ctx: commands.Context):
             await ctx.send(text)  # <- if you want ONLY the embed, delete this line
         except Exception:
             await ctx.reply(text)
-
 
 
 @commands.has_permissions(manage_guild=True)
