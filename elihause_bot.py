@@ -798,7 +798,7 @@ async def eh_help(interaction: discord.Interaction):
     public = [
         "`/eh_join` – join EliHaus (starter coins)",
         "`/eh_daily` – claim daily coins",
-        "`/eh_weeklyw` – claim weekly coins",
+        "`/eh_weekly` – claim weekly coins",
         "`/eh_balance` – check balance",
         "`/eh_buyticket` – buy lotto tickets",
         "`/eh_lotto` – see lotto status",
