@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo  # proper DST for London
 # ---- Admin check (owner OR Manage Server OR optional ADMIN_ROLE_ID) ----
 import os
 from discord.ext import commands
+import traceback
+
 
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))  # set in env if you want a role-based admin
 
@@ -570,7 +572,6 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
         await interaction.response.send_message(f"✅ Ticket created: {ticket.mention}", ephemeral=True)
 
 
-
         # optional: refresh the round embed stats
         try:
             with db() as conn:
@@ -595,24 +596,30 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
         except Exception:
             pass
 
-    from discord.ext import commands
-      
-    import traceback
+    
     @bot.event
     async def on_command_error(ctx, error):
-        from discord.ext.commands import CommandNotFound, MissingPermissions, CheckFailure, BadArgument, CommandInvokeError
+        from discord.ext.commands import (
+            CommandNotFound, MissingPermissions, CheckFailure,
+            BadArgument, CommandInvokeError
+        )
+    
         if isinstance(error, CommandNotFound):
-            return
+            return  # ignore typos quietly
+    
         if isinstance(error, (MissingPermissions, CheckFailure)):
             return await ctx.reply("You don’t have permission to use that command.")
+    
+        if isinstance(error, BadArgument):
+            return await ctx.reply("Bad arguments. Try `!help <command>`.")
+    
         if isinstance(error, CommandInvokeError):
             orig = error.original
             tb = "".join(traceback.format_exception(type(orig), orig, orig.__traceback__))[:1800]
             return await ctx.reply(f"Crash: **{type(orig).__name__}** — {orig}\n```py\n{tb}\n```")
-        if isinstance(error, BadArgument):
-            return await ctx.reply("Bad arguments. Try `!help <command>`.")
+    
+        # fallback
         await ctx.reply(f"Error: **{type(error).__name__}** — {error}")
-
 
 
 class BetView(discord.ui.View):
