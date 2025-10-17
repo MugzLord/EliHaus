@@ -408,21 +408,29 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
 
 # --- Bet Modal for the buttons ---
 class BetModal(discord.ui.Modal, title="Place your bet"):
-    amount = discord.ui.TextInput(label="Amount (coins)", placeholder="e.g. 2500", required=True, max_length=12)
+    amount = discord.ui.TextInput(
+        label="Amount (coins)",
+        placeholder="e.g. 2500",
+        required=True,
+        max_length=12
+    )
 
     def __init__(self, rid: str, color: str):
         super().__init__()
         self.rid = rid
         self.color = color
 
-        async def on_submit(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
+        # Parse amount
         try:
-            amt = int(str(self.amount).strip().replace("_",""))
+            amt = int(str(self.amount).strip().replace("_", ""))
         except Exception:
             return await interaction.response.send_message("Enter a valid number.", ephemeral=True)
 
         if amt <= 0 or amt > MAX_STAKE:
-            return await interaction.response.send_message(f"Stake must be between 1 and {MAX_STAKE}.", ephemeral=True)
+            return await interaction.response.send_message(
+                f"Stake must be between 1 and {MAX_STAKE}.", ephemeral=True
+            )
 
         # Validate round still open
         with db() as conn:
@@ -431,6 +439,7 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
             row = c.fetchone()
         if not row or row[0] != "OPEN":
             return await interaction.response.send_message("Betting window is closed.", ephemeral=True)
+
         try:
             exp_dt = datetime.fromisoformat(row[1])
         except Exception:
@@ -440,13 +449,13 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
 
         uid = str(interaction.user.id)
 
-        # Check if already bet (before any updates)
+        # If one bet per round, show their existing bet
         with db() as conn:
             c = conn.cursor()
-            c.execute("""SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1""", (self.rid, uid))
+            c.execute("""SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1""",
+                      (self.rid, uid))
             existing = c.fetchone()
         if ONE_BET_PER_ROUND and existing:
-            # Show what they already have + current balance
             bal_now = get_balance(uid)
             return await interaction.response.send_message(
                 f"⚠️ You’ve already placed a bet this round.\n"
@@ -474,7 +483,7 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
 
         bal_after = bal_before - amt
 
-                # Try to refresh the public round embed (pool/bets/time + players) silently
+        # Refresh public round embed: pool/bets/time + latest players
         try:
             with db() as conn:
                 c = conn.cursor()
@@ -484,22 +493,19 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
                     raise RuntimeError("no message_id for round")
                 msg_id, exp_iso = r[0], r[1]
 
-                # totals
                 c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (self.rid,))
                 cnt, pool = c.fetchone()
 
-                # last up to 10 bettors
                 c.execute("""SELECT discord_id, choice, stake
                              FROM bets WHERE rid=?
                              ORDER BY ts DESC LIMIT 10""", (self.rid,))
                 last_rows = c.fetchall()
 
-            # compute remaining seconds
             try:
-                exp_dt = datetime.fromisoformat(exp_iso)
+                exp_dt2 = datetime.fromisoformat(exp_iso)
             except Exception:
-                exp_dt = now_local()
-            left = max(0, int((exp_dt - now_local()).total_seconds()))
+                exp_dt2 = now_local()
+            left = max(0, int((exp_dt2 - now_local()).total_seconds()))
 
             msg = await interaction.channel.fetch_message(int(msg_id))
             if msg.embeds:
@@ -509,27 +515,24 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
                 e.add_field(name="Time", value=f"{left}s left", inline=True)
                 e.add_field(name="Bets", value=str(cnt), inline=True)
 
-                # Build a tiny players line (most recent 10)
+                # Players (latest)
                 lines = []
-                for uid, ch, st in last_rows:
-                    m = interaction.guild.get_member(int(uid))
-                    name = m.mention if m else f"<@{uid}>"
+                for uid2, ch, st in last_rows:
+                    m = interaction.guild.get_member(int(uid2))
+                    name = m.mention if m else f"<@{uid2}>"
                     lines.append(f"{name} · {st} on {ch.upper()}")
-                players_val = "\n".join(lines) if lines else "—"
-                e.add_field(name="Players (latest)", value=players_val, inline=False)
+                e.add_field(name="Players (latest)", value=("\n".join(lines) if lines else "—"), inline=False)
 
                 await msg.edit(embed=e)
         except Exception:
             pass
 
-
-        # Clear + friendly confirmation (ephemeral)
+        # Ephemeral confirmation for the player
         await interaction.response.send_message(
             f"✅ Bet placed — **{amt}** on **{self.color.upper()}**\n"
             f"Balance: **{bal_before} ➜ {bal_after}**",
             ephemeral=True
         )
-
 
 class BetView(discord.ui.View):
     def __init__(self, rid: str, timeout: int | None = None):
