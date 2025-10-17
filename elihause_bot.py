@@ -224,43 +224,25 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
             c.execute("UPDATE prizes SET status='claimed', updated_ts=? WHERE id=?", (iso(now_local()), self.prize_id))
         await interaction.response.send_message("Thanks! Your WL gift claim is queued. An admin will fulfil it shortly. ✅", ephemeral=True)
 
-# ===== UI: Bet Buttons + Modal =====
-# ===== UI: Bet Buttons + Modal (with dropdown colour) =====
+# ===== UI: Bet Buttons + Amount-only Modal =====
 class BetModal(discord.ui.Modal, title="Place Your Bet"):
-    def __init__(self, rid: str, preselect_color: str = "red"):
+    def __init__(self, rid: str, color: str):
         super().__init__()
         self.rid = rid
+        self.color = color  # from the button clicked
 
         self.amount = discord.ui.TextInput(
-            label="Bet Amount (coins)",
+            label=f"Bet Amount on {color.upper()} (coins)",
             placeholder="e.g., 1000",
             required=True,
             max_length=10
         )
         self.add_item(self.amount)
 
-        # Dropdown for colour (preselect based on the button clicked)
-        class ColorSelect(discord.ui.Select):
-            def __init__(self, default_value: str):
-                options = [
-                    discord.SelectOption(label="red", description="Pays 2×", emoji="🟥", default=(default_value=="red")),
-                    discord.SelectOption(label="black", description="Pays 2×", emoji="⬛", default=(default_value=="black")),
-                    discord.SelectOption(label="green", description=f"Pays {PAYOUT_GREEN}×", emoji="🟩", default=(default_value=="green")),
-                ]
-                super().__init__(placeholder="Choose colour", min_values=1, max_values=1, options=options)
-                self.value_chosen = default_value
-
-            async def callback(self, interaction: discord.Interaction):
-                self.value_chosen = self.values[0]
-                await interaction.response.defer()  # just acknowledge; submit will handle
-
-        self.color_select = ColorSelect(preselect_color)
-        self.add_item(self.color_select)
-
     async def on_submit(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
 
-        # validate round still open
+        # validate open round
         o = get_open_round(interaction.channel.id)
         if not o:
             return await interaction.response.send_message("No open round in this channel.", ephemeral=True)
@@ -278,12 +260,7 @@ class BetModal(discord.ui.Modal, title="Place Your Bet"):
         if amount <= 0 or amount > MAX_STAKE:
             return await interaction.response.send_message(f"Amount must be between 1 and {MAX_STAKE}.", ephemeral=True)
 
-        # colour from dropdown
-        color = getattr(self.color_select, "value_chosen", "red")
-        if color not in ("red","black","green"):
-            return await interaction.response.send_message("Pick red, black, or green.", ephemeral=True)
-
-        # place bet (same rules as !bet)
+        color = self.color  # fixed by button
         ensure_user(uid)
         with db() as conn:
             c = conn.cursor()
@@ -292,6 +269,7 @@ class BetModal(discord.ui.Modal, title="Place Your Bet"):
                 if c.fetchone():
                     return await interaction.response.send_message("You already placed a bet this round.", ephemeral=True)
 
+            # balance check
             c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
             bal = c.fetchone()[0]
             if bal < amount:
@@ -309,7 +287,7 @@ class BetModal(discord.ui.Modal, title="Place Your Bet"):
             ephemeral=True
         )
 
-        # optional: refresh embed stats
+        # optional: refresh the round embed stats
         try:
             with db() as conn:
                 c = conn.cursor()
@@ -324,7 +302,6 @@ class BetModal(discord.ui.Modal, title="Place Your Bet"):
                 if msg.embeds:
                     e = msg.embeds[0]
                     e.clear_fields()
-                    # seconds left
                     _, exp2 = get_open_round(interaction.channel.id)
                     left = max(0, int((exp2 - now_local()).total_seconds()))
                     e.add_field(name="Pool", value=str(pool), inline=True)
@@ -342,15 +319,15 @@ class BetView(discord.ui.View):
 
     @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger, emoji="🟥")
     async def bet_red(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BetModal(self.rid, preselect_color="red"))
+        await interaction.response.send_modal(BetModal(self.rid, color="red"))
 
     @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="⬛")
     async def bet_black(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BetModal(self.rid, preselect_color="black"))
+        await interaction.response.send_modal(BetModal(self.rid, color="black"))
 
     @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🟩")
     async def bet_green(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BetModal(self.rid, preselect_color="green"))
+        await interaction.response.send_modal(BetModal(self.rid, color="green"))
 
 # ---- Commands: Coins ----
 @bot.command(name="joinhaus")
