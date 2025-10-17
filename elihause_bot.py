@@ -920,7 +920,7 @@ async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SE
 
     embed = discord.Embed(
         title=f"🎯 Roulette — Round {rlabel}",
-        description="Click a button to bet. A modal will ask your amount.",
+        description="Click to bet. The screen’s your dealer- don't stutter when it asks your amount.",
         color=discord.Color.gold()
     )
     embed.add_field(name="Pool", value="0", inline=True)
