@@ -85,7 +85,7 @@ def init_db():
             key TEXT PRIMARY KEY,
             val TEXT
         )""")
-        c.execute("""CREATE TABLE IF NOTExists rounds(
+        c.execute("""CREATE TABLE IF NOT EXISTS rounds(
             rid TEXT PRIMARY KEY,
             channel_id TEXT,
             status TEXT,       -- OPEN|RESOLVED|CANCELLED
