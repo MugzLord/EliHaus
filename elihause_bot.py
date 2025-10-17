@@ -37,7 +37,9 @@ STARTER_AMOUNT = 5_000
 TICKET_COST = 10_000            # coins per ticket
 LOTTO_WINNERS = 1               # fixed: 1 grand winner
 LOTTO_WL_COUNT = 10             # 10 wishlist gifts to the winner
-SHOP_NAME = "Shop X"            # display name in winner message
+SHOP_NAME = "Shop YaEli"
+SHOP_YAELI_URL = os.getenv("https://www.imvu.com/shop/web_search.php?manufacturers_id=360644281")  # put your real shop link
+
 
 # Roulette knobs (admin-led, manual resolve)
 ROUND_SECONDS_DEFAULT = 120
@@ -468,6 +470,18 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
         except Exception:
             pass
 
+    @bot.event
+    async def on_command_error(ctx, error):
+        from discord.ext.commands import CommandNotFound, MissingPermissions, CheckFailure, BadArgument
+        if isinstance(error, CommandNotFound):
+            return
+        if isinstance(error, (MissingPermissions, CheckFailure)):
+            return await ctx.reply("You don’t have permission to use that command.")
+        if isinstance(error, BadArgument):
+            return await ctx.reply("Bad arguments. Try `!help <command>`.")
+        await ctx.reply(f"Error: {error.__class__.__name__}")
+    
+    
 
 class BetView(discord.ui.View):
     def __init__(self, rid: str, timeout: int | None = None):
@@ -820,10 +834,14 @@ async def drawlotto(ctx: commands.Context):
     mention = member.mention if member else f"<@{winner_id}>"
 
     embed = discord.Embed(
-        title="🎉 Weekly Lotto Winner!",
-        description=f"{mention} wins **{LOTTO_WL_COUNT}** wishlist gifts from **{SHOP_NAME}**.",
-        color=discord.Color.gold()
-    )
+    title="🎉 Weekly Lotto Winner!",
+    description=(
+        f"{mention} wins **{LOTTO_WL_COUNT}** wishlist gifts from "
+        f"**[{SHOP_NAME}]({SHOP_YAELI_URL})**."
+    ),
+    color=discord.Color.gold()
+)
+
     # Optional: include claim instructions
     # embed.add_field(name="How to claim", value=f"Add **10 items** from **[Shop YaEli]({SHOP_YAELI_URL})** to your wishlist, then press the button below.", inline=False)
 
@@ -872,6 +890,74 @@ async def fulfil_done(ctx: commands.Context, queue_id: int):
         c.execute("UPDATE prize_queue SET status='fulfilled', updated_ts=? WHERE id=?", (iso(now_local()), queue_id))
         c.execute("UPDATE prizes SET status='fulfilled', updated_ts=? WHERE id=?", (iso(now_local()), prize_id))
     await ctx.reply(f"Marked fulfilment queue **#{queue_id}** as fulfilled ✅")
+
+# ==== Categorized Help ====
+class EliHausHelp(commands.MinimalHelpCommand):
+    def get_command_signature(self, command):
+        return f"!{command.qualified_name} {command.signature}".strip()
+
+    async def send_bot_help(self, mapping):
+        # Define categories
+        player_cmds = [
+            "joinhaus", "daily", "weekly", "balance",
+            "openround",  # players see it, but we’ll mark admin-only below
+            "bet", "round",
+            "buyticket", "lotto"
+        ]
+        admin_cmds = [
+            "openround", "resolve", "cancelround",
+            "deposit", "withdraw",
+            "drawlotto",
+            "fulfil_next", "fulfil_done",
+            "lottoboard", "lottoexport", "roundreset"  # if you added these
+        ]
+
+        # Collect available commands
+        all_cmds = {c.qualified_name: c for c in self.context.bot.commands}
+
+        def fmt_list(names, admin=False):
+            lines = []
+            for n in names:
+                c = all_cmds.get(n)
+                if not c:
+                    continue
+                sig = self.get_command_signature(c)
+                # mark admin-only commands
+                tag = " *(admin)*" if admin else ""
+                brief = f" — {c.brief}" if getattr(c, "brief", None) else ""
+                lines.append(f"• `{sig}`{tag}{brief}")
+            return "\n".join(lines) if lines else "_None_"
+
+        # Build embed
+        e = discord.Embed(
+            title="📖 EliHaus Commands",
+            color=discord.Color.gold(),
+            description="**Tip:** Use `!help <command>` for details."
+        )
+        e.add_field(
+            name="🎮 Player Commands",
+            value=fmt_list(
+                ["joinhaus","daily","weekly","balance","bet","round","buyticket","lotto"]
+            ),
+            inline=False
+        )
+        e.add_field(
+            name="🛠️ Admin Commands",
+            value=fmt_list(
+                ["openround","resolve","cancelround","deposit","withdraw","drawlotto","fulfil_next","fulfil_done","lottoboard","lottoexport","roundreset"],
+                admin=True
+            ),
+            inline=False
+        )
+        await self.get_destination().send(embed=e)
+
+    async def send_command_help(self, command):
+        e = discord.Embed(title=f"❓ Help: !{command.qualified_name}", color=discord.Color.gold())
+        e.add_field(name="Usage", value=f"`{self.get_command_signature(command) or '!'+command.qualified_name}`", inline=False)
+        if command.help:
+            e.add_field(name="Description", value=command.help, inline=False)
+        await self.get_destination().send(embed=e)
+
 
 # ---- Run ----
 @bot.event
