@@ -1,11 +1,11 @@
-# elihause_bot.py — EliHaus (coins + admin roulette + weekly lotto + prize queue)
+# elihause_bot.py — EliHaus (coins + admin roulette + weekly lotto + prize queue) — SLASH ver (eh_*)
 # Requires: pip install -U discord.py
-import os, sqlite3, random, json
+import os, sqlite3, random, json, traceback
 from datetime import datetime, timedelta, timezone
-import traceback
 
 import discord
 from discord.ext import commands
+from discord import app_commands
 from zoneinfo import ZoneInfo  # proper DST (e.g., Europe/London)
 
 # ---------------- Config ----------------
@@ -13,17 +13,20 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
+# Optional: fast guild sync during development
+GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0"))
+
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/London")
 try:
     TZ = ZoneInfo(TIMEZONE_NAME)
 except Exception:
     TZ = timezone.utc
 
-PREFIX = "!"
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
-bot = commands.Bot(command_prefix=PREFIX, intents=INTENTS)
+
+bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 # Admin role (optional): users with Manage Server or this role ID are treated as admins
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
@@ -76,7 +79,7 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS tx(
             id INTEGER PRIMARY KEY,
             discord_id TEXT,
-            kind TEXT,        -- 'claim','bet','payout','adjust','redeem','lotto','starter'
+            kind TEXT,
             amount INTEGER,
             meta TEXT,
             ts TEXT
@@ -123,10 +126,10 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS prizes(
             id INTEGER PRIMARY KEY,
             winner_id TEXT,
-            kind TEXT,           -- 'wl'
-            amount INTEGER,      -- number of WL gifts
-            meta TEXT,           -- JSON: {"shop":"Shop X"}
-            status TEXT,         -- 'pending','claimed','ready','fulfilled','failed'
+            kind TEXT,
+            amount INTEGER,
+            meta TEXT,
+            status TEXT,
             created_ts TEXT,
             updated_ts TEXT
         )""")
@@ -203,51 +206,13 @@ def human_left(dt: datetime, ref: datetime | None = None) -> str:
     if m and not d: parts.append(f"{m}m")
     return " ".join(parts) or "less than 1m"
 
-# ---------------- Admin check decorator ----------------
-def is_admin():
-    async def predicate(ctx: commands.Context):
-        if ctx.author.guild_permissions.manage_guild or ctx.guild.owner_id == ctx.author.id:
-            return True
-        if ADMIN_ROLE_ID:
-            role = ctx.guild.get_role(ADMIN_ROLE_ID)
-            if role and role in ctx.author.roles:
-                return True
-        return False
-    return commands.check(predicate)
-
-def _user_is_admin(ctx: commands.Context) -> bool:
-    if ctx.author.guild_permissions.manage_guild or ctx.guild.owner_id == ctx.author.id:
+# ---------------- Admin check helpers ----------------
+def user_is_admin(member: discord.Member) -> bool:
+    if getattr(member.guild_permissions, "manage_guild", False) or member.id == getattr(member.guild, "owner_id", 0):
         return True
-    if ADMIN_ROLE_ID:
-        role = ctx.guild.get_role(ADMIN_ROLE_ID)
-        if role and role in ctx.author.roles:
-            return True
+    if ADMIN_ROLE_ID and hasattr(member, "roles"):
+        return any(getattr(r, "id", 0) == ADMIN_ROLE_ID for r in member.roles)
     return False
-
-# ---------------- User/Economy helpers ----------------
-def ensure_user(uid: str):
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""INSERT OR IGNORE INTO users(discord_id,balance,last_daily,last_weekly,joined_at)
-                     VALUES(?,?,?,?,?)""", (uid, 0, None, None, iso(now_local())))
-
-def get_balance(uid: str) -> int:
-    ensure_user(uid)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
-        row = c.fetchone()
-        return row[0] if row else 0
-
-def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
-    ensure_user(uid)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (delta, uid))
-        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                  (uid, kind, delta, meta, iso(now_local())))
-        c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
-        return c.fetchone()[0]
 
 # ---------------- Tickets category helper ----------------
 async def _get_or_create_tickets_category(guild: discord.Guild) -> discord.CategoryChannel | None:
@@ -316,7 +281,7 @@ class ClaimView(discord.ui.View):
         return get_state(ClaimView._round_label_key(rid)) or rid
 
     @staticmethod
-    def short_seed(s: str, n: int = 6) -> str:
+       def short_seed(s: str, n: int = 6) -> str:
         return f"{s[:n]}…{s[-n:]}" if s and len(s) > 2 * n else (s or "")
 
     # ---- Claim button ----
@@ -501,13 +466,17 @@ class BetModal(discord.ui.Modal, title="Place your bet"):
                 e.add_field(name="Bets", value=str(cnt), inline=True)
                 await msg.edit(embed=e)
         except Exception:
-            # never block the user’s modal reply if refresh fails
             pass
 
-
         uid = str(interaction.user.id)
-        ensure_user(uid)
-        bal = get_balance(uid)
+        # ensure user + balance checks
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("""INSERT OR IGNORE INTO users(discord_id,balance,last_daily,last_weekly,joined_at)
+                         VALUES(?,?,?,?,?)""", (uid, 0, None, None, iso(now_local())))
+            c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
+            row = c.fetchone()
+            bal = row[0] if row else 0
         if bal < amt:
             return await interaction.response.send_message(f"Insufficient coins. Balance **{bal}**.", ephemeral=True)
 
@@ -575,68 +544,73 @@ def get_open_round(channel_id: int):
         return None
     return rid, exp_dt
 
-# ---------------- Help ----------------
-class EliHausHelp(commands.MinimalHelpCommand):
-    def get_command_signature(self, command):
-        return f"!{command.qualified_name} {command.signature}".strip()
+# ---------------- Slash Commands (eh_*) ----------------
+def ensure_user(uid: str):
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("""INSERT OR IGNORE INTO users(discord_id,balance,last_daily,last_weekly,joined_at)
+                     VALUES(?,?,?,?,?)""", (uid, 0, None, None, iso(now_local())))
 
-    async def send_bot_help(self, mapping):
-        ctx = self.context
-        is_admin = _user_is_admin(ctx)
-        player_names = ["joinhaus","daily","weekly","balance","bet","round","buyticket","lotto"]
-        admin_names = ["openround","resolve","cancelround","deposit","withdraw","drawlotto","fulfil_next","fulfil_done","roundreset"]
-        all_cmds = {c.qualified_name: c for c in ctx.bot.commands}
+def get_balance(uid: str) -> int:
+    ensure_user(uid)
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
+        row = c.fetchone()
+        return row[0] if row else 0
 
-        def fmt(names):
-            lines = []
-            for n in names:
-                cmd = all_cmds.get(n)
-                if not cmd:
-                    continue
-                sig = self.get_command_signature(cmd)
-                brief = f" — {cmd.brief}" if getattr(cmd, "brief", None) else ""
-                lines.append(f"• `{sig}`{brief}")
-            return "\n".join(lines) if lines else "_None_"
+def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
+    ensure_user(uid)
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (delta, uid))
+        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                  (uid, kind, delta, meta, iso(now_local())))
+        c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
+        return c.fetchone()[0]
 
-        e = discord.Embed(
-            title="📖 EliHaus Commands",
-            description="**Tip:** Use `!help <command>` for details.",
-            color=discord.Color.gold()
-        )
-        e.add_field(name="🎮 Player Commands", value=fmt(player_names), inline=False)
-        if is_admin:
-            e.add_field(name="🛠️ Admin Commands", value=fmt(admin_names), inline=False)
-            e.set_footer(text="You are an admin: admin commands shown.")
-        else:
-            e.set_footer(text="Admin commands are hidden. Ask a mod if you need help.")
-        await self.get_destination().send(embed=e)
+# ---- Help (slash) ----
+@bot.tree.command(name="eh_help", description="Show EliHaus commands")
+async def eh_help(interaction: discord.Interaction):
+    is_admin = user_is_admin(interaction.user)
+    public = [
+        "`/eh_join` – join EliHaus (starter coins)",
+        "`/eh_daily` – claim daily coins",
+        "`/eh_weeklyw` – claim weekly coins",
+        "`/eh_balance` – check balance",
+        "`/eh_buyticket` – buy lotto tickets",
+        "`/eh_lotto` – see lotto status",
+        "`/eh_table` – active roulette round status",
+    ]
+    admin = [
+        "`/eh_openround` – open roulette round",
+        "`/eh_resolve` – resolve round",
+        "`/eh_cancelround` – cancel round",
+        "`/eh_deposit` / `/eh_withdraw` – adjust balance",
+        "`/eh_drawlotto` – draw weekly winner",
+        "`/eh_fulfil_next` / `/eh_fulfil_done` – fulfil WL claims",
+        "`/eh_roundreset` – unlock stuck round",
+    ]
+    lines = public + (["\n**Admin**"] + admin if is_admin else [])
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    async def send_command_help(self, command):
-        e = discord.Embed(title=f"❓ Help: !{command.qualified_name}", color=discord.Color.gold())
-        e.add_field(name="Usage", value=f"`{self.get_command_signature(command) or '!'+command.qualified_name}`", inline=False)
-        if command.help:
-            e.add_field(name="Description", value=command.help, inline=False)
-        await self.get_destination().send(embed=e)
-
-bot.help_command = EliHausHelp()
-
-# ---------------- Commands: Coins ----------------
-@bot.command(name="joinhaus")
-async def joinhaus(ctx: commands.Context):
-    uid = str(ctx.author.id)
+# ---- Player: join/daily/weekly/balance ----
+@bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
+async def eh_join(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
     ensure_user(uid)
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT 1 FROM tx WHERE discord_id=? AND kind='starter' LIMIT 1", (uid,))
         has_starter = c.fetchone() is not None
     if has_starter:
-        return await ctx.reply("You’ve already joined EliHaus. Use `!daily` and `!weekly` to build coins.")
+        return await interaction.response.send_message("You’ve already joined EliHaus. Use `/eh_daily` and `/eh_weeklyw` to build coins.", ephemeral=True)
     new_bal = change_balance(uid, STARTER_AMOUNT, "starter", "joinhaus starter")
-    await ctx.reply(f"Welcome to **EliHaus**. Starter pack: **{STARTER_AMOUNT}** coins. Balance: **{new_bal}**")
+    await interaction.response.send_message(f"Welcome to **EliHaus**. Starter pack: **{STARTER_AMOUNT}** coins. Balance: **{new_bal}**", ephemeral=True)
 
-@bot.command(name="daily")
-async def daily(ctx: commands.Context):
-    uid = str(ctx.author.id)
+@bot.tree.command(name="eh_daily", description="Claim your daily coins")
+async def eh_daily(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
     ensure_user(uid)
     with db() as conn:
         c = conn.cursor()
@@ -648,64 +622,75 @@ async def daily(ctx: commands.Context):
             left = timedelta(hours=24) - (now - last)
             hrs = int(left.total_seconds() // 3600)
             mins = int((left.total_seconds() % 3600) // 60)
-            return await ctx.reply(f"You’ve already claimed. Try again in **{hrs}h {mins}m**.")
+            return await interaction.response.send_message(f"You’ve already claimed. Try again in **{hrs}h {mins}m**.", ephemeral=True)
         new_bal = change_balance(uid, DAILY_AMOUNT, "claim", "daily")
         c.execute("UPDATE users SET last_daily=? WHERE discord_id=?", (iso(now), uid))
-    await ctx.reply(f"Daily claimed: **{DAILY_AMOUNT}** coins. New balance: **{new_bal}**")
+    await interaction.response.send_message(f"Daily claimed: **{DAILY_AMOUNT}** coins. New balance: **{new_bal}**", ephemeral=True)
 
-@bot.command(name="weekly")
-async def weekly(ctx: commands.Context):
-    uid = str(ctx.author.id)
+@bot.tree.command(name="eh_weeklyw", description="Claim your weekly coins")
+async def eh_weeklyw(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
     ensure_user(uid)
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT last_weekly FROM users WHERE discord_id=?", (uid,))
         row = c.fetchone()
-        now = now_local()
+        nowt = now_local()
         last = datetime.fromisoformat(row[0]).astimezone(TZ) if row and row[0] else None
-        if last and (last.isocalendar()[:2] == now.isocalendar()[:2]):
-            return await ctx.reply("You’ve already claimed your weekly this week.")
+        if last and (last.isocalendar()[:2] == nowt.isocalendar()[:2]):
+            return await interaction.response.send_message("You’ve already claimed your weekly this week.", ephemeral=True)
         new_bal = change_balance(uid, WEEKLY_AMOUNT, "claim", "weekly")
-        c.execute("UPDATE users SET last_weekly=? WHERE discord_id=?", (iso(now), uid))
-    await ctx.reply(f"Weekly claimed: **{WEEKLY_AMOUNT}** coins. New balance: **{new_bal}**")
+        c.execute("UPDATE users SET last_weekly=? WHERE discord_id=?", (iso(nowt), uid))
+    await interaction.response.send_message(f"Weekly claimed: **{WEEKLY_AMOUNT}** coins. New balance: **{new_bal}**", ephemeral=True)
 
-@bot.command(name="balance")
-async def balance(ctx: commands.Context, member: discord.Member | None = None):
-    m = member or ctx.author
+@bot.tree.command(name="eh_balance", description="Check a balance")
+@app_commands.describe(member="Member to check (optional)")
+async def eh_balance(interaction: discord.Interaction, member: discord.Member | None = None):
+    m = member or interaction.user
     bal = get_balance(str(m.id))
-    await ctx.reply(f"{m.mention} has **{bal}** coins.")
+    await interaction.response.send_message(f"{m.mention} has **{bal}** coins.", ephemeral=True)
 
-@commands.has_permissions(manage_guild=True)
-@bot.command(name="deposit")
-async def deposit(ctx: commands.Context, member: discord.Member, amount: int):
+# ---- Admin: deposit/withdraw ----
+@bot.tree.command(name="eh_deposit", description="(Admin) Deposit coins into a user's balance")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(member="Member to deposit to", amount="Positive amount")
+async def eh_deposit(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
     if amount <= 0:
-        return await ctx.reply("Amount must be positive.")
-    new_bal = change_balance(str(member.id), amount, "adjust", f"deposit by {ctx.author.id}")
-    await ctx.reply(f"Deposited **{amount}** to {member.mention}. Balance: **{new_bal}**")
+        return await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+    new_bal = change_balance(str(member.id), amount, "adjust", f"deposit by {interaction.user.id}")
+    await interaction.response.send_message(f"Deposited **{amount}** to {member.mention}. Balance: **{new_bal}**", ephemeral=True)
 
-@commands.has_permissions(manage_guild=True)
-@bot.command(name="withdraw")
-async def withdraw(ctx: commands.Context, member: discord.Member, amount: int):
+@bot.tree.command(name="eh_withdraw", description="(Admin) Withdraw coins from a user's balance")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(member="Member to withdraw from", amount="Positive amount")
+async def eh_withdraw(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
     if amount <= 0:
-        return await ctx.reply("Amount must be positive.")
+        return await interaction.response.send_message("Amount must be positive.", ephemeral=True)
     uid = str(member.id)
     bal = get_balance(uid)
     if bal < amount:
-        return await ctx.reply("Insufficient user balance.")
-    new_bal = change_balance(uid, -amount, "adjust", f"withdraw by {ctx.author.id}")
-    await ctx.reply(f"Withdrew **{amount}** from {member.mention}. Balance: **{new_bal}**")
+        return await interaction.response.send_message("Insufficient user balance.", ephemeral=True)
+    new_bal = change_balance(uid, -amount, "adjust", f"withdraw by {interaction.user.id}")
+    await interaction.response.send_message(f"Withdrew **{amount}** from {member.mention}. Balance: **{new_bal}**", ephemeral=True)
 
-# ---------------- Roulette Commands ----------------
-@is_admin()
-@bot.command(name="openround")
-async def openround(ctx: commands.Context, seconds: int = ROUND_SECONDS_DEFAULT):
+# ---- Roulette: open/status/resolve/cancel ----
+@bot.tree.command(name="eh_openround", description="(Admin) Open a roulette round")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(seconds="Betting window (10-600s)")
+async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SECONDS_DEFAULT):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
     seconds = max(10, min(seconds, 600))
-    if get_open_round(ctx.channel.id):
-        return await ctx.reply("There’s already an open round in this channel.")
-    rid, exp = open_round(ctx.channel.id, seconds, str(ctx.author.id))
+    if get_open_round(interaction.channel.id):
+        return await interaction.response.send_message("There’s already an open round in this channel.", ephemeral=True)
+    rid, exp = open_round(interaction.channel.id, seconds, str(interaction.user.id))
 
     # user-friendly label like #1, #2 per channel
-    rnum = ClaimView.next_round_number(ctx.channel.id)
+    rnum = ClaimView.next_round_number(interaction.channel.id)
     rlabel = f"#{rnum}"
     ClaimView.set_round_label(rid, rlabel)
 
@@ -719,61 +704,35 @@ async def openround(ctx: commands.Context, seconds: int = ROUND_SECONDS_DEFAULT)
     embed.add_field(name="Bets", value="0", inline=True)
 
     view = BetView(rid, timeout=seconds + 30)
-    msg = await ctx.reply(embed=embed, view=view)
+    msg = await interaction.channel.send(embed=embed, view=view)
     with db() as conn:
         conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
+    await interaction.response.send_message(f"Opened roulette round {rlabel}.", ephemeral=True)
 
-@bot.command(name="round")
-async def round_status(ctx: commands.Context):
-    o = get_open_round(ctx.channel.id)
+@bot.tree.command(name="eh_table", description="Show current roulette round status in this channel")
+async def eh_table(interaction: discord.Interaction):
+    o = get_open_round(interaction.channel.id)
     if not o:
-        return await ctx.reply("No open round in this channel.")
+        return await interaction.response.send_message("No open round in this channel.", ephemeral=True)
     rid, exp = o
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
         cnt, pool = c.fetchone()
     remain = max(0, int((exp - now_local()).total_seconds()))
-    await ctx.reply(f"Round **{ClaimView.get_round_label(rid)}** — Bets: **{cnt}** | Pool: **{pool}** | Time left: **{remain}s**")
+    await interaction.response.send_message(
+        f"Round **{ClaimView.get_round_label(rid)}** — Bets: **{cnt}** | Pool: **{pool}** | Time left: **{remain}s**",
+        ephemeral=True
+    )
 
-@bot.command(name="bet")
-async def bet(ctx: commands.Context, amount: int, choice: str):
-    """Manual bet command (in addition to the buttons)."""
-    choice = choice.lower().strip()
-    if choice not in ("red","black","green"):
-        return await ctx.reply("Pick `red`, `black`, or `green`.")
-    o = get_open_round(ctx.channel.id)
+@bot.tree.command(name="eh_resolve", description="(Admin) Resolve the current roulette round")
+@app_commands.default_permissions(manage_guild=True)
+async def eh_resolve(interaction: discord.Interaction):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+    o = get_open_round(interaction.channel.id)
     if not o:
-        return await ctx.reply("No open round. Ask an admin to `!openround`.")
-    rid, exp = o
-    if now_local() > exp:
-        return await ctx.reply("Betting window is closed for this round.")
-    if amount <= 0 or amount > MAX_STAKE:
-        return await ctx.reply(f"Stake must be between 1 and {MAX_STAKE}.")
-    uid = str(ctx.author.id)
-    ensure_user(uid)
-    with db() as conn:
-        c = conn.cursor()
-        if ONE_BET_PER_ROUND:
-            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (rid, uid))
-            if c.fetchone():
-                return await ctx.reply("You’ve already placed a bet this round.")
-        bal = get_balance(uid)
-        if bal < amount:
-            return await ctx.reply(f"Insufficient coins. Balance **{bal}**.")
-        c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (amount, uid))
-        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                  (uid, "bet", -amount, f"roulette:{rid}|{choice}", iso(now_local())))
-        c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
-                  (rid, str(ctx.channel.id), uid, choice, amount, iso(now_local())))
-    await ctx.message.add_reaction("✅")
-
-@commands.has_permissions(manage_guild=True)
-@bot.command(name="resolve")
-async def resolve_round(ctx: commands.Context):
-    o = get_open_round(ctx.channel.id)
-    if not o:
-        return await ctx.reply("No open round to resolve.")
+        return await interaction.response.send_message("No open round to resolve.", ephemeral=True)
     rid, _exp = o
 
     # roll an outcome with a reproducible seed
@@ -791,13 +750,13 @@ async def resolve_round(ctx: commands.Context):
     # settle
     total_pool = 0
     winners = []
+    rows = []
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,))
         rows = c.fetchall()
         for uid, ch, stake in rows:
             total_pool += stake
-        # pay winners
         for uid, ch, stake in rows:
             if ch == outcome:
                 win = int(stake * multiplier)
@@ -807,7 +766,7 @@ async def resolve_round(ctx: commands.Context):
                 winners.append((uid, win))
         c.execute("UPDATE rounds SET status='RESOLVED', outcome=?, seed=?, resolved_at=? WHERE rid=?",
                   (outcome, seed, iso(now_local()), rid))
-    set_state(round_key(ctx.channel.id), None)
+    set_state(round_key(interaction.channel.id), None)
 
     # update the original embed (remove buttons)
     msg_id = None
@@ -822,7 +781,7 @@ async def resolve_round(ctx: commands.Context):
     seed_display = ClaimView.short_seed(seed, 8)
     top_mentions = []
     for uid, _win in sorted(winners, key=lambda x: x[1], reverse=True)[:5]:
-        m = ctx.guild.get_member(int(uid))
+        m = interaction.guild.get_member(int(uid))
         top_mentions.append(m.mention if m else f"<@{uid}>")
 
     summary_text = (f"🎯 **Round {rlabel} → {outcome.upper()}**\n"
@@ -832,26 +791,30 @@ async def resolve_round(ctx: commands.Context):
 
     if msg_id:
         try:
-            msg = await ctx.channel.fetch_message(msg_id)
+            msg = await interaction.channel.fetch_message(msg_id)
             e = msg.embeds[0] if msg.embeds else discord.Embed(color=discord.Color.gold())
             e.title = f"🎯 Roulette — Round {rlabel}"
             e.description = f"**RESULT:** {outcome.upper()}"
             e.set_footer(text=f"Seed: {seed_display}")
             await msg.edit(embed=e, view=None)
-            await ctx.send(summary_text)
+            await interaction.channel.send(summary_text)
         except Exception:
-            await ctx.reply(summary_text)
+            await interaction.channel.send(summary_text)
     else:
-        await ctx.reply(summary_text)
+        await interaction.channel.send(summary_text)
 
-@commands.has_permissions(manage_guild=True)
-@bot.command(name="cancelround")
-async def cancelround(ctx: commands.Context):
-    o = get_open_round(ctx.channel.id)
+    await interaction.response.send_message("Round resolved.", ephemeral=True)
+
+@bot.tree.command(name="eh_cancelround", description="(Admin) Cancel the current roulette round and refund")
+@app_commands.default_permissions(manage_guild=True)
+async def eh_cancelround(interaction: discord.Interaction):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+    o = get_open_round(interaction.channel.id)
     if not o:
-        return await ctx.reply("No open round to cancel.")
+        return await interaction.response.send_message("No open round to cancel.", ephemeral=True)
     rid, _ = o
-    set_state(round_key(ctx.channel.id), None)
+    set_state(round_key(interaction.channel.id), None)
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT discord_id, stake FROM bets WHERE rid=?", (rid,))
@@ -861,18 +824,19 @@ async def cancelround(ctx: commands.Context):
             c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
                       (uid, "payout", stake, f"roulette:{rid}|refund", iso(now_local())))
         c.execute("UPDATE rounds SET status='CANCELLED', resolved_at=? WHERE rid=?", (iso(now_local()), rid))
-    await ctx.reply(f"Round **{ClaimView.get_round_label(rid)}** cancelled and bets refunded.")
+    await interaction.response.send_message(f"Round **{ClaimView.get_round_label(rid)}** cancelled and bets refunded.", ephemeral=True)
 
-# ---------------- Lotto ----------------
-@bot.command(name="buyticket")
-async def buyticket(ctx: commands.Context, count: int = 1):
+# ---- Lotto ----
+@bot.tree.command(name="eh_buyticket", description="Buy tickets for this week’s Lotto")
+@app_commands.describe(count="How many tickets (1-100)")
+async def eh_buyticket(interaction: discord.Interaction, count: int = 1):
     if count <= 0 or count > 100:
-        return await ctx.reply("You can buy between 1 and 100 tickets at once.")
-    uid = str(ctx.author.id)
+        return await interaction.response.send_message("You can buy between 1 and 100 tickets at once.", ephemeral=True)
+    uid = str(interaction.user.id)
     cost = TICKET_COST * count
     bal = get_balance(uid)
     if bal < cost:
-        return await ctx.reply(f"Not enough coins. Need **{cost}**, you have **{bal}**.")
+        return await interaction.response.send_message(f"Not enough coins. Need **{cost}**, you have **{bal}**.", ephemeral=True)
     with db() as conn:
         c = conn.cursor()
         c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (cost, uid))
@@ -881,12 +845,12 @@ async def buyticket(ctx: commands.Context, count: int = 1):
         wk = week_id()
         for _ in range(count):
             c.execute("INSERT INTO tickets(week_id,discord_id,ts) VALUES(?,?,?)", (wk, uid, iso(now_local())))
-    await ctx.reply(f"🎟️ Bought **{count}** ticket(s) for this week’s Lotto. Good luck!")
+    await interaction.response.send_message(f"🎟️ Bought **{count}** ticket(s) for this week’s Lotto. Good luck!", ephemeral=True)
 
-@bot.command(name="lotto")
-async def lotto(ctx: commands.Context):
+@bot.tree.command(name="eh_lotto", description="Show weekly lotto status")
+async def eh_lotto(interaction: discord.Interaction):
     wk = week_id()
-    uid = str(ctx.author.id)
+    uid = str(interaction.user.id)
     draw_dt = next_draw_dt()
     draw_str = draw_dt.strftime("%a %d %b %Y • %I:%M %p %Z")
     left = human_left(draw_dt)
@@ -896,23 +860,26 @@ async def lotto(ctx: commands.Context):
         total = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=? AND discord_id=?", (wk, uid))
         mine = c.fetchone()[0]
-    await ctx.reply(
+    await interaction.response.send_message(
         f"🎟️ **Weekly Lotto** — Week {wk}\n"
         f"Draw: **{draw_str}** _(in {left})_\n"
         f"Total tickets: **{total}** • Your tickets: **{mine}**\n"
-        f"Prize: **{LOTTO_WL_COUNT} WL gifts** from **{SHOP_NAME}** to **{LOTTO_WINNERS}** winner."
+        f"Prize: **{LOTTO_WL_COUNT} WL gifts** from **{SHOP_NAME}** to **{LOTTO_WINNERS}** winner.",
+        ephemeral=True
     )
 
-@commands.has_permissions(manage_guild=True)
-@bot.command(name="drawlotto")
-async def drawlotto(ctx: commands.Context):
+@bot.tree.command(name="eh_drawlotto", description="(Admin) Draw this week’s lotto")
+@app_commands.default_permissions(manage_guild=True)
+async def eh_drawlotto(interaction: discord.Interaction):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
     wk = week_id()
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT id, discord_id FROM tickets WHERE week_id=?", (wk,))
         all_tix = c.fetchall()
     if not all_tix:
-        return await ctx.reply(f"No tickets for Week {wk}.")
+        return await interaction.response.send_message(f"No tickets for Week {wk}.", ephemeral=True)
     seed = f"LOTTO-{wk}-{int(now_local().timestamp())}-{random.randint(1, 1_000_000)}"
     random.seed(seed)
     winner_ticket = random.choice(all_tix)
@@ -925,19 +892,23 @@ async def drawlotto(ctx: commands.Context):
                      VALUES(?,?,?,?,?,?,?)""",
                   (winner_id, "wl", LOTTO_WL_COUNT, json.dumps({"shop": SHOP_NAME, "week": wk}), "pending", iso(now_local()), iso(now_local())))
         prize_id = c.lastrowid
-    member = ctx.guild.get_member(int(winner_id))
+    member = interaction.guild.get_member(int(winner_id))
     mention = member.mention if member else f"<@{winner_id}>"
     embed = discord.Embed(
         title="🎉 Weekly Lotto Winner!",
         description=f"{mention} wins **{LOTTO_WL_COUNT}** wishlist gifts from **[{SHOP_NAME}]({SHOP_YAELI_URL})**.",
         color=discord.Color.gold()
     )
-    await ctx.reply(embed=embed, view=ClaimView(prize_id))
+    # Post winner publicly with claim button, respond ephemeral to admin
+    await interaction.channel.send(embed=embed, view=ClaimView(prize_id))
+    await interaction.response.send_message("Winner posted.", ephemeral=True)
 
-# ---------------- Prize fulfilment ----------------
-@commands.has_permissions(manage_guild=True)
-@bot.command(name="fulfil_next")
-async def fulfil_next(ctx: commands.Context):
+# ---- Prize fulfilment ----
+@bot.tree.command(name="eh_fulfil_next", description="(Admin) Show next WL claim to fulfil")
+@app_commands.default_permissions(manage_guild=True)
+async def eh_fulfil_next(interaction: discord.Interaction):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
     with db() as conn:
         c = conn.cursor()
         c.execute("""SELECT pq.id, pq.prize_id, pq.winner_id, pq.imvu_name, pq.imvu_profile, p.amount, p.meta
@@ -948,7 +919,7 @@ async def fulfil_next(ctx: commands.Context):
                      LIMIT 1""")
         row = c.fetchone()
     if not row:
-        return await ctx.reply("No pending WL claims to fulfil.")
+        return await interaction.response.send_message("No pending WL claims to fulfil.", ephemeral=True)
     pq_id, prize_id, winner_id, imvu_name, imvu_profile, amount, meta = row
     imvu_link = imvu_profile or f"https://www.imvu.com/catalog/web_mypage.php?av={imvu_name}"
     meta_obj = {}
@@ -956,62 +927,60 @@ async def fulfil_next(ctx: commands.Context):
         meta_obj = json.loads(meta or "{}")
     except Exception:
         pass
-    await ctx.reply(
+    await interaction.response.send_message(
         f"Fulfil queue **#{pq_id}** → Prize **#{prize_id}** for <@{winner_id}>\n"
         f"IMVU: **{imvu_name}** • {imvu_link}\n"
         f"Gifts to send: **{amount}** from **{meta_obj.get('shop', SHOP_NAME)}**\n"
-        f"After gifting, run `!fulfil_done {pq_id}`."
+        f"After gifting, run `/eh_fulfil_done {pq_id}`.",
+        ephemeral=True
     )
 
-@commands.has_permissions(manage_guild=True)
-@bot.command(name="fulfil_done")
-async def fulfil_done(ctx: commands.Context, queue_id: int):
+@bot.tree.command(name="eh_fulfil_done", description="(Admin) Mark a WL fulfilment done")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(queue_id="Queue ID from /eh_fulfil_next")
+async def eh_fulfil_done(interaction: discord.Interaction, queue_id: int):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT prize_id FROM prize_queue WHERE id=?", (queue_id,))
         row = c.fetchone()
         if not row:
-            return await ctx.reply("Queue ID not found.")
+            return await interaction.response.send_message("Queue ID not found.", ephemeral=True)
         prize_id = row[0]
         c.execute("UPDATE prize_queue SET status='fulfilled', updated_ts=? WHERE id=?", (iso(now_local()), queue_id))
         c.execute("UPDATE prizes SET status='fulfilled', updated_ts=? WHERE id=?", (iso(now_local()), prize_id))
-    await ctx.reply(f"Marked fulfilment queue **#{queue_id}** as fulfilled ✅")
+    await interaction.response.send_message(f"Marked fulfilment queue **#{queue_id}** as fulfilled ✅", ephemeral=True)
 
-# ---------------- Utilities ----------------
-@is_admin()
-@bot.command(name="roundreset", brief="(admin) Force-unlock this channel if a round is stuck")
-async def roundreset(ctx: commands.Context):
-    rid = get_state(round_key(ctx.channel.id))
+# ---- Utilities ----
+@bot.tree.command(name="eh_roundreset", description="(Admin) Force-unlock this channel if a round is stuck")
+@app_commands.default_permissions(manage_guild=True)
+async def eh_roundreset(interaction: discord.Interaction):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+    rid = get_state(round_key(interaction.channel.id))
     if not rid:
-        return await ctx.reply("No open round to reset (state already clear).")
+        return await interaction.response.send_message("No open round to reset (state already clear).", ephemeral=True)
     with db() as conn:
         c = conn.cursor()
         c.execute("UPDATE rounds SET status='CANCELLED', resolved_at=? WHERE rid=?",
                   (iso(now_local()), rid))
-    set_state(round_key(ctx.channel.id), None)
-    await ctx.reply(f"Force-reset round **{ClaimView.get_round_label(rid)}** — channel unlocked.")
+    set_state(round_key(interaction.channel.id), None)
+    await interaction.response.send_message(f"Force-reset round **{ClaimView.get_round_label(rid)}** — channel unlocked.", ephemeral=True)
 
-# ---------------- Error handling & Ready ----------------
-@bot.event
-async def on_command_error(ctx, error):
-    from discord.ext.commands import (
-        CommandNotFound, MissingPermissions, CheckFailure,
-        BadArgument, CommandInvokeError
-    )
-    if isinstance(error, CommandNotFound):
-        return
-    if isinstance(error, (MissingPermissions, CheckFailure)):
-        return await ctx.reply("You don’t have permission to use that command.")
-    if isinstance(error, BadArgument):
-        return await ctx.reply("Bad arguments. Try `!help <command>`.")
-    if isinstance(error, CommandInvokeError):
-        orig = error.original
-        tb = "".join(traceback.format_exception(type(orig), orig, orig.__traceback__))[:1800]
-        return await ctx.reply(f"Crash: **{type(orig).__name__}** — {orig}\n```py\n{tb}\n```")
-    await ctx.reply(f"Error: **{type(error).__name__}** — {error}")
-
+# ---------------- Sync & Ready ----------------
 @bot.event
 async def on_ready():
     print(f"[EliHaus] Logged in as {bot.user} | TZ={TIMEZONE_NAME}")
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            await bot.tree.sync(guild=guild)
+            print(f"[EliHaus] Slash commands synced to guild {GUILD_ID}")
+        else:
+            await bot.tree.sync()
+            print("[EliHaus] Slash commands synced globally")
+    except Exception as e:
+        print(f"[EliHaus] Slash sync failed: {e}")
 
 bot.run(TOKEN)
