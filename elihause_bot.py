@@ -22,6 +22,9 @@ try:
 except Exception:
     TZ = timezone.utc
 
+STICKY_AFTER_MSGS = 15  # bump after this many chat messages
+STICKY_COUNT: dict[int, int] = {}  # channel_id -> counter since last bump
+
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
@@ -650,6 +653,64 @@ def get_open_or_last_round(channel_id: int):
             return row[0], now_local()
     return None
 
+async def _bump_round_message(channel, rid: str):
+    # read latest totals + the old message id
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT message_id, expires_at FROM rounds WHERE rid=?", (rid,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return
+        old_id, exp_iso = row
+        c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
+        cnt, pool = c.fetchone()
+        c.execute("""SELECT discord_id, choice, stake
+                     FROM bets WHERE rid=?
+                     ORDER BY ts DESC LIMIT 10""", (rid,))
+        last_rows = c.fetchall()
+
+    # remaining time
+    try:
+        exp_dt = datetime.fromisoformat(exp_iso)
+    except Exception:
+        exp_dt = now_local()
+    remain = max(0, int((exp_dt - now_local()).total_seconds()))
+    if remain <= 0:
+        return  # don't bump if already ended
+
+    # rebuild the embed (same style as your main one)
+    e = discord.Embed(
+        title=f"🎯 Roulette — Round {ClaimView.get_round_label(rid)}",
+        description="Click a button to bet. A modal will ask your amount.",
+        color=discord.Color.gold()
+    )
+    e.add_field(name="Pool", value=str(pool), inline=True)
+    e.add_field(name="Time", value=f"{remain}s left", inline=True)
+    e.add_field(name="Bets", value=str(cnt), inline=True)
+
+    lines = []
+    guild = getattr(channel, "guild", None)
+    for uid, ch, st in last_rows:
+        m = guild.get_member(int(uid)) if guild else None
+        name = m.mention if m else f"<@{uid}>"
+        lines.append(f"{name} · {st} on {ch.upper()}")
+    e.add_field(name="Players (latest)", value=("\n".join(lines) if lines else "—"), inline=False)
+
+    # send a fresh message with fresh buttons so users can keep betting
+    view = BetView(rid, timeout=remain + 30)
+    new_msg = await channel.send(embed=e, view=view)
+
+    # update DB to the new message id
+    with db() as conn:
+        conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(new_msg.id), rid))
+
+    # try to delete the old one to reduce clutter (requires 'Manage Messages')
+    try:
+        old_msg = await channel.fetch_message(int(old_id))
+        await old_msg.delete()
+    except Exception:
+        pass
+
 # ---------------- Slash Commands (eh_*) ----------------
 def ensure_user(uid: str):
     with db() as conn:
@@ -1233,6 +1294,36 @@ async def eh_sync(interaction: discord.Interaction):
         await interaction.response.send_message(f"✅ Globally synced {len(cmds)} commands.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Sync error: {e}", ephemeral=True)
+
+@bot.event
+async def on_message(message: discord.Message):
+    # keep prefix commands working (even though we use slash now)
+    await bot.process_commands(message)
+
+    # ignore bots/DMs/system
+    if message.author.bot or not message.guild:
+        return
+    if message.type != discord.MessageType.default:
+        return
+
+    # if there is an open round in this channel, count & bump
+    o = get_open_round(message.channel.id)
+    if not o:
+        STICKY_COUNT.pop(message.channel.id, None)
+        return
+
+    rid, exp = o
+    # don't bump if nearly done to avoid spammy last seconds
+    if (exp - now_local()).total_seconds() <= 10:
+        return
+
+    STICKY_COUNT[message.channel.id] = STICKY_COUNT.get(message.channel.id, 0) + 1
+    if STICKY_COUNT[message.channel.id] >= STICKY_AFTER_MSGS:
+        STICKY_COUNT[message.channel.id] = 0
+        try:
+            await _bump_round_message(message.channel, rid)
+        except Exception:
+            pass
 
 
 bot.run(TOKEN)
