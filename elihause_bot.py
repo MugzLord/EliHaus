@@ -350,10 +350,71 @@ def _prize_ticket_key(prize_id: int) -> str:
     return f"prize_ticket:{prize_id}"
 
 # ---------------- Views & Modals ----------------
+# ---------- Roulette buttons (colored) ----------
 class RouletteBetView(discord.ui.View):
     def __init__(self, rid: int, timeout: float | None = None):
-        super().__init__(timeout=timeout)  # <- important
+        super().__init__(timeout=timeout)
         self.rid = rid
+
+    # 🔴 RED
+    @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger, emoji="🎯", custom_id="eh_roul_red")
+    async def bet_red(self, itx: discord.Interaction, _: discord.ui.Button):
+        try:
+            await itx.response.send_modal(RedBetModal(self.rid))
+        except Exception as e:
+            if not itx.response.is_done():
+                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+            else:
+                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+
+    # ⬛ BLACK
+    @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="⬛", custom_id="eh_roul_black")
+    async def bet_black(self, itx: discord.Interaction, _: discord.ui.Button):
+        try:
+            await itx.response.send_modal(BlackBetModal(self.rid))
+        except Exception as e:
+            if not itx.response.is_done():
+                await itx.response.send_message(f"❌ Failed to open Black bet modal: `{e}`", ephemeral=True)
+            else:
+                await itx.followup.send(f"❌ Failed to open Black bet modal: `{e}`", ephemeral=True)
+
+    # 🟩 GREEN
+    @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🟩", custom_id="eh_roul_green")
+    async def bet_green(self, itx: discord.Interaction, _: discord.ui.Button):
+        try:
+            await itx.response.send_modal(GreenBetModal(self.rid))
+        except Exception as e:
+            if not itx.response.is_done():
+                await itx.response.send_message(f"❌ Failed to open Green bet modal: `{e}`", ephemeral=True)
+            else:
+                await itx.followup.send(f"❌ Failed to open Green bet modal: `{e}`", ephemeral=True)
+
+    # 🎯 NUMBER
+    @discord.ui.button(label="Bet NUMBER", style=discord.ButtonStyle.secondary, emoji="🎯", custom_id="eh_roul_number")
+    async def bet_number(self, itx: discord.Interaction, _: discord.ui.Button):
+        try:
+            await itx.response.send_modal(NumberBetModal(self.rid))
+        except Exception as e:
+            if not itx.response.is_done():
+                await itx.response.send_message(f"❌ Failed to open Number bet modal: `{e}`", ephemeral=True)
+            else:
+                await itx.followup.send(f"❌ Failed to open Number bet modal: `{e}`", ephemeral=True)
+
+    # ❓ My Bet
+    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="❓", custom_id="eh_roul_mybet")
+    async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
+        await itx.response.defer(ephemeral=True, thinking=True)
+        uid = str(itx.user.id)
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
+            row = c.fetchone()
+        bal = get_balance(uid)
+        if not row:
+            return await itx.followup.send(f"You have **no bet** this round.\nBalance: **{bal}**", ephemeral=True)
+        choice, stake = row
+        await itx.followup.send(f"🎲 Your bet: **{choice}** — **{stake}** coins.\nBalance: **{bal}**", ephemeral=True)
+
 
 class DisabledClaimView(discord.ui.View):
     def __init__(self):
@@ -1387,8 +1448,6 @@ async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SE
         embed.add_field(name="Bets", value="0", inline=True)
 
         view = RouletteBetView(rid, timeout=seconds + 30)
-
-        # send the panel and save message_id
         msg = await interaction.channel.send(embed=embed, view=view)
         with db() as conn:
             conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
