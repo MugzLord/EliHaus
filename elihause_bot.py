@@ -289,6 +289,24 @@ def build_roulette_result_embed(
     e.set_footer(text=seed_display)
     return e
 
+# === interaction reply helpers (paste once; keep above commands) ===
+async def safe_ack(interaction: discord.Interaction, ephemeral: bool = True):
+    """Defer quickly so the command never times out."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+    except Exception:
+        pass
+
+async def safe_followup(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+    """Send a reply whether or not we already deferred."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except Exception:
+        pass
 
 # ---------------- Admin check helpers ----------------
 def user_is_admin(member: discord.Member) -> bool:
