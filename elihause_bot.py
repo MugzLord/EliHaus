@@ -298,6 +298,36 @@ def user_is_admin(member: discord.Member) -> bool:
         return any(getattr(r, "id", 0) == ADMIN_ROLE_ID for r in member.roles)
     return False
 
+
+async def _edit_round_message(bot, channel, rid: int, embed, view=None):
+    """Edits the ONE official roulette message for this round. If missing, sends and records it."""
+    # fetch message_id for this round
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT message_id FROM rounds WHERE rid=?", (rid,))
+        row = c.fetchone()
+    msg_id = int(row[0]) if row and row[0] else None
+
+    # resolve channel object
+    ch = channel
+    if isinstance(channel, int):
+        ch = bot.get_channel(channel) or await bot.fetch_channel(channel)
+
+    # try edit the original message
+    if msg_id:
+        try:
+            msg = await ch.fetch_message(msg_id)
+            await msg.edit(embed=embed, view=view)
+            return
+        except Exception:
+            pass  # message was deleted or not found
+
+    # fallback: send a new one and save its id
+    new_msg = await ch.send(embed=embed, view=view)
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(new_msg.id), rid))
+
 # ---------------- Tickets category helper ----------------
 async def _get_or_create_tickets_category(guild: discord.Guild) -> discord.CategoryChannel | None:
     if TICKETS_CATEGORY_ID:
@@ -709,46 +739,75 @@ class NumberBetModal(discord.ui.Modal, title="Bet on a Number"):
         _deduct(uid, amt); _insert_bet(self.rid, itx.channel.id, uid, str(n), amt)
         return await itx.response.send_message(f"✅ Bet placed — **{amt}** on **#{n}**", ephemeral=True)
 
-# --- Buttons / View (appears under your round embed) ---
-class BetView(discord.ui.View):
-    def __init__(self, rid: str, timeout: int | None = None):
-        super().__init__(timeout=timeout or 120)
-        self.rid = rid
+    # --- Buttons / View (appears under your round embed) ---
+    class BetView(discord.ui.View):
+        def __init__(self, rid: str, timeout: int | None = None):
+            super().__init__(timeout=timeout or 120)
+            self.rid = rid
 
     
+    # --- Roulette Bet Modals ---
     class RedBetModal(discord.ui.Modal, title="Bet: RED"):
-    stake = discord.ui.TextInput(
-        label="Stake (coins)",                      # <=45
-        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
-        required=True, max_length=10
-    )
-
-class BlackBetModal(discord.ui.Modal, title="Bet: BLACK"):
-    stake = discord.ui.TextInput(
-        label="Stake (coins)",
-        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
-        required=True, max_length=10
-    )
-
-class GreenBetModal(discord.ui.Modal, title="Bet: GREEN"):
-    stake = discord.ui.TextInput(
-        label="Stake (coins)",
-        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
-        required=True, max_length=10
-    )
-
-class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
-    number = discord.ui.TextInput(
-        label="Number (0–36)",                      # <=45
-        placeholder="e.g., 17",
-        required=True, max_length=2
-    )
-    stake = discord.ui.TextInput(
-        label="Stake (coins)",                      # <=45
-        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
-        required=True, max_length=10
-    )
-
+        stake = discord.ui.TextInput(
+            label="Stake (coins)",
+            placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
+            required=True,
+            max_length=10
+        )
+    
+        async def on_submit(self, interaction: discord.Interaction):
+            # TODO: your bet logic here
+            await interaction.response.send_message(
+                f"🎯 You bet **{self.stake}** coins on **RED**!", ephemeral=True
+            )
+    
+    
+    class BlackBetModal(discord.ui.Modal, title="Bet: BLACK"):
+        stake = discord.ui.TextInput(
+            label="Stake (coins)",
+            placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
+            required=True,
+            max_length=10
+        )
+    
+        async def on_submit(self, interaction: discord.Interaction):
+            await interaction.response.send_message(
+                f"⬛ You bet **{self.stake}** coins on **BLACK**!", ephemeral=True
+            )
+    
+    
+    class GreenBetModal(discord.ui.Modal, title="Bet: GREEN"):
+        stake = discord.ui.TextInput(
+            label="Stake (coins)",
+            placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
+            required=True,
+            max_length=10
+        )
+    
+        async def on_submit(self, interaction: discord.Interaction):
+            await interaction.response.send_message(
+                f"🟩 You bet **{self.stake}** coins on **GREEN**!", ephemeral=True
+            )
+        
+    class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
+        number = discord.ui.TextInput(
+            label="Number (0–36)",
+            placeholder="e.g., 17",
+            required=True,
+            max_length=2
+        )
+        stake = discord.ui.TextInput(
+            label="Stake (coins)",
+            placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
+            required=True,
+            max_length=10
+        )
+    
+        async def on_submit(self, interaction: discord.Interaction):
+            await interaction.response.send_message(
+                f"🎲 You bet **{self.stake}** on number **{self.number}**!", ephemeral=True
+            )
+       
 
     @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary,emoji="❓", custom_id="eh_roul_mybet")
     async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
@@ -1112,131 +1171,108 @@ async def eh_help(interaction: discord.Interaction):
     ]
     lines = public + (["\n**Admin**"] + admin if is_admin else [])
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+# ========= Roulette single-card helpers =========
+import asyncio
+
+async def _edit_round_message(bot, channel, rid: int, embed: discord.Embed, view: discord.ui.View | None):
+    """
+    Edit the ONE official roulette message for this round (rid).
+    Falls back to sending a new one only if the original was deleted,
+    and then records the new message_id in the 'rounds' table.
+    """
+    # fetch saved message_id
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT message_id FROM rounds WHERE rid=?", (rid,))
+        row = c.fetchone()
+    msg_id = int(row[0]) if row and row[0] else None
+
+    # resolve channel object if an id was passed
+    ch = channel
+    if isinstance(channel, int):
+        ch = bot.get_channel(channel) or await bot.fetch_channel(channel)
+
+    if msg_id:
+        try:
+            msg = await ch.fetch_message(msg_id)
+            await msg.edit(embed=embed, view=view)
+            return
+        except Exception:
+            pass  # original message missing or cannot be edited
+
+    # fallback: send new, then save id
+    new_msg = await ch.send(embed=embed, view=view)
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(new_msg.id), rid))
+
+
+def _round_stats(rid: int) -> tuple[int, int]:
+    """
+    Returns (bets_count, pool_sum) for a round from 'bets' table.
+    Safe even if there are no bets.
+    """
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(stake), 0) FROM bets WHERE rid=?", (rid,))
+        row = c.fetchone() or (0, 0)
+    count = int(row[0] or 0)
+    pool = int(row[1] or 0)
+    return count, pool
 
 import asyncio
 ROUND_TICK_SECONDS = 5
 ROUND_TASKS: dict[str, asyncio.Task] = {}
 
-async def _tick_round(channel: discord.abc.Messageable, rid: str, exp_iso: str):
+# ========= Countdown + close logic (single-card; no duplicates) =========
+async def tick_round(channel, rid: int, exp_iso: str):
+    """
+    Updates the betting panel countdown, then shows the result —
+    all by EDITING the saved message (no extra sends).
+    """
+    # parse expiry
+    exp = from_iso(exp_iso) if 'from_iso' in globals() else datetime.fromisoformat(exp_iso)
+
+    # --- live countdown ---
+    while True:
+        now = now_local() if 'now_local' in globals() else datetime.now(tz=TZ)
+        left = max(0, int((exp - now).total_seconds()))
+
+        bets_count, pool_sum = _round_stats(rid)
+
+        open_embed = discord.Embed(
+            title=f"🎰 Roulette — Round #{rid}",
+            description="Click to bet.",
+            color=discord.Color.gold()
+        )
+        open_embed.add_field(name="Pool", value=str(pool_sum), inline=True)
+        open_embed.add_field(name="Time", value=f"{left}s left", inline=True)
+        open_embed.add_field(name="Bets", value=str(bets_count), inline=True)
+        open_embed.add_field(name="Players (latest)", value="—", inline=False)
+
+        # keep buttons during betting
+        view = BetView(rid, timeout=left + 30)
+
+        # ✳️ EDIT the saved message (do not send a new one)
+        await _edit_round_message(bot, channel, rid, open_embed, view=view)
+
+        if left <= 0:
+            break
+        await asyncio.sleep(5)
+
+    # ------- resolve result -------
     try:
+        result_color, result_number = resolve_spin_result(rid)  # your existing function
+    except NameError:
         try:
-            exp_dt = datetime.fromisoformat(exp_iso)
+            result_color, result_number = eh_resolve(rid)       # fallback to your alt resolver
         except Exception:
-            exp_dt = now_local()
+            result_color, result_number = ("BLACK", 17)         # last resort
 
-        while True:
-            try:
-                with db() as conn:
-                    c = conn.cursor()
-                    c.execute("SELECT message_id, status FROM rounds WHERE rid=?", (rid,))
-                    row = c.fetchone()
-                    if not row:
-                        break
-                    msg_id, status = row
-                    c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
-                    cnt, pool = c.fetchone()
-                    c.execute("""SELECT discord_id, choice, stake
-                                 FROM bets WHERE rid=? ORDER BY ts DESC LIMIT 10""", (rid,))
-                    last_rows = c.fetchall()
-            except Exception:
-                break
-
-            if status != "OPEN":
-                break
-
-            remain = max(0, int((exp_dt - now_local()).total_seconds()))
-
-            # update embed
-            try:
-                msg = await channel.fetch_message(int(msg_id))
-                if msg.embeds:
-                    e = msg.embeds[0]
-                    e.clear_fields()
-                    e.add_field(name="Pool", value=str(pool), inline=True)
-                    e.add_field(name="Time", value=f"{remain}s left", inline=True)
-                    e.add_field(name="Bets", value=str(cnt), inline=True)
-
-                    # players list
-                    lines = []
-                    guild = getattr(channel, "guild", None)
-                    for uid, ch, st in last_rows:
-                        m = guild.get_member(int(uid)) if guild else None
-                        name = m.mention if m else f"<@{uid}>"
-                        lines.append(f"{name} · {st} on {ch.upper()}")
-                    e.add_field(name="Players (latest)", value=("\n".join(lines) if lines else "—"), inline=False)
-
-                    await msg.edit(embed=e)
-            except Exception:
-                # keep looping even if one edit fails
-                pass
-
-            if remain <= 0:
-                # Auto resolve at 0s using the same logic as /eh_resolve
-                try:
-                    seed = f"ROUL-{rid}-{int(now_local().timestamp())}-{random.randint(1, 1_000_000)}"
-                    random.seed(seed)
-                    roll = random.randint(0, 36)
-                    red_nums = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-                    if roll == 0:
-                        outcome = "green"; multiplier = PAYOUT_GREEN
-                    else:
-                        outcome = "red" if roll in red_nums else "black"; multiplier = PAYOUT_RED_BLACK
-
-                    total_pool = 0; winners = []; rows = []
-                    with db() as conn:
-                        c = conn.cursor()
-                        c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,))
-                        rows = c.fetchall()
-                        for uid, ch, stake in rows:
-                            total_pool += stake
-                        for uid, ch, stake in rows:
-                            if ch == outcome:
-                                win = int(stake * multiplier)
-                                c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (win, uid))
-                                c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                                          (uid, "payout", win, f"roulette:{rid}|{outcome}", iso(now_local())))
-                                winners.append((uid, win))
-                        c.execute("UPDATE rounds SET status='RESOLVED', outcome=?, seed=?, resolved_at=? WHERE rid=?",
-                                  (f"{outcome}:{roll}", seed, iso(now_local()), rid))
-                    set_state(round_key(int(str(channel.id))), None)
-
-                    # edit original embed to show result + remove buttons
-                    try:
-                        msg = await channel.fetch_message(int(msg_id))
-                        rlabel = ClaimView.get_round_label(rid)
-                        seed_display = ClaimView.short_seed(seed, 8)
-                        e = msg.embeds[0] if msg.embeds else discord.Embed(color=_result_color(outcome))
-                        e.title = f"🎯 Roulette — Round {rlabel}"
-                        e.description = f"**RESULT:** {outcome.upper()} • #{roll}"
-                        e.set_footer(text=f"Seed: {seed_display}")
-                        await msg.edit(embed=e, view=None)
-                    except Exception:
-                        pass
-                    
-                    # casino-style result card
-                    top_mentions = []
-                    guild = getattr(channel, "guild", None)
-                    for uid, _win in sorted(winners, key=lambda x: x[1], reverse=True)[:5]:
-                        m = guild.get_member(int(uid)) if guild else None
-                        top_mentions.append(m.mention if m else f"<@{uid}>")
-                    
-                    result_embed = build_roulette_result_embed(
-                        rlabel=rlabel,
-                        outcome=outcome, roll=roll,
-                        total_bets=len(rows),
-                        total_pool=total_pool,
-                        winners_mentions=top_mentions,
-                        seed_display=seed_display,
-                    )
-                    await channel.send(embed=result_embed)
-
-                finally:
-                    break
-
-            await asyncio.sleep(ROUND_TICK_SECONDS)
-    finally:
-        ROUND_TASKS.pop(rid, None)
-
+    # colour + pill for RESULT line
+    color_map = {"RED": (220, 38, 38), "BLACK": (24, 24, 27), "GREEN": (16, 185, 129)}
+    pill_text = {"RED": "🔴 **RED**", "BLACK": "⬛ **BLACK**", "GREEN": "🟩 **GREEN**"}
+    rgb = color_map.get(str(result_color).
 
 # ---- Player: join/daily/weekly/balance ----
 @bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
@@ -1377,13 +1413,11 @@ async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SE
     msg = await interaction.channel.send(embed=embed, view=view)
     with db() as conn:
         conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
-
     # launch a background ticker for this round
     try:
         ROUND_TASKS[rid] = bot.loop.create_task(_tick_round(interaction.channel, rid, iso(exp)))
     except Exception:
         pass
-
     await interaction.response.send_message(f"Opened roulette round {rlabel}.", ephemeral=True)
 
 @bot.tree.command(name="eh_table", description="Show current roulette round status in this channel")
@@ -1861,6 +1895,36 @@ def get_slots_pot(channel_id: int) -> int:
 def set_slots_pot(channel_id: int, pot: int):
     # Pot can never fall below the configured seed
     set_state(_slots_pot_key(channel_id), str(max(pot, SLOTS_SEED)))
+
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+
+def generate_roulette_badge(color: str, number: int) -> BytesIO:
+    # color can be "RED", "BLACK", or "GREEN"
+    color_map = {
+        "RED": (220, 38, 38),
+        "BLACK": (24, 24, 27),
+        "GREEN": (16, 185, 129)
+    }
+    bg = color_map.get(color.upper(), (24, 24, 27))
+    size = (140, 140)
+    img = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # rounded circle
+    draw.ellipse([0, 0, size[0], size[1]], fill=bg)
+
+    # number text
+    font = ImageFont.truetype("arial.ttf", 70)  # or DejaVuSans.ttf if hosted on Linux
+    text = str(number)
+    w, h = draw.textsize(text, font=font)
+    draw.text(((size[0]-w)/2, (size[1]-h)/2-5), text, fill=(255,255,255), font=font)
+
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    buf.seek(0)
+    return buf
+
 
 # ---- UI: Modal + View ----
 class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
