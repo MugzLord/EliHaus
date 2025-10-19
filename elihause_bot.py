@@ -320,6 +320,12 @@ def _prize_ticket_key(prize_id: int) -> str:
     return f"prize_ticket:{prize_id}"
 
 # ---------------- Views & Modals ----------------
+class RouletteBetView(discord.ui.View):
+    def __init__(self, rid: int):
+        super().__init__(timeout=None)   # <- required for persistence
+        self.rid = rid
+    # ... buttons with unique custom_id values ...
+
 class DisabledClaimView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -709,38 +715,70 @@ class BetView(discord.ui.View):
         super().__init__(timeout=timeout or 120)
         self.rid = rid
 
-    @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger, emoji="🟥")
+    
+    @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger,   emoji="🎯", custom_id="eh_roul_red")
     async def bet_red(self, itx: discord.Interaction, _: discord.ui.Button):
-        await itx.response.send_modal(RedBetModal(self.rid))
+        try:
+            await itx.response.send_modal(RedBetModal(self.rid))
+        except Exception as e:
+            # if modal construction crashed, report it
+            if not itx.response.is_done():
+                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+            else:
+                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
 
-    @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="⬛")
+
+    @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary,  emoji="⬛", custom_id="eh_roul_black")
     async def bet_black(self, itx: discord.Interaction, _: discord.ui.Button):
-        await itx.response.send_modal(BlackBetModal(self.rid))
+        try:
+            await itx.response.send_modal(RedBetModal(self.rid))
+        except Exception as e:
+            # if modal construction crashed, report it
+            if not itx.response.is_done():
+                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+            else:
+                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
 
-    @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🟩")
+    @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success,  emoji="🟩", custom_id="eh_roul_green")
     async def bet_green(self, itx: discord.Interaction, _: discord.ui.Button):
-        await itx.response.send_modal(GreenBetModal(self.rid))
+        try:
+            await itx.response.send_modal(RedBetModal(self.rid))
+        except Exception as e:
+            # if modal construction crashed, report it
+            if not itx.response.is_done():
+                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+            else:
+                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
 
-    @discord.ui.button(label="Bet NUMBER", style=discord.ButtonStyle.secondary, emoji="🎯")
+    @discord.ui.button(label="Bet NUMBER", style=discord.ButtonStyle.secondary,emoji="🎯", custom_id="eh_roul_number")
     async def bet_number(self, itx: discord.Interaction, _: discord.ui.Button):
-        await itx.response.send_modal(NumberBetModal(self.rid))
+        try:
+            await itx.response.send_modal(RedBetModal(self.rid))
+        except Exception as e:
+            # if modal construction crashed, report it
+            if not itx.response.is_done():
+                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+            else:
+                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
 
-    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="❔")
+    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary,emoji="❓", custom_id="eh_roul_mybet")
     async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
+        await itx.response.defer(ephemeral=True, thinking=True)   # add this line
+    
         uid = str(itx.user.id)
         with db() as conn:
             c = conn.cursor()
             c.execute("SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
             row = c.fetchone()
+    
         bal = get_balance(uid)
+    
         if not row:
-            return await itx.response.send_message(f"You have **no bet** this round.\nBalance: **{bal}**", ephemeral=True)
+            await itx.followup.send(f"You have **no bet** this round.\nBalance: **{bal}**", ephemeral=True)
+            return
+    
         choice, stake = row
-        left = _round_open_and_timeleft(self.rid)
-        await itx.response.send_message(
-            f"Your bet: **{stake}** on **{choice.upper()}**\nTime left: **{left}s**\nBalance: **{bal}**",
-            ephemeral=True
-        )
+        await itx.followup.send(f"🎲 Your bet: **{choice}** — **{stake}** coins.\nBalance: **{bal}**", ephemeral=True)
 
 class AdminApproveWithdrawModal(discord.ui.Modal, title="Approve WL Withdraw"):
     coins = discord.ui.TextInput(
@@ -2461,7 +2499,10 @@ class AdminRejectWithdrawModal(discord.ui.Modal, title="Reject WL Withdraw"):
             pass
 
         await interaction.response.send_message("Rejected and left balance unchanged. ❌", ephemeral=True)
-# 
+@bot.event
+async def setup_hook():
+    # Register handlers for the custom_id buttons so old messages keep working after restarts
+    bot.add_view(RouletteBetView(0))   # rid here is a dummy; you’ll attach a fresh view to live rounds
 
 
 bot.run(TOKEN)
