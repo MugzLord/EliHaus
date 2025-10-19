@@ -783,7 +783,30 @@ class WithdrawWLModal(discord.ui.Modal, title="Withdraw → WL Gifts"):
         embed.set_footer(text="Staff: review and approve or reject below.")
 
         view = AdminWithdrawReviewView(req_id)
-        msg = await ticket.send(embed=embed, view=view)
+        try:
+            msg = await ticket.send(
+                content=(f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"),
+                embed=embed,
+                view=view
+            )
+        except discord.Forbidden:
+            # Grant the bot perms in this ticket and try once more
+            me = interaction.guild.me
+            try:
+                await ticket.set_permissions(
+                    me, view_channel=True, send_messages=True, read_message_history=True, manage_messages=True
+                )
+                msg = await ticket.send(
+                    content=(f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"),
+                    embed=embed, view=view
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"Bot couldn’t post in the ticket. Ask an admin to grant **Send Messages** here or run `/eh_ticket_fix`. Error: {e}",
+                    ephemeral=True
+                )
+                return
+        
 
         # save ticket & message
         with db() as conn:
@@ -2501,6 +2524,170 @@ class AdminRejectWithdrawModal(discord.ui.Modal, title="Reject WL Withdraw"):
             pass
 
         await interaction.response.send_message("Rejected and left balance unchanged. ❌", ephemeral=True)
+# ==== EliHaus Roulette — Colour & Number Bet Add-On (single block) ====
+# Paste this near your roulette code. It provides:
+# - RED/BLACK number validation sets
+# - Mobile-friendly modals for RED, BLACK (optional CSV of numbers) and GREEN (0)
+# - Ready-made buttons: BetRedButton, BetBlackButton, BetGreenButton
+# Usage in your RouletteView.__init__:
+#   self.add_item(BetRedButton(self.round_id))
+#   self.add_item(BetBlackButton(self.round_id))
+#   self.add_item(BetGreenButton(self.round_id))
+
+import discord
+
+# --- Config (safe default if not set elsewhere) ---
+try:
+    CURRENCY  # keep existing if defined
+except NameError:
+    CURRENCY = "coins"
+
+# --- Colour → numbers (European wheel) ---
+RED_NUMBERS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+BLACK_NUMBERS = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
+
+# ---------- Modals ----------
+class RedBetModal(discord.ui.Modal, title="Bet on RED"):
+    amount = discord.ui.TextInput(label="Amount", placeholder="e.g. 50", required=True)
+    numbers = discord.ui.TextInput(
+        label="Red numbers (optional, CSV)",
+        placeholder="e.g. 1,3,5  — or leave blank for colour-only",
+        required=False
+    )
+    def __init__(self, round_id: str):
+        super().__init__()
+        self.round_id = round_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # amount
+        try:
+            amt = int(str(self.amount).strip())
+        except ValueError:
+            return await interaction.response.send_message("Enter a whole number amount.", ephemeral=True)
+        if amt <= 0:
+            return await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
+
+        raw = str(self.numbers).strip()
+        if not raw:
+            # colour-only bet
+            return await _handle_bet(interaction, self.round_id, "color", "red", amt)
+
+        # CSV numbers path (split equally)
+        try:
+            picks = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            return await interaction.response.send_message("Numbers must be comma-separated integers.", ephemeral=True)
+        if not picks:
+            return await interaction.response.send_message("No valid numbers found.", ephemeral=True)
+
+        bad = [n for n in picks if n not in RED_NUMBERS]
+        if bad:
+            return await interaction.response.send_message(
+                f"Only red numbers allowed. Not red: {', '.join(map(str, bad))}.", ephemeral=True
+            )
+
+        per = max(1, amt // len(picks))
+        total = per * len(picks)
+        bal = get_balance(interaction.user.id)
+        if bal < total or not debit_balance(interaction.user.id, total):
+            return await interaction.response.send_message(
+                f"Couldn’t reserve {total} {CURRENCY}. Balance: {bal}.", ephemeral=True
+            )
+        for n in picks:
+            place_bet(self.round_id, interaction.user.id, "number", str(n), per)
+
+        return await interaction.response.send_message(
+            f"Bet locked: {', '.join('#'+str(n) for n in picks)} — **{per} {CURRENCY} each** ✅",
+            ephemeral=True
+        )
+
+class BlackBetModal(discord.ui.Modal, title="Bet on BLACK"):
+    amount = discord.ui.TextInput(label="Amount", placeholder="e.g. 50", required=True)
+    numbers = discord.ui.TextInput(
+        label="Black numbers (optional, CSV)",
+        placeholder="e.g. 2,4,6  — or leave blank for colour-only",
+        required=False
+    )
+    def __init__(self, round_id: str):
+        super().__init__()
+        self.round_id = round_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amt = int(str(self.amount).strip())
+        except ValueError:
+            return await interaction.response.send_message("Enter a whole number amount.", ephemeral=True)
+        if amt <= 0:
+            return await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
+
+        raw = str(self.numbers).strip()
+        if not raw:
+            return await _handle_bet(interaction, self.round_id, "color", "black", amt)
+
+        try:
+            picks = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            return await interaction.response.send_message("Numbers must be comma-separated integers.", ephemeral=True)
+        if not picks:
+            return await interaction.response.send_message("No valid numbers found.", ephemeral=True)
+
+        bad = [n for n in picks if n not in BLACK_NUMBERS]
+        if bad:
+            return await interaction.response.send_message(
+                f"Only black numbers allowed. Not black: {', '.join(map(str, bad))}.", ephemeral=True
+            )
+
+        per = max(1, amt // len(picks))
+        total = per * len(picks)
+        bal = get_balance(interaction.user.id)
+        if bal < total or not debit_balance(interaction.user.id, total):
+            return await interaction.response.send_message(
+                f"Couldn’t reserve {total} {CURRENCY}. Balance: {bal}.", ephemeral=True
+            )
+        for n in picks:
+            place_bet(self.round_id, interaction.user.id, "number", str(n), per)
+
+        return await interaction.response.send_message(
+            f"Bet locked: {', '.join('#'+str(n) for n in picks)} — **{per} {CURRENCY} each** ✅",
+            ephemeral=True
+        )
+
+class GreenBetModal(discord.ui.Modal, title="Bet on 0 (GREEN)"):
+    amount = discord.ui.TextInput(label="Amount", placeholder="e.g. 50", required=True)
+    def __init__(self, round_id: str):
+        super().__init__()
+        self.round_id = round_id
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amt = int(str(self.amount).strip())
+        except ValueError:
+            return await interaction.response.send_message("Enter a whole number amount.", ephemeral=True)
+        if amt <= 0:
+            return await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
+        return await _handle_bet(interaction, self.round_id, "number", "0", amt)
+
+# ---------- Buttons (ready to drop into your View) ----------
+class BetRedButton(discord.ui.Button):
+    def __init__(self, round_id: str):
+        super().__init__(style=discord.ButtonStyle.danger, label="Bet RED")
+        self.round_id = round_id
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(RedBetModal(self.round_id))
+
+class BetBlackButton(discord.ui.Button):
+    def __init__(self, round_id: str):
+        super().__init__(style=discord.ButtonStyle.primary, label="Bet BLACK")
+        self.round_id = round_id
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(BlackBetModal(self.round_id))
+
+class BetGreenButton(discord.ui.Button):
+    def __init__(self, round_id: str):
+        super().__init__(style=discord.ButtonStyle.success, label="Bet GREEN")
+        self.round_id = round_id
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(GreenBetModal(self.round_id))
+# ==== End add-on block ====
 
 
 bot.run(TOKEN)
