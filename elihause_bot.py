@@ -203,19 +203,29 @@ async def get_balance(user_id: int) -> int:
 # Daily & Weekly
 @bot.tree.command(name="eh_daily", description="Claim your daily coins")
 async def eh_daily(inter: discord.Interaction):
-    uid = inter.user.id
-    con = sqlite3.connect(DB_PATH)
     try:
-        con.execute("INSERT OR IGNORE INTO users(user_id, coins) VALUES(?,0)", (uid,))
-        cur = con.execute("SELECT last_daily FROM users WHERE user_id=?", (uid,))
-        last = cur.fetchone()[0]
-        now = datetime.now(TZ)
-        grant = 1000
-        if last:
-            last_dt = datetime.fromisoformat(last)
-            if (now.date() == last_dt.date()):
-                await inter.response.send_message("You already claimed daily today.", ephemeral=True)
-                return
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        uid = inter.user.id
+        con = sqlite3.connect(DB_PATH)
+        try:
+            con.execute("INSERT OR IGNORE INTO users(user_id, coins) VALUES(?,0)", (uid,))
+            cur = con.execute("SELECT last_daily FROM users WHERE user_id=?", (uid,))
+            row = cur.fetchone()
+            last = row[0] if row else None
+            now = datetime.now(TZ)
+            grant = 1000
+            if last:
+                last_dt = datetime.fromisoformat(last)
+                if (now.date() == last_dt.date()):
+                    await inter.followup.send("You already claimed daily today.", ephemeral=True)
+                    return
+            bal = await change_balance(uid, grant, "daily", "daily grant")
+            con.execute("UPDATE users SET last_daily=? WHERE user_id=?", (now.isoformat(), uid))
+            con.commit()
+        finally:
+            con.close()
+        await inter.followup.send(f"Daily +{grant} coins. Balance: {bal}", ephemeral=True                return
         bal = await change_balance(uid, grant, "daily", "daily grant")
         con.execute("UPDATE users SET last_daily=? WHERE user_id=?", (now.isoformat(), uid))
         con.commit()
