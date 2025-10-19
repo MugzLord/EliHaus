@@ -580,21 +580,38 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
         if raw.startswith(("http://", "https://")):
             url = raw
             import urllib.parse as _u
+            # we tried to parse a pasted URL above and set: url, p = urlparse(raw), etc.
             try:
-                p = _u.urlparse(url)
-                q = _u.parse_qs(p.query)
-                if "av" in q and q["av"]:
-                    uname = q["av"][0]
-                else:
-                    uname = p.path.strip("/").split("/")[-1] or None
+                p = urlparse(raw)
+                q = parse_qs(p.query)
+                uname = (
+                    (q.get("nick", [None])[0])
+                    or (q.get("avatar_name", [None])[0])
+                    or (q.get("user", [None])[0])
+                    or (p.path.strip("/").split("/")[-1] or None)
+                )
+                # normalise username token
+                if uname:
+                    uname = re.sub(r"[^A-Za-z0-9_-]", "", uname)
             except Exception:
                 uname = None
-            profile_url = url
-        else:
-            uname = raw
-            profile_url = f"https://www.imvu.com/catalog/web_mypage.php?av={uname}"
-        wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?av={uname}" if uname else None
-        return uname, profile_url, wishlist_url
+            
+            # build canonical links
+            if uname:
+                profile_url  = f"https://www.imvu.com/catalog/web_profile.php?nick={uname}"
+                wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?nick={uname}"
+            else:
+                # fallback: they typed a URL we couldn't parse, or some random text
+                uname = raw
+                if re.fullmatch(r"[A-Za-z0-9_-]{2,32}", uname):
+                    profile_url  = f"https://www.imvu.com/catalog/web_profile.php?nick={uname}"
+                    wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?nick={uname}"
+                else:
+                    profile_url  = raw   # keep whatever they pasted
+                    wishlist_url = None
+            
+            return uname, profile_url, wishlist_url
+
 
     async def on_submit(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
