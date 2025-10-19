@@ -1190,20 +1190,56 @@ async def tick_round(channel, rid: int, exp_iso: str):
         except Exception:
             result_color, result_number = ("BLACK", 17)         # last resort
 
+# --- interaction reply helpers (paste once) ---
+async def safe_ack(interaction: discord.Interaction, ephemeral: bool = True):
+    """Defer quickly so the command never times out."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+    except Exception:
+        pass
+
+async def safe_followup(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+    """Send a reply whether or not we already deferred."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except Exception:
+        pass
     
-# ---- Player: join/daily/weekly/balance ----
 @bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
 async def eh_join(interaction: discord.Interaction):
-    uid = str(interaction.user.id)
-    ensure_user(uid)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM tx WHERE discord_id=? AND kind='starter' LIMIT 1", (uid,))
-        has_starter = c.fetchone() is not None
-    if has_starter:
-        return await interaction.response.send_message("You’ve already joined EliHaus. Use `/eh_daily` and `/eh_weekly` to build coins.", ephemeral=True)
-    new_bal = change_balance(uid, STARTER_AMOUNT, "starter", "joinhaus starter")
-    await interaction.response.send_message(f"Welcome to **EliHaus**. Starter pack: **{STARTER_AMOUNT}** coins. Balance: **{new_bal}**", ephemeral=True)
+    await safe_ack(interaction, ephemeral=True)  # prevents "The application did not respond"
+
+    try:
+        uid = str(interaction.user.id)
+        ensure_user(uid)
+
+        # already claimed starter?
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM tx WHERE discord_id=? AND kind='starter' LIMIT 1", (uid,))
+            has_starter = c.fetchone() is not None
+
+        if has_starter:
+            return await safe_followup(
+                interaction,
+                "You’ve already joined EliHaus. Use `/eh_daily` and `/eh_weekly` to build coins.",
+                True,
+            )
+
+        new_bal = change_balance(uid, STARTER_AMOUNT, "starter", "joinhaus starter")
+
+        return await safe_followup(
+            interaction,
+            f"Welcome to **EliHaus**. Starter pack: **{STARTER_AMOUNT}** coins. Balance: **{new_bal}**",
+            True,
+        )
+
+    except Exception as e:
+        return await safe_followup(interaction, f"❌ Error: `{e}`", True)
 
 @bot.tree.command(name="eh_daily", description="Claim your daily coins")
 async def eh_daily(interaction: discord.Interaction):
@@ -1300,42 +1336,56 @@ async def eh_balance(interaction: discord.Interaction, member: discord.Member | 
         ephemeral=True
     )
 
-# ---- Roulette: open/status/resolve/cancel ----
 @bot.tree.command(name="eh_openround", description="(Admin) Open a roulette round")
 @app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(seconds="Betting window (10-600s)")
+@app_commands.describe(seconds="Betting window (10–600s)")
 async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SECONDS_DEFAULT):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    seconds = max(10, min(seconds, 600))
-    if get_open_round(interaction.channel.id):
-        return await interaction.response.send_message("There’s already an open round in this channel.", ephemeral=True)
-    rid, exp = open_round(interaction.channel.id, seconds, str(interaction.user.id))
+    await safe_ack(interaction, ephemeral=True)  # <<< immediate ack to avoid timeout
 
-    # user-friendly label like #1, #2 per channel
-    rnum = ClaimView.next_round_number(interaction.channel.id)
-    rlabel = f"#{rnum}"
-    ClaimView.set_round_label(rid, rlabel)
-
-    embed = discord.Embed(
-        title=f"🎯 Roulette — Round {rlabel}",
-        description="Click to bet.",
-        color=discord.Color.gold()
-    )
-    embed.add_field(name="Pool", value="0", inline=True)
-    embed.add_field(name="Time", value=f"{seconds}s left", inline=True)
-    embed.add_field(name="Bets", value="0", inline=True)
-
-    view = BetView(rid, timeout=seconds + 30)
-    msg = await interaction.channel.send(embed=embed, view=view)
-    with db() as conn:
-        conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
-    # launch a background ticker for this round
     try:
-        ROUND_TASKS[rid] = bot.loop.create_task(_tick_round(interaction.channel, rid, iso(exp)))
-    except Exception:
-        pass
-    await interaction.response.send_message(f"Opened roulette round {rlabel}.", ephemeral=True)
+        # --- your existing permission checks ---
+        if not user_is_admin(interaction.user):
+            return await safe_followup(interaction, "You don’t have permission.", True)
+
+        seconds = max(10, min(seconds, 600))
+        if get_open_round(interaction.channel.id):
+            return await safe_followup(interaction, "There’s already an open round in this channel.", True)
+
+        rid, exp = open_round(interaction.channel.id, seconds, str(interaction.user.id))
+
+        # build the opening panel
+        rnum = ClaimView.next_round_number(interaction.channel.id)
+        rlabel = f"#{rnum}"
+        ClaimView.set_round_label(rid, rlabel)
+
+        embed = discord.Embed(
+            title=f"🎰 Roulette — Round {rlabel}",
+            description="Click to bet.",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="Pool", value="0", inline=True)
+        embed.add_field(name="Time", value=f"{seconds}s left", inline=True)
+        embed.add_field(name="Bets", value="0", inline=True)
+
+        view = BetView(rid, timeout=seconds + 30)
+
+        # send the panel and save message_id
+        msg = await interaction.channel.send(embed=embed, view=view)
+        with db() as conn:
+            conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
+
+        # launch ticker as a background task (never block the command)
+        try:
+            ROUND_TASKS[rid] = bot.loop.create_task(tick_round(interaction.channel, rid, iso(exp)))
+        except Exception:
+            pass
+
+        return await safe_followup(interaction, f"✅ Opened roulette round {rlabel}.", True)
+
+    except Exception as e:
+        # show error to caller so it never silently “doesn’t respond”
+        return await safe_followup(interaction, f"❌ Error opening round: `{e}`", True)
+
 
 @bot.tree.command(name="eh_table", description="Show current roulette round status in this channel")
 async def eh_table(interaction: discord.Interaction):
