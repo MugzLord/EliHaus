@@ -716,50 +716,39 @@ class BetView(discord.ui.View):
         self.rid = rid
 
     
-    @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger,   emoji="🎯", custom_id="eh_roul_red")
-    async def bet_red(self, itx: discord.Interaction, _: discord.ui.Button):
-        try:
-            await itx.response.send_modal(RedBetModal(self.rid))
-        except Exception as e:
-            # if modal construction crashed, report it
-            if not itx.response.is_done():
-                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
-            else:
-                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+    class RedBetModal(discord.ui.Modal, title="Bet: RED"):
+    stake = discord.ui.TextInput(
+        label="Stake (coins)",                      # <=45
+        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
+        required=True, max_length=10
+    )
 
+class BlackBetModal(discord.ui.Modal, title="Bet: BLACK"):
+    stake = discord.ui.TextInput(
+        label="Stake (coins)",
+        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
+        required=True, max_length=10
+    )
 
-    @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary,  emoji="⬛", custom_id="eh_roul_black")
-    async def bet_black(self, itx: discord.Interaction, _: discord.ui.Button):
-        try:
-            await itx.response.send_modal(RedBetModal(self.rid))
-        except Exception as e:
-            # if modal construction crashed, report it
-            if not itx.response.is_done():
-                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
-            else:
-                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+class GreenBetModal(discord.ui.Modal, title="Bet: GREEN"):
+    stake = discord.ui.TextInput(
+        label="Stake (coins)",
+        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
+        required=True, max_length=10
+    )
 
-    @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success,  emoji="🟩", custom_id="eh_roul_green")
-    async def bet_green(self, itx: discord.Interaction, _: discord.ui.Button):
-        try:
-            await itx.response.send_modal(RedBetModal(self.rid))
-        except Exception as e:
-            # if modal construction crashed, report it
-            if not itx.response.is_done():
-                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
-            else:
-                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
+class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
+    number = discord.ui.TextInput(
+        label="Number (0–36)",                      # <=45
+        placeholder="e.g., 17",
+        required=True, max_length=2
+    )
+    stake = discord.ui.TextInput(
+        label="Stake (coins)",                      # <=45
+        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
+        required=True, max_length=10
+    )
 
-    @discord.ui.button(label="Bet NUMBER", style=discord.ButtonStyle.secondary,emoji="🎯", custom_id="eh_roul_number")
-    async def bet_number(self, itx: discord.Interaction, _: discord.ui.Button):
-        try:
-            await itx.response.send_modal(RedBetModal(self.rid))
-        except Exception as e:
-            # if modal construction crashed, report it
-            if not itx.response.is_done():
-                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
-            else:
-                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
 
     @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary,emoji="❓", custom_id="eh_roul_mybet")
     async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
