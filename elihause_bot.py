@@ -308,6 +308,62 @@ async def safe_followup(interaction: discord.Interaction, content: str, ephemera
     except Exception:
         pass
 
+# ---------- Roulette badge rendering ----------
+from io import BytesIO
+
+# where your 3 base chips live
+CHIP_ASSETS = {
+    "RED":   "assets/chip_red.png",
+    "BLACK": "assets/chip_black.png",
+    "GREEN": "assets/chip_green.png",
+}
+
+def roulette_color_from_number(n: int) -> str:
+    red = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+    if n == 0:
+        return "GREEN"
+    return "RED" if n in red else "BLACK"
+
+def render_chip_badge(color: str, number: int) -> BytesIO | None:
+    """
+    Draws the number onto the base chip of the given color.
+    Returns a PNG buffer (BytesIO) or None on failure.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # Pillow
+    except Exception:
+        return None
+
+    key = str(color).upper()
+    base_path = CHIP_ASSETS.get(key)
+    if not base_path:
+        return None
+
+    # open base chip
+    img = Image.open(base_path).convert("RGBA")
+    W, H = img.size
+    draw = ImageDraw.Draw(img)
+
+    # choose a font; DejaVuSans is commonly available in Linux containers
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", int(H * 0.44))
+    except Exception:
+        font = ImageFont.load_default()
+
+    text = str(int(number))
+    # center the number
+    tw, th = draw.textlength(text, font=font), font.size
+    x = (W - tw) / 2
+    y = (H - th) / 2 - H * 0.02
+
+    # draw with slight stroke so it pops
+    draw.text((x, y), text, font=font, fill=(245, 241, 235, 255), stroke_width=int(H * 0.035), stroke_fill=(0, 0, 0, 140))
+
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    buf.seek(0)
+    return buf
+
 # ---------------- Admin check helpers ----------------
 def user_is_admin(member: discord.Member) -> bool:
     if getattr(member.guild_permissions, "manage_guild", False) or member.id == getattr(member.guild, "owner_id", 0):
@@ -1170,6 +1226,8 @@ async def eh_help(interaction: discord.Interaction):
     ]
     lines = public + (["\n**Admin**"] + admin if is_admin else [])
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
 # ========= Roulette single-card helpers =========
 import asyncio
 
@@ -1223,6 +1281,38 @@ import asyncio
 ROUND_TICK_SECONDS = 5
 ROUND_TASKS: dict[str, asyncio.Task] = {}
 
+def _choice_label(choice: str) -> str:
+    """Pretty label for a stored choice."""
+    ch = str(choice).upper()
+    if ch.startswith("NUM:"):
+        return f"#{ch.split(':', 1)[1]}"
+    if ch in ("RED", "BLACK", "GREEN"):
+        # same 🎯 icon everywhere for consistency
+        return {"RED": "🟥", "BLACK": "⬛", "GREEN": "🟩"}[ch]
+    return ch
+
+def _latest_bets_lines(channel, rid: int, limit: int = 6) -> str:
+    """Return 'mention: LABEL — amount' lines for the latest bets in this round."""
+    rows: list[tuple[str, str, int]] = []
+    with db() as conn:
+        c = conn.cursor()
+        # Works on SQLite even without an explicit timestamp (uses ROWID order)
+        c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=? ORDER BY ROWID DESC LIMIT ?", (rid, limit))
+        rows = c.fetchall() or []
+
+    lines = []
+    guild = getattr(channel, "guild", None)
+    for uid, choice, stake in rows:
+        who = f"<@{uid}>"
+        if guild:
+            m = guild.get_member(int(uid))
+            if m:
+                who = m.mention
+        lines.append(f"{who}: {_choice_label(choice)} — **{int(stake)}**")
+    return "\n".join(lines) if lines else "—"
+
+
+        
 # ---- robust countdown that always resolves ----
 import asyncio
 from datetime import datetime, timezone
@@ -1264,7 +1354,8 @@ async def tick_round(channel, rid: int, exp_iso: str):
             open_embed.add_field(name="Pool", value=str(pool), inline=True)
             open_embed.add_field(name="Time", value=f"{left}s left", inline=True)
             open_embed.add_field(name="Bets", value=str(cnt), inline=True)
-            open_embed.add_field(name="Players (latest)", value="—", inline=False)
+            players_txt = _latest_bets_lines(channel, rid, limit=10)
+            open_embed.add_field(name="Players (latest)", value=players_txt, inline=False)
 
             view = RouletteBetView(rid, timeout=left + 30)
             await _edit_round_message(bot, channel, rid, open_embed, view=view)
@@ -1277,41 +1368,86 @@ async def tick_round(channel, rid: int, exp_iso: str):
             # never let a bug kill the countdown
             await asyncio.sleep(5)
 
-    # ----- auto resolve -----
+          # ----- compute outcome (result_color/result_number already set or roll now) -----
     try:
-        # outcome
-        try:
-            result_color, result_number = resolve_spin_result(rid)
-            # if your resolver returns lowercase, normalize below
-        except Exception:
-            # simple fallback roll
-            import random
-            red_nums = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-            n = random.randint(0, 36)
-            result_number = n
-            result_color = "GREEN" if n == 0 else ("RED" if n in red_nums else "BLACK")
+        result_color, result_number = resolve_spin_result(rid)
+    except Exception:
+        import random
+        n = random.randint(0, 36)
+        result_number = n
+        result_color = "GREEN" if n == 0 else ("RED" if _outcome_from_spin(n) == "red" else "BLACK")
+    
+    outcome = result_color.lower()
+    
+    # Totals + winners (sum payouts if same user has multiple winning bets)
+    total_bets = 0
+    total_pool = 0
+    winners_map: dict[str, int] = {}
+    
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,))
+        rows = c.fetchall() or []
+        for uid, choice, stake in rows:
+            total_bets += 1
+            total_pool += int(stake)
+    
+            ch = str(choice).upper()
+            win = 0
+            if ch in ("RED","BLACK") and ch.lower() == outcome:
+                win = int(stake * PAYOUT_RED_BLACK)
+            elif ch == "GREEN" and outcome == "green":
+                win = int(stake * PAYOUT_GREEN)
+            elif ch.startswith("NUM:"):
+                num = int(ch.split(":",1)[1])
+                if num == int(result_number):
+                    win = int(stake * PAYOUT_NUMBER)
+    
+            if win > 0:
+                winners_map[uid] = winners_map.get(uid, 0) + win
+                # credit users (optional if you already do this elsewhere)
+                c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (win, uid))
+                c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                          (uid, "payout", win, f"roulette:{rid}|{outcome}:{result_number}", iso(now_local())))
+    
+    winners_list = list(winners_map.items())
+    winners_txt = _format_winners_lines(getattr(channel, "guild", None), winners_list, limit=5)
+    
+    # Colored result embed
+    pill = {"RED":"🔴 **RED**","BLACK":"⬛ **BLACK**","GREEN":"🟩 **GREEN**"}[str(result_color).upper()]
+    col_map = {"RED":(220,38,38), "BLACK":(24,24,27), "GREEN":(16,185,129)}
+    r,g,b = col_map.get(str(result_color).upper(), (24,24,27))
+    
+    result_embed = discord.Embed(
+        title=f"🎰 EliHaus Roulette — Round {ClaimView.get_round_label(rid)}",
+        colour=discord.Colour.from_rgb(r,g,b)
+    )
+    result_embed.add_field(name="RESULT", value=f"{pill} · **#{int(result_number)}**", inline=False)
+    result_embed.add_field(name="Total Bets", value=str(total_bets), inline=True)
+    result_embed.add_field(name="Pool", value=str(total_pool), inline=True)
+    result_embed.add_field(name="Winners (top)", value=winners_txt, inline=False)
 
-        # compute totals and winners (optional—adjust to your DB schema)
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
-            total_bets, total_pool = c.fetchone() or (0, 0)
+    # 2) render the numbered chip and SEND a new result message
+    badge = render_chip_badge(str(result_color).upper(), int(result_number))  # uses assets/chip_*.png
+    if badge:
+        fname = f"chip_{str(result_color).lower()}_{int(result_number)}.png"
+        file = discord.File(badge, filename=fname)
+        result_embed.set_thumbnail(url=f"attachment://{fname}")
+        await channel.send(embed=result_embed, file=file)
+    else:
+        # fallback if Pillow/assets missing
+        await channel.send(embed=result_embed)
 
-        # colored result embed
-        pill = {"RED": "🔴 **RED**", "BLACK": "⬛ **BLACK**", "GREEN": "🟩 **GREEN**"}.get(str(result_color).upper(), "⬛ **BLACK**")
-        col_map = {"RED": (220,38,38), "BLACK": (24,24,27), "GREEN": (16,185,129)}
-        r,g,b = col_map.get(str(result_color).upper(), (24,24,27))
-        result_embed = discord.Embed(
-            title=f"🎰 EliHaus Roulette — Round {ClaimView.get_round_label(rid)}",
-            colour=discord.Colour.from_rgb(r,g,b)
-        )
-        result_embed.add_field(name="RESULT", value=f"{pill} · **#{int(result_number)}**", inline=False)
-        result_embed.add_field(name="Total Bets", value=str(total_bets), inline=True)
-        result_embed.add_field(name="Pool", value=str(total_pool), inline=True)
-        result_embed.add_field(name="Winners (top)", value="—", inline=False)
-
-        # remove buttons
-        await _edit_round_message(bot, channel, rid, result_embed, view=None)
+    # 1) close the original betting panel (remove buttons)
+    await _edit_round_message(
+        bot, channel, rid,
+        discord.Embed(
+            title=f"🎰 Roulette — Round {ClaimView.get_round_label(rid)}",
+            description="Round closed.",
+            colour=discord.Colour.dark_grey()
+        ),
+        view=None
+    )
 
     except Exception:
         # even if resolve fails, make sure buttons are gone
@@ -1492,7 +1628,7 @@ async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SE
         ClaimView.set_round_label(rid, rlabel)
 
         embed = discord.Embed(
-            title=f"🎰 Roulette — Round {rlabel}",
+            title=f"🎰 Roulette — Round {ClaimView.get_round_label(rid)}",
             description="Click to bet.",
             color=discord.Color.gold()
         )
@@ -1600,7 +1736,7 @@ async def eh_resolve(interaction: discord.Interaction):
         outcome=outcome, roll=roll,
         total_bets=len(rows),
         total_pool=total_pool,
-        winners_mentions=top_mentions,
+        winners_mentions=[],  # not used anymore
         seed_display=seed_display,
     )
     
@@ -1979,6 +2115,28 @@ def _slots_msg_key(channel_id: int) -> str:
     return f"slots:msg:{channel_id}"
 
 # ---- Pot helpers ----
+def _outcome_from_spin(n: int) -> str:
+    red = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+    if n == 0:
+        return "green"
+    return "red" if n in red else "black"
+
+def _format_winners_lines(guild: discord.Guild, winners: list[tuple[str, int]], limit: int = 5) -> str:
+    """
+    winners: list of (discord_id, payout)
+    Returns up to top N lines like '@User — 2500'.
+    """
+    if not winners:
+        return "—"
+    # sort by payout desc, then take top N
+    winners = sorted(winners, key=lambda x: x[1], reverse=True)[:limit]
+    lines = []
+    for uid, amount in winners:
+        m = guild.get_member(int(uid))
+        who = m.mention if m else f"<@{uid}>"
+        lines.append(f"{who} — **{amount}**")
+    return "\n".join(lines)
+
      
 def edit_round_message(bot, channel, rid: int, embed, view=None):
     """Safe from non-async code: schedules the edit on the loop."""
