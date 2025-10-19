@@ -351,10 +351,10 @@ def _prize_ticket_key(prize_id: int) -> str:
 
 # ---------------- Views & Modals ----------------
 class RouletteBetView(discord.ui.View):
-    def __init__(self, rid: int):
-        super().__init__(timeout=None)   # <- required for persistence
+    def __init__(self, rid: int, timeout: float | None = None):
+        # pass the timeout through to the base View so callers can supply it
+        super().__init__(timeout=timeout)
         self.rid = rid
-    # ... buttons with unique custom_id values ...
 
 class DisabledClaimView(discord.ui.View):
     def __init__(self):
