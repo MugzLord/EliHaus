@@ -42,6 +42,12 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 # Admin role (optional): users with Manage Server or this role ID are treated as admins
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
 
+from collections import defaultdict
+
+MESSAGE_COUNTER = defaultdict(int)   # channel_id -> count since last bump
+ACTIVE_PANEL_MSG: dict[int, int] = {}  # channel_id -> betting panel message_id
+
+
 # Economy
 DAILY_AMOUNT = 1_800
 WEEKLY_AMOUNT = 6_000
@@ -324,20 +330,61 @@ def roulette_color_from_number(n: int) -> str:
         return "GREEN"
     return "RED" if n in red else "BLACK"
 
-def render_chip_badge(color: str, number: int) -> BytesIO | None:
+# requires: from PIL import Image, ImageDraw, ImageFont
+# and import io
+
+def render_chip_badge(result_color: str, result_number: int) -> io.BytesIO | None:
     """
-    Draws the number onto the base chip of the given color.
-    Returns a PNG buffer (BytesIO) or None on failure.
+    Returns a PNG (in-memory) of a LARGE chip with a BIG, centered number.
+    Expects base chip asset at: assets/chip_red.png / chip_black.png / chip_green.png (108x108 ok)
     """
     try:
-        from PIL import Image, ImageDraw, ImageFont  # Pillow
+        base_path = f"assets/chip_{result_color.lower()}.png"
+        chip = Image.open(base_path).convert("RGBA")
+
+        # --- upscale chip so text can be huge ---
+        SCALE = 5                       # 108 * 5 = 540 px
+        W, H = chip.size
+        chip = chip.resize((W*SCALE, H*SCALE), Image.LANCZOS)
+
+        draw = ImageDraw.Draw(chip)
+
+        # --- choose a big font relative to chip size ---
+        # try common fonts; fall back if needed
+        font = None
+        for fp in ("DejaVuSans-Bold.ttf", "Arial.ttf", "arial.ttf"):
+            try:
+                font = ImageFont.truetype(fp, size=int(chip.width * 0.42))
+                break
+            except Exception:
+                pass
+        if font is None:
+            # last resort: small default font (still better than nothing)
+            font = ImageFont.load_default()
+
+        # text + styles
+        text = str(int(result_number))
+        cx, cy = chip.width // 2, chip.height // 2
+
+        # outline for contrast
+        draw.text(
+            (cx, cy),
+            text,
+            font=font,
+            fill=(255, 255, 255, 255),
+            anchor="mm",
+            stroke_width=max(2, chip.width // 60),
+            stroke_fill=(0, 0, 0, 255),
+        )
+
+        # export to bytes for discord.File
+        out = io.BytesIO()
+        chip.save(out, format="PNG")
+        out.seek(0)
+        return out
     except Exception:
         return None
 
-    key = str(color).upper()
-    base_path = CHIP_ASSETS.get(key)
-    if not base_path:
-        return None
 
     # open base chip
     img = Image.open(base_path).convert("RGBA")
@@ -1682,7 +1729,7 @@ async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SE
         # show error to caller so it never silently “doesn’t respond”
         return await safe_followup(interaction, f"❌ Error opening round: `{e}`", True)
 
-
+  
 @bot.tree.command(name="eh_table", description="Show current roulette round status in this channel")
 async def eh_table(interaction: discord.Interaction):
     o = get_open_round(interaction.channel.id)
@@ -1698,6 +1745,38 @@ async def eh_table(interaction: discord.Interaction):
         f"Round **{ClaimView.get_round_label(rid)}** — Bets: **{cnt}** | Pool: **{pool}** | Time left: **{remain}s**",
         ephemeral=True
     )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # ignore bots + DMs
+    if message.author.bot or message.guild is None:
+        return
+
+    # count only real chat messages
+    MESSAGE_COUNTER[message.channel.id] += 1
+
+    # bump threshold (change 15 to what you like)
+    if MESSAGE_COUNTER[message.channel.id] >= 15:
+        MESSAGE_COUNTER[message.channel.id] = 0
+        mid = ACTIVE_PANEL_MSG.get(message.channel.id)
+        if mid:
+            jump = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{mid}"
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="Jump to Betting Panel", url=jump))
+
+            bump = discord.Embed(
+                title="🎰 Roulette — current round",
+                description="Chat flew past. Click below to jump to the betting panel.",
+                colour=discord.Colour.dark_grey()
+            )
+            await message.channel.send(embed=bump, view=view)
+
+    # keep commands working if you use commands.Bot
+    try:
+        await bot.process_commands(message)
+    except Exception:
+        pass
 
 @bot.tree.command(name="eh_resolve", description="(Admin) Resolve the current roulette round")
 @app_commands.default_permissions(manage_guild=True)
