@@ -368,7 +368,7 @@ class RouletteBetView(discord.ui.View):
                 await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
 
     # ⬛ BLACK
-    @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="⬛", custom_id="eh_roul_black")
+    @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="🎯", custom_id="eh_roul_black")
     async def bet_black(self, itx: discord.Interaction, _: discord.ui.Button):
         try:
             await itx.response.send_modal(BlackBetModal(self.rid))
@@ -379,7 +379,7 @@ class RouletteBetView(discord.ui.View):
                 await itx.followup.send(f"❌ Failed to open Black bet modal: `{e}`", ephemeral=True)
 
     # 🟩 GREEN
-    @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🟩", custom_id="eh_roul_green")
+    @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🎯", custom_id="eh_roul_green")
     async def bet_green(self, itx: discord.Interaction, _: discord.ui.Button):
         try:
             await itx.response.send_modal(GreenBetModal(self.rid))
@@ -401,7 +401,7 @@ class RouletteBetView(discord.ui.View):
                 await itx.followup.send(f"❌ Failed to open Number bet modal: `{e}`", ephemeral=True)
 
     # ❓ My Bet
-    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="❓", custom_id="eh_roul_mybet")
+    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="🎯", custom_id="eh_roul_mybet")
     async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
         await itx.response.defer(ephemeral=True, thinking=True)
         uid = str(itx.user.id)
@@ -1205,71 +1205,106 @@ import asyncio
 ROUND_TICK_SECONDS = 5
 ROUND_TASKS: dict[str, asyncio.Task] = {}
 
-# ========= Countdown + close logic (single-card; no duplicates) =========
+# ---- robust countdown that always resolves ----
+import asyncio
+from datetime import datetime, timezone
+
 async def tick_round(channel, rid: int, exp_iso: str):
     """
-    Updates the betting panel countdown, then shows the result —
-    all by EDITING the saved message (no extra sends).
+    Edits the ONE round panel with a countdown and auto-resolves when time is up.
+    Never crashes the task; always removes buttons at the end.
     """
-    # parse expiry
-    exp = from_iso(exp_iso) if 'from_iso' in globals() else datetime.fromisoformat(exp_iso)
+    # parse expiry safely
+    try:
+        exp = datetime.fromisoformat(exp_iso)
+        if exp.tzinfo is None:
+            # make it local if your app uses TZ, else fall back to UTC
+            exp = (now_local() if 'now_local' in globals() else datetime.now(timezone.utc)).astimezone().tzinfo \
+                  and exp.replace(tzinfo=(now_local().tzinfo if 'now_local' in globals() else timezone.utc)) \
+                  or exp.replace(tzinfo=timezone.utc)
+    except Exception:
+        # if parsing fails, end immediately
+        exp = (now_local() if 'now_local' in globals() else datetime.now(timezone.utc))
 
-    # --- live countdown ---
     while True:
-        now = now_local() if 'now_local' in globals() else datetime.now(tz=TZ)
-        left = max(0, int((exp - now).total_seconds()))
-
-        bets_count, pool_sum = _round_stats(rid)
-
-        open_embed = discord.Embed(
-            title=f"🎰 Roulette — Round #{rid}",
-            description="Click to bet.",
-            color=discord.Color.gold()
-        )
-        open_embed.add_field(name="Pool", value=str(pool_sum), inline=True)
-        open_embed.add_field(name="Time", value=f"{left}s left", inline=True)
-        open_embed.add_field(name="Bets", value=str(bets_count), inline=True)
-        open_embed.add_field(name="Players (latest)", value="—", inline=False)
-
-        # keep buttons during betting
-        view = RouletteBetView(rid, timeout=left + 30)
-        await _edit_round_message(bot, channel, rid, open_embed, view=view)
-
-
-        # ✳️ EDIT the saved message (do not send a new one)
-        edit_round_message(bot, channel, rid, result_embed, view=None)
-
-        if left <= 0:
-            break
-        await asyncio.sleep(5)
-
-    # ------- resolve result -------
-    try:
-        result_color, result_number = resolve_spin_result(rid)  # your existing function
-    except NameError:
         try:
-            result_color, result_number = eh_resolve(rid)       # fallback to your alt resolver
+            now = now_local() if 'now_local' in globals() else datetime.now(timezone.utc)
+            left = max(0, int((exp - now).total_seconds()))
+
+            # stats
+            with db() as conn:
+                c = conn.cursor()
+                c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
+                cnt, pool = c.fetchone() or (0, 0)
+
+            # betting panel (gold)
+            open_embed = discord.Embed(
+                title=f"🎰 Roulette — Round {ClaimView.get_round_label(rid)}",
+                description="Click to bet.",
+                color=discord.Color.gold()
+            )
+            open_embed.add_field(name="Pool", value=str(pool), inline=True)
+            open_embed.add_field(name="Time", value=f"{left}s left", inline=True)
+            open_embed.add_field(name="Bets", value=str(cnt), inline=True)
+            open_embed.add_field(name="Players (latest)", value="—", inline=False)
+
+            view = RouletteBetView(rid, timeout=left + 30)
+            await _edit_round_message(bot, channel, rid, open_embed, view=view)
+
+            if left <= 0:
+                break
+
+            await asyncio.sleep(5)
         except Exception:
-            result_color, result_number = ("BLACK", 17)         # last resort
+            # never let a bug kill the countdown
+            await asyncio.sleep(5)
 
-# --- interaction reply helpers (paste once) ---
-async def safe_ack(interaction: discord.Interaction, ephemeral: bool = True):
-    """Defer quickly so the command never times out."""
+    # ----- auto resolve -----
     try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=ephemeral, thinking=True)
-    except Exception:
-        pass
+        # outcome
+        try:
+            result_color, result_number = resolve_spin_result(rid)
+            # if your resolver returns lowercase, normalize below
+        except Exception:
+            # simple fallback roll
+            import random
+            red_nums = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+            n = random.randint(0, 36)
+            result_number = n
+            result_color = "GREEN" if n == 0 else ("RED" if n in red_nums else "BLACK")
 
-async def safe_followup(interaction: discord.Interaction, content: str, ephemeral: bool = True):
-    """Send a reply whether or not we already deferred."""
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=ephemeral)
-        else:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
+        # compute totals and winners (optional—adjust to your DB schema)
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
+            total_bets, total_pool = c.fetchone() or (0, 0)
+
+        # colored result embed
+        pill = {"RED": "🔴 **RED**", "BLACK": "⬛ **BLACK**", "GREEN": "🟩 **GREEN**"}.get(str(result_color).upper(), "⬛ **BLACK**")
+        col_map = {"RED": (220,38,38), "BLACK": (24,24,27), "GREEN": (16,185,129)}
+        r,g,b = col_map.get(str(result_color).upper(), (24,24,27))
+        result_embed = discord.Embed(
+            title=f"🎰 EliHaus Roulette — Round {ClaimView.get_round_label(rid)}",
+            colour=discord.Colour.from_rgb(r,g,b)
+        )
+        result_embed.add_field(name="RESULT", value=f"{pill} · **#{int(result_number)}**", inline=False)
+        result_embed.add_field(name="Total Bets", value=str(total_bets), inline=True)
+        result_embed.add_field(name="Pool", value=str(total_pool), inline=True)
+        result_embed.add_field(name="Winners (top)", value="—", inline=False)
+
+        # remove buttons
+        await _edit_round_message(bot, channel, rid, result_embed, view=None)
+
     except Exception:
-        pass
+        # even if resolve fails, make sure buttons are gone
+        try:
+            await _edit_round_message(bot, channel, rid,
+                                      discord.Embed(title=f"🎰 EliHaus Roulette — Round {ClaimView.get_round_label(rid)}",
+                                                    description="Round closed.", colour=discord.Colour.dark_grey()),
+                                      view=None)
+        except Exception:
+            pass
+
     
 @bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
 async def eh_join(interaction: discord.Interaction):
