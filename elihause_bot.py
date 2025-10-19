@@ -472,23 +472,50 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
             f"Failure to comply is subject to **disqualification**."
         )
 
+        # --- announce + staff tag in the TICKET channel (you already have this)
         await ticket.send(
             f"{staff_tag} New WL claim for {interaction.user.mention}\n"
-            f"IMVU: {profile_line}\n"
-            f"Wishlist: {wishlist_line}\n"
-            f"Notes: {str(self.note or '—')}\n\n"
+            f"**IMVU:** {profile_line}\n"
+            f"**Wishlist:** {wishlist_line}\n"
+            f"**Notes:** {self.note or '—'}\n"
             f"{policy}"
         )
-
+        
+        # --- approval embed + buttons (send to the TICKET, not interaction.channel)
+        embed = discord.Embed(
+            title="Withdraw Request • Pending Approval",
+            description=(
+                f"**Requester:** {interaction.user.mention}\n"
+                f"**Coins to convert:** `{self.amount}`\n"
+                f"**IMVU:** {profile_line}\n"
+                f"**Wishlist:** {wishlist_line}"
+            ),
+            colour=discord.Colour.gold()
+        )
+        embed.set_footer(text="Use the buttons below to Approve or Reject")
+        
+        view = WithdrawApprovalView(
+            requester_id=interaction.user.id,
+            amount=self.amount,
+            imvu_url=self.profile_url or "",
+            note=self.note or ""
+        )
+        
         try:
-            msg_id = get_state(_prize_msg_key(self.prize_id))
-            if msg_id:
-                msg = await interaction.channel.fetch_message(int(msg_id))
-                await msg.edit(view=DisabledClaimView())
-        except Exception:
-            pass
+            await ticket.send(embed=embed, view=view)
+        except Exception as e:
+            await interaction.response.send_message(
+                f"Bot couldn’t post in the ticket. Please allow **Send Messages / Embed Links** for the bot here.\nError: `{e}`",
+                ephemeral=True
+            )
+            return
+        
+        # --- acknowledge the modal exactly once
+        try:
+            await interaction.response.send_message(f"✅ Ticket created: {ticket.mention}", ephemeral=True)
+        except discord.InteractionResponded:
+            await interaction.followup.send(f"✅ Ticket created: {ticket.mention}", ephemeral=True)
 
-        await interaction.response.send_message(f"✅ Ticket created: {ticket.mention}", ephemeral=True)
 
 # ===== Roulette Betting UI — Colour + Number Modals (mobile-friendly) =====
 # Uses: db(), now_local(), iso(), get_balance(uid), ONE_BET_PER_ROUND, MAX_STAKE,
@@ -535,7 +562,7 @@ def _insert_bet(rid: str, channel_id: int, uid: str, choice: str, stake: int):
 class RedBetModal(discord.ui.Modal, title="Bet on RED"):
     amount  = discord.ui.TextInput(label="Amount (coins)", placeholder="e.g. 2500", required=True)
     numbers = discord.ui.TextInput(
-        label="Red numbers (optional, CSV)",
+        label="Red numbers (1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36)",
         placeholder="e.g. 1,3,5 — leave blank for colour only",
         required=False
     )
@@ -582,7 +609,7 @@ class RedBetModal(discord.ui.Modal, title="Bet on RED"):
 class BlackBetModal(discord.ui.Modal, title="Bet on BLACK"):
     amount  = discord.ui.TextInput(label="Amount (coins)", placeholder="e.g. 2500", required=True)
     numbers = discord.ui.TextInput(
-        label="Black numbers (optional, CSV)",
+        label="Black numbers (2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35)",
         placeholder="e.g. 2,4,6 — leave blank for colour only",
         required=False
     )
@@ -714,154 +741,7 @@ class BetView(discord.ui.View):
             f"Your bet: **{stake}** on **{choice.upper()}**\nTime left: **{left}s**\nBalance: **{bal}**",
             ephemeral=True
         )
-# ===== End betting UI =====
 
-class WithdrawWLModal(discord.ui.Modal, title="Withdraw → WL Gifts"):
-    amount_coins = discord.ui.TextInput(
-        label=f"Coins to convert (multiple of {WL_COINS_PER_GIFT})",
-        placeholder=str(WL_COINS_PER_GIFT),
-        required=True,
-        max_length=12
-    )
-    imvu_handle_or_url = discord.ui.TextInput(
-        label="IMVU Username or Profile URL",
-        placeholder="e.g. YaEli   or   https://www.imvu.com/…",
-        required=True,
-        max_length=200
-    )
-    note = discord.ui.TextInput(
-        label="Notes for staff (optional)",
-        required=False,
-        style=discord.TextStyle.paragraph,
-        max_length=200
-    )
-
-    def _extract_username(self, text: str):
-        raw = (text or "").strip()
-        if not raw: return None, None, None
-        if raw.startswith(("http://","https://")):
-            import urllib.parse as _u
-            try:
-                p = _u.urlparse(raw)
-                q = _u.parse_qs(p.query)
-                if "av" in q and q["av"]:
-                    uname = q["av"][0]
-                else:
-                    uname = p.path.strip("/").split("/")[-1] or None
-            except Exception:
-                uname = None
-            profile_url = raw
-        else:
-            uname = raw
-            profile_url = f"https://www.imvu.com/catalog/web_mypage.php?av={uname}"
-        wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?av={uname}" if uname else None
-        return uname, profile_url, wishlist_url
-
-    async def on_submit(self, interaction: discord.Interaction):
-        uid = str(interaction.user.id)
-        ensure_user(uid)
-
-        # parse amount / validate
-        try:
-            coins = int(str(self.amount_coins).strip().replace("_",""))
-        except Exception:
-            return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
-        if coins <= 0 or coins % WL_COINS_PER_GIFT != 0:
-            return await interaction.response.send_message(
-                f"Amount must be a positive multiple of **{WL_COINS_PER_GIFT}**.", ephemeral=True
-            )
-        gifts = coins // WL_COINS_PER_GIFT
-        if gifts < MIN_WL_GIFTS or gifts > MAX_WL_GIFTS:
-            return await interaction.response.send_message(
-                f"Gift count must be between **{MIN_WL_GIFTS}** and **{MAX_WL_GIFTS}**.", ephemeral=True
-            )
-
-        bal = get_balance(uid)
-        if bal < coins:
-            return await interaction.response.send_message(
-                f"Insufficient coins. Need **{coins}**, you have **{bal}**.", ephemeral=True
-            )
-
-        uname, profile_url, wishlist_url = self._extract_username(str(self.imvu_handle_or_url))
-        if not uname:
-            return await interaction.response.send_message("Please enter a valid IMVU username or profile link.", ephemeral=True)
-
-        # create ticket (private to user + staff)
-        cat = await _get_or_create_tickets_category(interaction.guild)
-        if not cat:
-            return await interaction.response.send_message("Could not create a ticket channel. Please ping an admin.", ephemeral=True)
-
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
-        }
-        if TICKETS_STAFF_ROLE_ID:
-            role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
-
-        # store request (pending)
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""INSERT INTO withdraw_requests(discord_id,coins,gifts,imvu_name,imvu_profile,note,status,created_ts,updated_ts)
-                         VALUES(?,?,?,?,?,?,?,?,?)""",
-                      (uid, coins, gifts, uname, wishlist_url or profile_url or "", str(self.note or ""),
-                       "pending", iso(now_local()), iso(now_local())))
-            req_id = c.lastrowid
-
-        ticket = await interaction.guild.create_text_channel(
-            f"wl-withdraw-{interaction.user.name[:16].lower()}-{req_id}",
-            category=cat, overwrites=overwrites, reason="WL withdraw request"
-        )
-
-        # post admin review panel inside ticket
-        embed = discord.Embed(
-            title=f"WL Withdraw Request #{req_id}",
-            description=(f"User: <@{uid}>\n"
-                         f"Coins → WL: **{coins} → {gifts}** (rate {WL_COINS_PER_GIFT}/WL)\n"
-                         f"IMVU: **{uname}**\n"
-                         f"[Profile/Wishlist]({wishlist_url or profile_url})"),
-            color=discord.Color.gold()
-        )
-        if self.note:
-            embed.add_field(name="User note", value=str(self.note)[:200], inline=False)
-        embed.set_footer(text="Staff: review and approve or reject below.")
-
-        view = AdminWithdrawReviewView(req_id)
-        try:
-            msg = await ticket.send(
-                content=(f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"),
-                embed=embed,
-                view=view
-            )
-        except discord.Forbidden:
-            # Grant the bot perms in this ticket and try once more
-            me = interaction.guild.me
-            try:
-                await ticket.set_permissions(
-                    me, view_channel=True, send_messages=True, read_message_history=True, manage_messages=True
-                )
-                msg = await ticket.send(
-                    content=(f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"),
-                    embed=embed, view=view
-                )
-            except Exception as e:
-                await interaction.response.send_message(
-                    f"Bot couldn’t post in the ticket. Ask an admin to grant **Send Messages** here or run `/eh_ticket_fix`. Error: {e}",
-                    ephemeral=True
-                )
-                return
-        
-
-        # save ticket & message
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE withdraw_requests SET ticket_channel_id=?, message_id=?, updated_ts=? WHERE id=?",
-                      (str(ticket.id), str(msg.id), iso(now_local()), req_id))
-
-        await interaction.response.send_message(
-            f"✅ Request submitted. A private ticket was opened: {ticket.mention}", ephemeral=True
-        )
 class AdminApproveWithdrawModal(discord.ui.Modal, title="Approve WL Withdraw"):
     coins = discord.ui.TextInput(
         label="Confirm coins to deduct",
@@ -2366,6 +2246,17 @@ class WithdrawWLModal(discord.ui.Modal, title="Withdraw → WL Gifts"):
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
         }
+        # add staff role if you have one...
+        if TICKETS_STAFF_ROLE_ID:
+            role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+        
+        # ✅ add this line:
+        overwrites[interaction.guild.me] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, embed_links=True, attach_files=True, read_message_history=True, use_application_commands=True
+        )
+
         if TICKETS_STAFF_ROLE_ID:
             role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
             if role:
@@ -2393,7 +2284,8 @@ class WithdrawWLModal(discord.ui.Modal, title="Withdraw → WL Gifts"):
         view = AdminWithdrawReviewView(req_id)
         msg = await ticket.send(
             content=(f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"),
-            embed=embed, view=view
+            embed=embed,
+            view=view
         )
 
         # Save ticket/message refs
