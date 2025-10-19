@@ -352,8 +352,7 @@ def _prize_ticket_key(prize_id: int) -> str:
 # ---------------- Views & Modals ----------------
 class RouletteBetView(discord.ui.View):
     def __init__(self, rid: int, timeout: float | None = None):
-        # pass the timeout through to the base View so callers can supply it
-        super().__init__(timeout=timeout)
+        super().__init__(timeout=timeout)  # <- important
         self.rid = rid
 
 class DisabledClaimView(discord.ui.View):
@@ -1020,7 +1019,7 @@ async def _bump_round_message(channel, rid: str):
     e.add_field(name="Players (latest)", value=("\n".join(lines) if lines else "—"), inline=False)
 
     # send a fresh message with fresh buttons so users can keep betting
-    view = BetView(rid, timeout=remain + 30)
+    view = RouletteBetView(rid, timeout=remain + 30)
     new_msg = await channel.send(embed=e, view=view)
 
     # update DB to the new message id
@@ -1172,7 +1171,9 @@ async def tick_round(channel, rid: int, exp_iso: str):
         open_embed.add_field(name="Players (latest)", value="—", inline=False)
 
         # keep buttons during betting
-        view = BetView(rid, timeout=left + 30)
+        view = RouletteBetView(rid, timeout=left + 30)
+        await _edit_round_message(bot, channel, rid, open_embed, view=view)
+
 
         # ✳️ EDIT the saved message (do not send a new one)
         edit_round_message(bot, channel, rid, result_embed, view=None)
@@ -1335,10 +1336,24 @@ async def eh_balance(interaction: discord.Interaction, member: discord.Member | 
         f"Balance: **{bal} ➜ {new_bal}**",
         ephemeral=True
     )
-# --- compatibility shim: old name -> new view ---
-def BetView(rid: int, timeout: float | None = None):
-    # assumes you have class RouletteBetView(rid, timeout=None)
-    return RouletteBetView(rid, timeout=timeout)
+
+    
+def _result_color(outcome: str) -> discord.Colour:
+    m = {"red": (220, 38, 38), "black": (24, 24, 27), "green": (16, 185, 129)}
+    r, g, b = m.get(str(outcome).lower(), (24, 24, 27))
+    return discord.Colour.from_rgb(r, g, b)
+def build_roulette_result_embed(*, rlabel: str, outcome: str, roll: int,
+                                total_bets: int, total_pool: int,
+                                winners_mentions: list[str], seed_display: str) -> discord.Embed:
+    pill = {"red": "🔴 **RED**", "black": "⬛ **BLACK**", "green": "🟩 **GREEN**"}.get(outcome.lower(), "⬛ **BLACK**")
+    e = discord.Embed(title=f"🎰 EliHaus Roulette — Round {rlabel}",
+                      colour=_result_color(outcome))
+    e.add_field(name="RESULT", value=f"{pill} · **#{roll}**", inline=False)
+    e.add_field(name="Total Bets", value=str(total_bets), inline=True)
+    e.add_field(name="Pool", value=str(total_pool), inline=True)
+    e.add_field(name="Winners (top)", value=("• " + "\n• ".join(winners_mentions)) if winners_mentions else "—", inline=False)
+    e.set_footer(text=f"Seed: {seed_display}")
+    return e
 
 @bot.tree.command(name="eh_openround", description="(Admin) Open a roulette round")
 @app_commands.default_permissions(manage_guild=True)
