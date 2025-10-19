@@ -1532,85 +1532,76 @@ async def eh_table(interaction: discord.Interaction):
 async def eh_resolve(interaction: discord.Interaction):
     if not user_is_admin(interaction.user):
         return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-        
+
     o = get_open_or_last_round(interaction.channel.id)
     if not o:
         return await interaction.response.send_message("No round found to resolve in this channel.", ephemeral=True)
+
     rid, _exp = o
 
-    # roll an outcome with a reproducible seed
+    # ----- roll an outcome with a reproducible seed -----
     seed = f"ROUL-{rid}-{int(now_local().timestamp())}-{random.randint(1, 1_000_000)}"
     random.seed(seed)
-    roll = random.randint(0, 36)  # 0 = green
-    red_nums = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+    roll = random.randint(0, 36)       # 0 = green
+
+    # ----- determine colour outcome & multipliers -----
     if roll == 0:
         outcome = "green"
-        multiplier = PAYOUT_GREEN
+        colour_mult = PAYOUT_GREEN          # keep your configured green payout
     else:
-        outcome = "red" if roll in red_nums else "black"
-        multiplier = PAYOUT_RED_BLACK
+        outcome = "red" if roll in RED_NUMBERS else "black"
+        colour_mult = PAYOUT_RED_BLACK      # keep your configured red/black payout
 
-    # settle
     total_pool = 0
     winners = []
-    rows = []
+
     with db() as conn:
         c = conn.cursor()
+
+        # gather all bets for this round
         c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,))
         rows = c.fetchall()
+
         for uid, ch, stake in rows:
             total_pool += stake
+
+        # settle each bet
         for uid, ch, stake in rows:
+            win = 0
+
+            # even-money colour bets
             if ch == outcome:
-                win = int(stake * multiplier)
+                win = int(stake * colour_mult)
+            else:
+                # straight number bet? (stored as '0'..'36')
+                try:
+                    if int(ch) == roll:
+                        win = int(stake * PAYOUT_NUMBER)  # 36x return (35:1 style)
+                except ValueError:
+                    # 'ch' wasn't an int (i.e., it was 'red'/'black'/'green'), ignore here
+                    pass
+
+            if win > 0:
                 c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (win, uid))
-                c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                          (uid, "payout", win, f"roulette:{rid}|{outcome}", iso(now_local())))
+                c.execute(
+                    "INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                    (uid, "payout", win, f"roulette:{rid}|{outcome}|{roll}", iso(now_local()))
+                )
                 winners.append((uid, win))
-        c.execute("UPDATE rounds SET status='RESOLVED', outcome=?, seed=?, resolved_at=? WHERE rid=?",
-                  (outcome, seed, iso(now_local()), rid))
-    set_state(round_key(interaction.channel.id), None)
 
-    # update the original embed (remove buttons)
-    msg_id = None
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT message_id FROM rounds WHERE rid=?", (rid,))
-        r = c.fetchone()
-        if r and r[0]:
-            msg_id = int(r[0])
+        # mark round resolved with colour + rolled number
+        c.execute(
+            "UPDATE rounds SET status='RESOLVED', outcome=?, seed=?, resolved_at=? WHERE rid=?",
+            (f"{outcome}:{roll}", seed, iso(now_local()), rid)
+        )
 
-    rlabel = ClaimView.get_round_label(rid)
-    seed_display = ClaimView.short_seed(seed, 8)
-    top_mentions = []
-    for uid, _win in sorted(winners, key=lambda x: x[1], reverse=True)[:5]:
-        m = interaction.guild.get_member(int(uid))
-        top_mentions.append(m.mention if m else f"<@{uid}>")
-
-    # --- Casino-style result embed ---
-    result_embed = build_roulette_result_embed(
-        rlabel=rlabel,
-        outcome=outcome,
-        total_bets=len(rows),
-        total_pool=total_pool,
-        winners_mentions=top_mentions,
-        seed_display=seed_display,
+    # ----- announce result -----
+    win_count = len(winners)
+    await interaction.response.send_message(
+        f"🎡 **Round `{rid}` resolved** → rolled **{roll}** ({outcome.upper()})\n"
+        f"Pool: **{total_pool}** • Winners: **{win_count}**",
+        ephemeral=True
     )
-    
-    if msg_id:
-        try:
-            msg = await interaction.channel.fetch_message(msg_id)
-            e = msg.embeds[0] if msg.embeds else discord.Embed(color=_result_color(outcome))
-            e.title = f"🎯 Roulette — Round {rlabel}"
-            e.description = f"**RESULT:** {outcome.upper()}"
-            e.set_footer(text=f"Seed: {seed_display}")
-            await msg.edit(embed=e, view=None)
-        except Exception:
-            pass
-    
-    await interaction.channel.send(embed=result_embed)
-    await interaction.response.send_message("Round resolved.", ephemeral=True)
-
 
 @bot.tree.command(name="eh_cancelround", description="(Admin) Cancel the current roulette round and refund")
 @app_commands.default_permissions(manage_guild=True)
