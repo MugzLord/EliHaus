@@ -594,124 +594,116 @@ def _insert_bet(rid: str, channel_id: int, uid: str, choice: str, stake: int):
         c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
                   (rid, str(channel_id), uid, choice, stake, iso(now_local())))
 
-# --- Bet modals (fixed: use interaction.response, not itx.followup) ---
+# ===== Roulette bet limits =====
+ROUL_MIN_BET = int(os.getenv("ROUL_MIN_BET", "100"))
+ROUL_MAX_BET = int(os.getenv("ROUL_MAX_BET", "10000"))
+
+# ===== Bet modals (use ROUL_MIN_BET / ROUL_MAX_BET) =====
 
 class RedBetModal(discord.ui.Modal, title="Bet: RED"):
     stake = discord.ui.TextInput(
-        label="Stake (coins)",
-        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
-        required=True, max_length=10
+        label="Stake (coins)", placeholder="enter amount", required=True, max_length=10
     )
     def __init__(self, rid: int):
         super().__init__(timeout=180)
         self.rid = rid
+        self.stake.placeholder = f"Min {ROUL_MIN_BET}, Max {ROUL_MAX_BET}"
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             amt = int(str(self.stake).strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
-        if amt < MIN_BET or amt > MAX_BET:
-            return await interaction.response.send_message(f"Stake must be between {MIN_BET} and {MAX_BET}.", ephemeral=True)
-
+        if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
+            return await interaction.response.send_message(
+                f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
+            )
         uid = str(interaction.user.id)
         bal = get_balance(uid)
         if bal < amt:
-            return await interaction.response.send_message(f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True)
-
-        # record bet
+            return await interaction.response.send_message(
+                f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
+            )
         with db() as conn:
             c = conn.cursor()
             c.execute("REPLACE INTO bets(rid, discord_id, choice, stake) VALUES(?, ?, ?, ?)",
                       (self.rid, uid, "RED", amt))
-
         return await interaction.response.send_message(
             f"🎯 Bet placed: **RED** — **{amt}** coins.", ephemeral=True
         )
 
 
 class BlackBetModal(discord.ui.Modal, title="Bet: BLACK"):
-    stake = discord.ui.TextInput(
-        label="Stake (coins)",
-        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
-        required=True, max_length=10
-    )
+    stake = discord.ui.TextInput(label="Stake (coins)", placeholder="enter amount", required=True, max_length=10)
     def __init__(self, rid: int):
         super().__init__(timeout=180)
         self.rid = rid
+        self.stake.placeholder = f"Min {ROUL_MIN_BET}, Max {ROUL_MAX_BET}"
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             amt = int(str(self.stake).strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
-        if amt < MIN_BET or amt > MAX_BET:
-            return await interaction.response.send_message(f"Stake must be between {MIN_BET} and {MAX_BET}.", ephemeral=True)
-
+        if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
+            return await interaction.response.send_message(
+                f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
+            )
         uid = str(interaction.user.id)
         bal = get_balance(uid)
         if bal < amt:
-            return await interaction.response.send_message(f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True)
-
+            return await interaction.response.send_message(
+                f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
+            )
         with db() as conn:
             c = conn.cursor()
             c.execute("REPLACE INTO bets(rid, discord_id, choice, stake) VALUES(?, ?, ?, ?)",
                       (self.rid, uid, "BLACK", amt))
-
         return await interaction.response.send_message(
             f"⬛ Bet placed: **BLACK** — **{amt}** coins.", ephemeral=True
         )
 
 
 class GreenBetModal(discord.ui.Modal, title="Bet: GREEN"):
-    stake = discord.ui.TextInput(
-        label="Stake (coins)",
-        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
-        required=True, max_length=10
-    )
+    stake = discord.ui.TextInput(label="Stake (coins)", placeholder="enter amount", required=True, max_length=10)
     def __init__(self, rid: int):
         super().__init__(timeout=180)
         self.rid = rid
+        self.stake.placeholder = f"Min {ROUL_MIN_BET}, Max {ROUL_MAX_BET}"
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             amt = int(str(self.stake).strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
-        if amt < MIN_BET or amt > MAX_BET:
-            return await interaction.response.send_message(f"Stake must be between {MIN_BET} and {MAX_BET}.", ephemeral=True)
-
+        if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
+            return await interaction.response.send_message(
+                f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
+            )
         uid = str(interaction.user.id)
         bal = get_balance(uid)
         if bal < amt:
-            return await interaction.response.send_message(f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True)
-
+            return await interaction.response.send_message(
+                f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
+            )
         with db() as conn:
             c = conn.cursor()
             c.execute("REPLACE INTO bets(rid, discord_id, choice, stake) VALUES(?, ?, ?, ?)",
                       (self.rid, uid, "GREEN", amt))
-
         return await interaction.response.send_message(
             f"🟩 Bet placed: **GREEN** — **{amt}** coins.", ephemeral=True
         )
 
 
 class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
-    number = discord.ui.TextInput(
-        label="Number (0–36)", placeholder="e.g., 17",
-        required=True, max_length=2
-    )
-    stake = discord.ui.TextInput(
-        label="Stake (coins)",
-        placeholder=f"Min {MIN_BET}, Max {MAX_BET}",
-        required=True, max_length=10
-    )
+    number = discord.ui.TextInput(label="Number (0–36)", placeholder="e.g., 17", required=True, max_length=2)
+    stake  = discord.ui.TextInput(label="Stake (coins)", placeholder="enter amount", required=True, max_length=10)
     def __init__(self, rid: int):
         super().__init__(timeout=180)
         self.rid = rid
+        self.stake.placeholder = f"Min {ROUL_MIN_BET}, Max {ROUL_MAX_BET}"
 
     async def on_submit(self, interaction: discord.Interaction):
-        # parse inputs
         try:
             n = int(str(self.number).strip())
             amt = int(str(self.stake).strip())
@@ -719,19 +711,20 @@ class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
             return await interaction.response.send_message("Enter valid number and stake.", ephemeral=True)
         if not (0 <= n <= 36):
             return await interaction.response.send_message("Number must be between 0 and 36.", ephemeral=True)
-        if amt < MIN_BET or amt > MAX_BET:
-            return await interaction.response.send_message(f"Stake must be between {MIN_BET} and {MAX_BET}.", ephemeral=True)
-
+        if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
+            return await interaction.response.send_message(
+                f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
+            )
         uid = str(interaction.user.id)
         bal = get_balance(uid)
         if bal < amt:
-            return await interaction.response.send_message(f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True)
-
+            return await interaction.response.send_message(
+                f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
+            )
         with db() as conn:
             c = conn.cursor()
             c.execute("REPLACE INTO bets(rid, discord_id, choice, stake) VALUES(?, ?, ?, ?)",
                       (self.rid, uid, f"NUM:{n}", amt))
-
         return await interaction.response.send_message(
             f"🎲 Bet placed: **#{n}** — **{amt}** coins.", ephemeral=True
         )
