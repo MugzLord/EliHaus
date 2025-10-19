@@ -28,7 +28,7 @@ except Exception:
 WL_COINS_PER_GIFT = int(os.getenv("WL_COINS_PER_GIFT", "5000"))  # default 10k coins = 1 WL
 MIN_WL_GIFTS = int(os.getenv("MIN_WL_GIFTS", "1"))
 MAX_WL_GIFTS = int(os.getenv("MAX_WL_GIFTS", "40"))
-
+ROULETTE_STATE = {"resolved": False}
 
 STICKY_AFTER_MSGS = 15  # bump after this many chat messages
 STICKY_COUNT: dict[int, int] = {}  # channel_id -> counter since last bump
@@ -1429,15 +1429,7 @@ async def tick_round(channel, rid: int, exp_iso: str):
 
     # 2) render the numbered chip and SEND a new result message
     badge = render_chip_badge(str(result_color).upper(), int(result_number))  # uses assets/chip_*.png
-    if badge:
-        fname = f"chip_{str(result_color).lower()}_{int(result_number)}.png"
-        file = discord.File(badge, filename=fname)
-        result_embed.set_thumbnail(url=f"attachment://{fname}")
-        await channel.send(embed=result_embed, file=file)
-    else:
-        # fallback if Pillow/assets missing
-        await channel.send(embed=result_embed)
-
+    
     # ------------------------------------------------------------
     # remove buttons and show result (close panel, then send result)
     # ------------------------------------------------------------
@@ -1458,7 +1450,7 @@ async def tick_round(channel, rid: int, exp_iso: str):
         if badge:
             fname = f"chip_{str(result_color).lower()}_{int(result_number)}.png"
             file = discord.File(badge, filename=fname)
-            result_embed.set_thumbnail(url=f"attachment://{fname}")
+            result_embed.set_image(url=f"attachment://{fname}")
             await channel.send(embed=result_embed, file=file)
         else:
             # fallback if Pillow/assets missing
