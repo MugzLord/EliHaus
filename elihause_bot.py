@@ -1335,6 +1335,10 @@ async def eh_balance(interaction: discord.Interaction, member: discord.Member | 
         f"Balance: **{bal} ➜ {new_bal}**",
         ephemeral=True
     )
+# --- compatibility shim: old name -> new view ---
+def BetView(rid: int, timeout: float | None = None):
+    # assumes you have class RouletteBetView(rid, timeout=None)
+    return RouletteBetView(rid, timeout=timeout)
 
 @bot.tree.command(name="eh_openround", description="(Admin) Open a roulette round")
 @app_commands.default_permissions(manage_guild=True)
@@ -1367,7 +1371,7 @@ async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SE
         embed.add_field(name="Time", value=f"{seconds}s left", inline=True)
         embed.add_field(name="Bets", value="0", inline=True)
 
-        view = BetView(rid, timeout=seconds + 30)
+        view = RouletteBetView(rid, timeout=seconds + 30)
 
         # send the panel and save message_id
         msg = await interaction.channel.send(embed=embed, view=view)
