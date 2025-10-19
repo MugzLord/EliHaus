@@ -1877,6 +1877,11 @@ def _slots_msg_key(channel_id: int) -> str:
     return f"slots:msg:{channel_id}"
 
 # ---- Pot helpers ----
+     
+def edit_round_message(bot, channel, rid: int, embed, view=None):
+    """Safe from non-async code: schedules the edit on the loop."""
+    return asyncio.create_task(_edit_round_message(bot, channel, rid, embed, view))
+
 def get_slots_pot(channel_id: int) -> int:
     val = get_state(_slots_pot_key(channel_id))
     if val is None:
@@ -1927,8 +1932,7 @@ def generate_roulette_badge(color: str, number: int) -> BytesIO:
         text=f"ROUL-{rid} • {(now_local().strftime('%b %d, %H:%M') if 'now_local' in globals() else datetime.now().strftime('%b %d, %H:%M'))}"
     )
     
-    await _edit_round_message(bot, channel, rid, result_embed, view=None)
-
+    edit_round_message(bot, channel, rid, result_embed, view=None)
 
 # ---- UI: Modal + View ----
 class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
