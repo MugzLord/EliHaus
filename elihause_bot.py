@@ -1269,11 +1269,7 @@ async def tick_round(channel, rid: int, exp_iso: str):
         except Exception:
             result_color, result_number = ("BLACK", 17)         # last resort
 
-    # colour + pill for RESULT line
-    color_map = {"RED": (220, 38, 38), "BLACK": (24, 24, 27), "GREEN": (16, 185, 129)}
-    pill_text = {"RED": "🔴 **RED**", "BLACK": "⬛ **BLACK**", "GREEN": "🟩 **GREEN**"}
-    rgb = color_map.get(str(result_color).
-
+    
 # ---- Player: join/daily/weekly/balance ----
 @bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
 async def eh_join(interaction: discord.Interaction):
@@ -1900,30 +1896,38 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 
 def generate_roulette_badge(color: str, number: int) -> BytesIO:
-    # color can be "RED", "BLACK", or "GREEN"
+    
+    # --- RESULT (color + pill) ---
     color_map = {
-        "RED": (220, 38, 38),
+        "RED":   (220, 38, 38),
         "BLACK": (24, 24, 27),
-        "GREEN": (16, 185, 129)
+        "GREEN": (16, 185, 129),
     }
-    bg = color_map.get(color.upper(), (24, 24, 27))
-    size = (140, 140)
-    img = Image.new("RGBA", size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    # rounded circle
-    draw.ellipse([0, 0, size[0], size[1]], fill=bg)
-
-    # number text
-    font = ImageFont.truetype("arial.ttf", 70)  # or DejaVuSans.ttf if hosted on Linux
-    text = str(number)
-    w, h = draw.textsize(text, font=font)
-    draw.text(((size[0]-w)/2, (size[1]-h)/2-5), text, fill=(255,255,255), font=font)
-
-    buf = BytesIO()
-    img.save(buf, "PNG")
-    buf.seek(0)
-    return buf
+    pill_text = {
+        "RED":   "🔴 **RED**",
+        "BLACK": "⬛ **BLACK**",
+        "GREEN": "🟩 **GREEN**",
+    }
+    
+    color_key = str(result_color).upper()
+    rgb = color_map.get(color_key, (24, 24, 27))      # (R, G, B)
+    pill = pill_text.get(color_key, "⬛ **BLACK**")    # text pill
+    
+    bets_count, pool_sum = _round_stats(rid)
+    
+    result_embed = discord.Embed(
+        title=f"🎰 EliHaus Roulette — Round #{rid}",
+        colour=discord.Colour.from_rgb(rgb[0], rgb[1], rgb[2]),
+    )
+    result_embed.add_field(name="RESULT", value=f"{pill} · **#{int(result_number)}**", inline=False)
+    result_embed.add_field(name="Total Bets", value=str(bets_count), inline=True)
+    result_embed.add_field(name="Pool", value=str(pool_sum), inline=True)
+    result_embed.add_field(name="Winners (top)", value="—", inline=False)
+    result_embed.set_footer(
+        text=f"ROUL-{rid} • {(now_local().strftime('%b %d, %H:%M') if 'now_local' in globals() else datetime.now().strftime('%b %d, %H:%M'))}"
+    )
+    
+    await _edit_round_message(bot, channel, rid, result_embed, view=None)
 
 
 # ---- UI: Modal + View ----
