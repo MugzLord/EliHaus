@@ -1818,11 +1818,7 @@ def set_slots_pot(channel_id: int, pot: int):
     # Pot can never fall below the configured seed
     set_state(_slots_pot_key(channel_id), str(max(pot, SLOTS_SEED)))
 
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
 
-def generate_roulette_badge(color: str, number: int) -> BytesIO:
-    
     # --- RESULT (color + pill) ---
     color_map = {
         "RED":   (220, 38, 38),
