@@ -1438,24 +1438,44 @@ async def tick_round(channel, rid: int, exp_iso: str):
         # fallback if Pillow/assets missing
         await channel.send(embed=result_embed)
 
-    # 1) close the original betting panel (remove buttons)
-    await _edit_round_message(
-        bot, channel, rid,
-        discord.Embed(
-            title=f"🎰 Roulette — Round {ClaimView.get_round_label(rid)}",
-            description="Round closed.",
-            colour=discord.Colour.dark_grey()
-        ),
-        view=None
-    )
-
+    # ------------------------------------------------------------
+    # remove buttons and show result (close panel, then send result)
+    # ------------------------------------------------------------
+    try:
+        # 1) close the original betting panel (remove buttons)
+        await _edit_round_message(
+            bot, channel, rid,
+            discord.Embed(
+                title=f"🎰 Roulette — Round {ClaimView.get_round_label(rid)}",
+                description="Round closed.",
+                colour=discord.Colour.dark_grey()
+            ),
+            view=None
+        )
+    
+        # 2) render the numbered chip and SEND a new result message
+        badge = render_chip_badge(str(result_color).upper(), int(result_number))  # uses assets/chip_*.png
+        if badge:
+            fname = f"chip_{str(result_color).lower()}_{int(result_number)}.png"
+            file = discord.File(badge, filename=fname)
+            result_embed.set_thumbnail(url=f"attachment://{fname}")
+            await channel.send(embed=result_embed, file=file)
+        else:
+            # fallback if Pillow/assets missing
+            await channel.send(embed=result_embed)
+    
     except Exception:
-        # even if resolve fails, make sure buttons are gone
+        # even if something above fails, make sure buttons are gone
         try:
-            await _edit_round_message(bot, channel, rid,
-                                      discord.Embed(title=f"🎰 EliHaus Roulette — Round {ClaimView.get_round_label(rid)}",
-                                                    description="Round closed.", colour=discord.Colour.dark_grey()),
-                                      view=None)
+            await _edit_round_message(
+                bot, channel, rid,
+                discord.Embed(
+                    title=f"🎰 EliHaus Roulette — Round {ClaimView.get_round_label(rid)}",
+                    description="Round closed.",
+                    colour=discord.Colour.dark_grey()
+                ),
+                view=None
+            )
         except Exception:
             pass
 
