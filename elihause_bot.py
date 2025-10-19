@@ -9,6 +9,13 @@ from discord import app_commands
 from zoneinfo import ZoneInfo  # proper DST (e.g., Europe/London)
 import io, time
 
+# Payout for straight-up number bets (stake returned+win; 35:1 => 36x total back)
+PAYOUT_NUMBER = 36.0
+
+# Red/Black number sets (European wheel)
+RED_NUMBERS   = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+BLACK_NUMBERS = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
+
 
 # ---------------- Config ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -493,167 +500,238 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
         await interaction.response.send_message(f"✅ Ticket created: {ticket.mention}", ephemeral=True)
 
 # --- Bet Modal for the buttons ---
-class BetModal(discord.ui.Modal, title="Place your bet"):
-    amount = discord.ui.TextInput(
-        label="Amount (coins)",
-        placeholder="e.g. 2500",
-        required=True,
-        max_length=12
-    )
+# --- Helpers shared by the modals ---
+async def _round_open_and_timeleft(rid: str) -> int:
+    """Return seconds left if round OPEN else 0."""
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT status, expires_at FROM rounds WHERE rid=?", (rid,))
+        row = c.fetchone()
+    if not row or row[0] != "OPEN":
+        return 0
+    try:
+        exp_dt = datetime.fromisoformat(row[1])
+    except Exception:
+        exp_dt = now_local()
+    left = max(0, int((exp_dt - now_local()).total_seconds()))
+    return left
 
-    def __init__(self, rid: str, color: str):
-        super().__init__()
-        self.rid = rid
-        self.color = color
+def _has_existing_bet(rid: str, uid: str) -> tuple[bool, tuple[str,int] | None]:
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (rid, uid))
+        r = c.fetchone()
+    return (r is not None, (r[0], r[1]) if r else None)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        # Parse amount
-        try:
-            amt = int(str(self.amount).strip().replace("_", ""))
-        except Exception:
-            return await interaction.response.send_message("Enter a valid number.", ephemeral=True)
+def _deduct(uid: str, amount: int):
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (amount, uid))
+        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                  (uid, "bet", -amount, "roulette", iso(now_local())))
 
+def _insert_bet(rid: str, channel_id: int, uid: str, choice: str, stake: int):
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
+                  (rid, str(channel_id), uid, choice, stake, iso(now_local())))
+
+# ---------- RED (colour-only or CSV of red numbers) ----------
+class RedBetModal(discord.ui.Modal, title="Bet on RED"):
+    amount  = discord.ui.TextInput(label="Amount (coins)", placeholder="e.g. 2500", required=True)
+    numbers = discord.ui.TextInput(label="Red numbers (optional, CSV)",
+                                   placeholder="e.g. 1,3,5 — leave blank for colour only",
+                                   required=False)
+    def __init__(self, rid: str): super().__init__(); self.rid = rid
+    async def on_submit(self, itx: discord.Interaction):
+        left = await _round_open_and_timeleft(self.rid)
+        if left <= 0: return await itx.response.send_message("Betting window is closed.", ephemeral=True)
+
+        uid = str(itx.user.id)
+        if ONE_BET_PER_ROUND:
+            has, prev = _has_existing_bet(self.rid, uid)
+            if has:
+                bal_now = get_balance(uid)
+                ch, st = prev
+                return await itx.response.send_message(
+                    f"⚠️ You’ve already placed a bet this round.\nYour bet: **{st}** on **{ch.upper()}**\nBalance: **{bal_now}**",
+                    ephemeral=True
+                )
+
+        try: amt = int(str(self.amount).strip().replace("_",""))
+        except Exception: return await itx.response.send_message("Enter a valid number.", ephemeral=True)
         if amt <= 0 or amt > MAX_STAKE:
-            return await interaction.response.send_message(
-                f"Stake must be between 1 and {MAX_STAKE}.", ephemeral=True
-            )
+            return await itx.response.send_message(f"Stake must be between 1 and {MAX_STAKE}.", ephemeral=True)
 
-        # Validate round still open
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT status, expires_at FROM rounds WHERE rid=?", (self.rid,))
-            row = c.fetchone()
-        if not row or row[0] != "OPEN":
-            return await interaction.response.send_message("Betting window is closed.", ephemeral=True)
+        raw = str(self.numbers).strip()
+        if not raw:
+            # colour-only
+            bal = get_balance(uid)
+            if bal < amt: return await itx.response.send_message(f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True)
+            _deduct(uid, amt)
+            _insert_bet(self.rid, itx.channel.id, uid, "red", amt)
+            return await itx.response.send_message(f"✅ Bet placed — **{amt}** on **RED**", ephemeral=True)
 
-        try:
-            exp_dt = datetime.fromisoformat(row[1])
-        except Exception:
-            exp_dt = now_local()
-        if now_local() > exp_dt:
-            return await interaction.response.send_message("Betting window is closed.", ephemeral=True)
+        # CSV numbers (split equally)
+        try: picks = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except Exception: return await itx.response.send_message("Numbers must be comma-separated integers.", ephemeral=True)
+        if not picks: return await itx.response.send_message("No valid numbers found.", ephemeral=True)
+        bad = [n for n in picks if n not in RED_NUMBERS]
+        if bad: return await itx.response.send_message(f"Only red numbers allowed. Not red: {', '.join(map(str,bad))}.", ephemeral=True)
 
-        uid = str(interaction.user.id)
-
-        # If one bet per round, show their existing bet
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1""",
-                      (self.rid, uid))
-            existing = c.fetchone()
-        if ONE_BET_PER_ROUND and existing:
-            bal_now = get_balance(uid)
-            return await interaction.response.send_message(
-                f"⚠️ You’ve already placed a bet this round.\n"
-                f"Your bet: **{existing[1]}** on **{existing[0].upper()}**\n"
-                f"Balance: **{bal_now}**",
-                ephemeral=True
-            )
-
-        # Balance check
-        bal_before = get_balance(uid)
-        if bal_before < amt:
-            return await interaction.response.send_message(
-                f"Insufficient coins. Need **{amt}**, you have **{bal_before}**.",
-                ephemeral=True
-            )
-
-        # Record bet + deduct
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (amt, uid))
-            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                      (uid, "bet", -amt, f"roulette:{self.rid}|{self.color}", iso(now_local())))
-            c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
-                      (self.rid, str(interaction.channel.id), uid, self.color, amt, iso(now_local())))
-
-        bal_after = bal_before - amt
-
-        # Refresh public round embed: pool/bets/time + latest players
-        try:
-            with db() as conn:
-                c = conn.cursor()
-                c.execute("SELECT message_id, expires_at FROM rounds WHERE rid=?", (self.rid,))
-                r = c.fetchone()
-                if not r or not r[0]:
-                    raise RuntimeError("no message_id for round")
-                msg_id, exp_iso = r[0], r[1]
-
-                c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (self.rid,))
-                cnt, pool = c.fetchone()
-
-                c.execute("""SELECT discord_id, choice, stake
-                             FROM bets WHERE rid=?
-                             ORDER BY ts DESC LIMIT 10""", (self.rid,))
-                last_rows = c.fetchall()
-
-            try:
-                exp_dt2 = datetime.fromisoformat(exp_iso)
-            except Exception:
-                exp_dt2 = now_local()
-            left = max(0, int((exp_dt2 - now_local()).total_seconds()))
-
-            msg = await interaction.channel.fetch_message(int(msg_id))
-            if msg.embeds:
-                e = msg.embeds[0]
-                e.clear_fields()
-                e.add_field(name="Pool", value=str(pool), inline=True)
-                e.add_field(name="Time", value=f"{left}s left", inline=True)
-                e.add_field(name="Bets", value=str(cnt), inline=True)
-
-                # Players (latest)
-                lines = []
-                for uid2, ch, st in last_rows:
-                    m = interaction.guild.get_member(int(uid2))
-                    name = m.mention if m else f"<@{uid2}>"
-                    lines.append(f"{name} · {st} on {ch.upper()}")
-                e.add_field(name="Players (latest)", value=("\n".join(lines) if lines else "—"), inline=False)
-
-                await msg.edit(embed=e)
-        except Exception:
-            pass
-
-        # Ephemeral confirmation for the player
-        await interaction.response.send_message(
-            f"✅ Bet placed — **{amt}** on **{self.color.upper()}**\n"
-            f"Balance: **{bal_before} ➜ {bal_after}**",
-            ephemeral=True
+        per = max(1, amt // len(picks)); total = per * len(picks)
+        bal = get_balance(uid)
+        if bal < total: return await itx.response.send_message(f"Insufficient coins. Need **{total}**, you have **{bal}**.", ephemeral=True)
+        _deduct(uid, total)
+        for n in picks:
+            _insert_bet(self.rid, itx.channel.id, uid, str(n), per)
+        return await itx.response.send_message(
+            f"✅ Bet placed — {', '.join('#'+str(n) for n in picks)} at **{per}** each", ephemeral=True
         )
 
+# ---------- BLACK ----------
+class BlackBetModal(discord.ui.Modal, title="Bet on BLACK"):
+    amount  = discord.ui.TextInput(label="Amount (coins)", placeholder="e.g. 2500", required=True)
+    numbers = discord.ui.TextInput(label="Black numbers (optional, CSV)",
+                                   placeholder="e.g. 2,4,6 — leave blank for colour only",
+                                   required=False)
+    def __init__(self, rid: str): super().__init__(); self.rid = rid
+    async def on_submit(self, itx: discord.Interaction):
+        left = await _round_open_and_timeleft(self.rid)
+        if left <= 0: return await itx.response.send_message("Betting window is closed.", ephemeral=True)
+        uid = str(itx.user.id)
+        if ONE_BET_PER_ROUND:
+            has, prev = _has_existing_bet(self.rid, uid)
+            if has:
+                bal_now = get_balance(uid)
+                ch, st = prev
+                return await itx.response.send_message(
+                    f"⚠️ You’ve already placed a bet this round.\nYour bet: **{st}** on **{ch.upper()}**\nBalance: **{bal_now}**",
+                    ephemeral=True
+                )
+        try: amt = int(str(self.amount).strip().replace("_",""))
+        except Exception: return await itx.response.send_message("Enter a valid number.", ephemeral=True)
+        if amt <= 0 or amt > MAX_STAKE:
+            return await itx.response.send_message(f"Stake must be between 1 and {MAX_STAKE}.", ephemeral=True)
+
+        raw = str(self.numbers).strip()
+        if not raw:
+            bal = get_balance(uid)
+            if bal < amt: return await itx.response.send_message(f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True)
+            _deduct(uid, amt)
+            _insert_bet(self.rid, itx.channel.id, uid, "black", amt)
+            return await itx.response.send_message(f"✅ Bet placed — **{amt}** on **BLACK**", ephemeral=True)
+
+        try: picks = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except Exception: return await itx.response.send_message("Numbers must be comma-separated integers.", ephemeral=True)
+        if not picks: return await itx.response.send_message("No valid numbers found.", ephemeral=True)
+        bad = [n for n in picks if n not in BLACK_NUMBERS]
+        if bad: return await itx.response.send_message(f"Only black numbers allowed. Not black: {', '.join(map(str,bad))}.", ephemeral=True)
+
+        per = max(1, amt // len(picks)); total = per * len(picks)
+        bal = get_balance(uid)
+        if bal < total: return await itx.response.send_message(f"Insufficient coins. Need **{total}**, you have **{bal}**.", ephemeral=True)
+        _deduct(uid, total)
+        for n in picks:
+            _insert_bet(self.rid, itx.channel.id, uid, str(n), per)
+        return await itx.response.send_message(
+            f"✅ Bet placed — {', '.join('#'+str(n) for n in picks)} at **{per}** each", ephemeral=True
+        )
+
+# ---------- GREEN (0 as number) ----------
+class GreenBetModal(discord.ui.Modal, title="Bet on 0 (GREEN)"):
+    amount = discord.ui.TextInput(label="Amount (coins)", placeholder="e.g. 2500", required=True)
+    def __init__(self, rid: str): super().__init__(); self.rid = rid
+    async def on_submit(self, itx: discord.Interaction):
+        left = await _round_open_and_timeleft(self.rid)
+        if left <= 0: return await itx.response.send_message("Betting window is closed.", ephemeral=True)
+        uid = str(itx.user.id)
+        if ONE_BET_PER_ROUND:
+            has, prev = _has_existing_bet(self.rid, uid)
+            if has:
+                bal_now = get_balance(uid)
+                ch, st = prev
+                return await itx.response.send_message(
+                    f"⚠️ You’ve already placed a bet this round.\nYour bet: **{st}** on **{ch.upper()}**\nBalance: **{bal_now}**",
+                    ephemeral=True
+                )
+        try: amt = int(str(self.amount).strip().replace("_",""))
+        except Exception: return await itx.response.send_message("Enter a valid number.", ephemeral=True)
+        if amt <= 0 or amt > MAX_STAKE:
+            return await itx.response.send_message(f"Stake must be between 1 and {MAX_STAKE}.", ephemeral=True)
+
+        bal = get_balance(uid)
+        if bal < amt: return await itx.response.send_message(f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True)
+        _deduct(uid, amt)
+        _insert_bet(self.rid, itx.channel.id, uid, "0", amt)  # store as number
+        return await itx.response.send_message(f"✅ Bet placed — **{amt}** on **#0**", ephemeral=True)
+
+# ---------- Single-number modal ----------
+class NumberBetModal(discord.ui.Modal, title="Bet on a Number"):
+    amount = discord.ui.TextInput(label="Amount (coins)", placeholder="e.g. 2500", required=True)
+    number = discord.ui.TextInput(label="Number (0–36)", placeholder="e.g. 17", required=True)
+    def __init__(self, rid: str): super().__init__(); self.rid = rid
+    async def on_submit(self, itx: discord.Interaction):
+        left = await _round_open_and_timeleft(self.rid)
+        if left <= 0: return await itx.response.send_message("Betting window is closed.", ephemeral=True)
+        uid = str(itx.user.id)
+        if ONE_BET_PER_ROUND:
+            has, prev = _has_existing_bet(self.rid, uid)
+            if has:
+                bal_now = get_balance(uid)
+                ch, st = prev
+                return await itx.response.send_message(
+                    f"⚠️ You’ve already placed a bet this round.\nYour bet: **{st}** on **{ch.upper()}**\nBalance: **{bal_now}**",
+                    ephemeral=True
+                )
+        try:
+            amt = int(str(self.amount).strip().replace("_",""))
+            n = int(str(self.number).strip())
+        except Exception:
+            return await itx.response.send_message("Enter whole numbers only.", ephemeral=True)
+        if amt <= 0 or amt > MAX_STAKE:
+            return await itx.response.send_message(f"Stake must be between 1 and {MAX_STAKE}.", ephemeral=True)
+        if not (0 <= n <= 36):
+            return await itx.response.send_message("Number must be 0–36.", ephemeral=True)
+        bal = get_balance(uid)
+        if bal < amt: return await itx.response.send_message(f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True)
+        _deduct(uid, amt)
+        _insert_bet(self.rid, itx.channel.id, uid, str(n), amt)
+        return await itx.response.send_message(f"✅ Bet placed — **{amt}** on **#{n}**", ephemeral=True)
+
+# ---------- Buttons / View ----------
 class BetView(discord.ui.View):
     def __init__(self, rid: str, timeout: int | None = None):
         super().__init__(timeout=timeout or 120)
         self.rid = rid
 
     @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger, emoji="🟥")
-    async def bet_red(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BetModal(self.rid, color="red"))
+    async def bet_red(self, itx: discord.Interaction, _: discord.ui.Button):
+        await itx.response.send_modal(RedBetModal(self.rid))
 
     @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="⬛")
-    async def bet_black(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BetModal(self.rid, color="black"))
+    async def bet_black(self, itx: discord.Interaction, _: discord.ui.Button):
+        await itx.response.send_modal(BlackBetModal(self.rid))
 
     @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🟩")
-    async def bet_green(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BetModal(self.rid, color="green"))
+    async def bet_green(self, itx: discord.Interaction, _: discord.ui.Button):
+        await itx.response.send_modal(GreenBetModal(self.rid))
 
-    # NEW: quick check button (ephemeral, no slash command needed)
+    @discord.ui.button(label="Bet NUMBER", style=discord.ButtonStyle.secondary, emoji="🎯")
+    async def bet_number(self, itx: discord.Interaction, _: discord.ui.Button):
+        await itx.response.send_modal(NumberBetModal(self.rid))
+
     @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="❔")
-    async def my_bet(self, interaction: discord.Interaction, button: discord.ui.Button):
-        uid = str(interaction.user.id)
-        # Look up this user’s bet for this round
+    async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
+        uid = str(itx.user.id)
         with db() as conn:
             c = conn.cursor()
             c.execute("SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
             row = c.fetchone()
         bal = get_balance(uid)
         if not row:
-            return await interaction.response.send_message(
-                f"You have **no bet** this round.\nBalance: **{bal}**",
-                ephemeral=True
-            )
+            return await itx.response.send_message(f"You have **no bet** this round.\nBalance: **{bal}**", ephemeral=True)
         choice, stake = row
-        # Remaining time (optional)
         with db() as conn:
             c = conn.cursor()
             c.execute("SELECT expires_at FROM rounds WHERE rid=?", (self.rid,))
@@ -665,12 +743,11 @@ class BetView(discord.ui.View):
                 remain = max(0, int((exp_dt - now_local()).total_seconds()))
             except Exception:
                 pass
-        await interaction.response.send_message(
-            f"Your bet: **{stake}** on **{choice.upper()}**\n"
-            f"Time left: **{remain}s**\n"
-            f"Balance: **{bal}**",
+        await itx.response.send_message(
+            f"Your bet: **{stake}** on **{choice.upper()}**\nTime left: **{remain}s**\nBalance: **{bal}**",
             ephemeral=True
         )
+
 class WithdrawWLModal(discord.ui.Modal, title="Withdraw → WL Gifts"):
     amount_coins = discord.ui.TextInput(
         label=f"Coins to convert (multiple of {WL_COINS_PER_GIFT})",
@@ -2524,170 +2601,5 @@ class AdminRejectWithdrawModal(discord.ui.Modal, title="Reject WL Withdraw"):
             pass
 
         await interaction.response.send_message("Rejected and left balance unchanged. ❌", ephemeral=True)
-# ==== EliHaus Roulette — Colour & Number Bet Add-On (single block) ====
-# Paste this near your roulette code. It provides:
-# - RED/BLACK number validation sets
-# - Mobile-friendly modals for RED, BLACK (optional CSV of numbers) and GREEN (0)
-# - Ready-made buttons: BetRedButton, BetBlackButton, BetGreenButton
-# Usage in your RouletteView.__init__:
-#   self.add_item(BetRedButton(self.round_id))
-#   self.add_item(BetBlackButton(self.round_id))
-#   self.add_item(BetGreenButton(self.round_id))
-
-import discord
-
-# --- Config (safe default if not set elsewhere) ---
-try:
-    CURRENCY  # keep existing if defined
-except NameError:
-    CURRENCY = "coins"
-
-# --- Colour → numbers (European wheel) ---
-RED_NUMBERS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-BLACK_NUMBERS = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
-
-# ---------- Modals ----------
-class RedBetModal(discord.ui.Modal, title="Bet on RED"):
-    amount = discord.ui.TextInput(label="Amount", placeholder="e.g. 50", required=True)
-    numbers = discord.ui.TextInput(
-        label="Red numbers (optional, CSV)",
-        placeholder="e.g. 1,3,5  — or leave blank for colour-only",
-        required=False
-    )
-    def __init__(self, round_id: str):
-        super().__init__()
-        self.round_id = round_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # amount
-        try:
-            amt = int(str(self.amount).strip())
-        except ValueError:
-            return await interaction.response.send_message("Enter a whole number amount.", ephemeral=True)
-        if amt <= 0:
-            return await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
-
-        raw = str(self.numbers).strip()
-        if not raw:
-            # colour-only bet
-            return await _handle_bet(interaction, self.round_id, "color", "red", amt)
-
-        # CSV numbers path (split equally)
-        try:
-            picks = [int(x.strip()) for x in raw.split(",") if x.strip()]
-        except ValueError:
-            return await interaction.response.send_message("Numbers must be comma-separated integers.", ephemeral=True)
-        if not picks:
-            return await interaction.response.send_message("No valid numbers found.", ephemeral=True)
-
-        bad = [n for n in picks if n not in RED_NUMBERS]
-        if bad:
-            return await interaction.response.send_message(
-                f"Only red numbers allowed. Not red: {', '.join(map(str, bad))}.", ephemeral=True
-            )
-
-        per = max(1, amt // len(picks))
-        total = per * len(picks)
-        bal = get_balance(interaction.user.id)
-        if bal < total or not debit_balance(interaction.user.id, total):
-            return await interaction.response.send_message(
-                f"Couldn’t reserve {total} {CURRENCY}. Balance: {bal}.", ephemeral=True
-            )
-        for n in picks:
-            place_bet(self.round_id, interaction.user.id, "number", str(n), per)
-
-        return await interaction.response.send_message(
-            f"Bet locked: {', '.join('#'+str(n) for n in picks)} — **{per} {CURRENCY} each** ✅",
-            ephemeral=True
-        )
-
-class BlackBetModal(discord.ui.Modal, title="Bet on BLACK"):
-    amount = discord.ui.TextInput(label="Amount", placeholder="e.g. 50", required=True)
-    numbers = discord.ui.TextInput(
-        label="Black numbers (optional, CSV)",
-        placeholder="e.g. 2,4,6  — or leave blank for colour-only",
-        required=False
-    )
-    def __init__(self, round_id: str):
-        super().__init__()
-        self.round_id = round_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            amt = int(str(self.amount).strip())
-        except ValueError:
-            return await interaction.response.send_message("Enter a whole number amount.", ephemeral=True)
-        if amt <= 0:
-            return await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
-
-        raw = str(self.numbers).strip()
-        if not raw:
-            return await _handle_bet(interaction, self.round_id, "color", "black", amt)
-
-        try:
-            picks = [int(x.strip()) for x in raw.split(",") if x.strip()]
-        except ValueError:
-            return await interaction.response.send_message("Numbers must be comma-separated integers.", ephemeral=True)
-        if not picks:
-            return await interaction.response.send_message("No valid numbers found.", ephemeral=True)
-
-        bad = [n for n in picks if n not in BLACK_NUMBERS]
-        if bad:
-            return await interaction.response.send_message(
-                f"Only black numbers allowed. Not black: {', '.join(map(str, bad))}.", ephemeral=True
-            )
-
-        per = max(1, amt // len(picks))
-        total = per * len(picks)
-        bal = get_balance(interaction.user.id)
-        if bal < total or not debit_balance(interaction.user.id, total):
-            return await interaction.response.send_message(
-                f"Couldn’t reserve {total} {CURRENCY}. Balance: {bal}.", ephemeral=True
-            )
-        for n in picks:
-            place_bet(self.round_id, interaction.user.id, "number", str(n), per)
-
-        return await interaction.response.send_message(
-            f"Bet locked: {', '.join('#'+str(n) for n in picks)} — **{per} {CURRENCY} each** ✅",
-            ephemeral=True
-        )
-
-class GreenBetModal(discord.ui.Modal, title="Bet on 0 (GREEN)"):
-    amount = discord.ui.TextInput(label="Amount", placeholder="e.g. 50", required=True)
-    def __init__(self, round_id: str):
-        super().__init__()
-        self.round_id = round_id
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            amt = int(str(self.amount).strip())
-        except ValueError:
-            return await interaction.response.send_message("Enter a whole number amount.", ephemeral=True)
-        if amt <= 0:
-            return await interaction.response.send_message("Amount must be greater than 0.", ephemeral=True)
-        return await _handle_bet(interaction, self.round_id, "number", "0", amt)
-
-# ---------- Buttons (ready to drop into your View) ----------
-class BetRedButton(discord.ui.Button):
-    def __init__(self, round_id: str):
-        super().__init__(style=discord.ButtonStyle.danger, label="Bet RED")
-        self.round_id = round_id
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(RedBetModal(self.round_id))
-
-class BetBlackButton(discord.ui.Button):
-    def __init__(self, round_id: str):
-        super().__init__(style=discord.ButtonStyle.primary, label="Bet BLACK")
-        self.round_id = round_id
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(BlackBetModal(self.round_id))
-
-class BetGreenButton(discord.ui.Button):
-    def __init__(self, round_id: str):
-        super().__init__(style=discord.ButtonStyle.success, label="Bet GREEN")
-        self.round_id = round_id
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(GreenBetModal(self.round_id))
-# ==== End add-on block ====
-
 
 bot.run(TOKEN)
