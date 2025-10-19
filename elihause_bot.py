@@ -1254,7 +1254,7 @@ async def tick_round(channel, rid: int, exp_iso: str):
         view = BetView(rid, timeout=left + 30)
 
         # ✳️ EDIT the saved message (do not send a new one)
-        await _edit_round_message(bot, channel, rid, open_embed, view=view)
+        edit_round_message(bot, channel, rid, result_embed, view=None)
 
         if left <= 0:
             break
