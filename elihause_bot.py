@@ -194,7 +194,24 @@ def init_db():
 
 init_db()
 
-# ---------------- Time / State helpers ----------------
+
+# ---- Slots helpers (state) ----
+def _slots_pot_key(channel_id: int) -> str:
+    return f"slots_pot:{int(channel_id)}"
+
+def _slots_msg_key(channel_id: int) -> str:
+    return f"slots_msg:{int(channel_id)}"   # used when you store the panel message id
+
+def get_slots_pot(channel_id: int) -> int:
+    v = get_state(_slots_pot_key(channel_id))
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return SLOTS_SEED   # default when nothing stored yet
+
+def set_slots_pot(channel_id: int, value: int) -> None:
+    set_state(_slots_pot_key(channel_id), int(value))
+
 def now_local():
     return datetime.now(TZ)
 
@@ -2513,8 +2530,9 @@ async def slots_open(interaction: discord.Interaction):
             ),
             color=discord.Color.gold()
         )
-        e.add_field(name="Pot", value=str(pot), inline=True)
+        e.add_field(name="Pot",  value=str(get_slots_pot(interaction.channel.id)), inline=True)
         e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
+
 
         view = SlotsView(interaction.channel.id)
         msg = await interaction.channel.send(embed=e, view=view)
