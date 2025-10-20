@@ -1793,6 +1793,53 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
     except Exception:
         pass
+async def _roulette_send_result(
+    bot, channel, *, rid: int,
+    result_color: str,           # "RED" | "BLACK" | "GREEN"
+    result_number: int,
+    winners_top: list[tuple[str,int]],  # [(discord_id, payout), ...]
+    pool_sum: int,
+    image_path: str | None = None  # e.g. "assets/roulette/result_red.png"
+):
+    color_map = {"RED": (220,38,38), "BLACK": (24,24,27), "GREEN": (16,185,129)}
+    pill_text = {"RED":"🔴 **RED**","BLACK":"⬛ **BLACK**","GREEN":"🟩 **GREEN**"}
+
+    ck = str(result_color).upper()
+    rgb = color_map.get(ck, (24,24,27))
+    pill = pill_text.get(ck, "⬛ **BLACK**")
+
+    # winners list (top 5)
+    def _format_winners(guild: discord.Guild, winners: list[tuple[str,int]], limit: int = 5) -> str:
+        if not winners: return "—"
+        winners = sorted(winners, key=lambda x: x[1], reverse=True)[:limit]
+        lines = []
+        for uid, amount in winners:
+            m = guild.get_member(int(uid))
+            who = m.mention if m else f"<@{uid}>"
+            lines.append(f"{who} — **{amount}**")
+        return "\n".join(lines)
+
+    e = discord.Embed(
+        title=f"🎰 EliHaus Roulette — Round #{rid}",
+        colour=discord.Colour.from_rgb(*rgb),
+    )
+    e.add_field(name="RESULT", value=f"{pill} · **#{int(result_number)}**", inline=False)
+    e.add_field(name="Pool", value=str(pool_sum), inline=True)
+    e.add_field(name="Winners (top)", value=_format_winners(channel.guild, winners_top), inline=False)
+    e.set_footer(text=f"ROUL-{rid} • {now_local().strftime('%b %d, %H:%M')}")
+
+    # If you want a mockup image, attach it as a separate public message (editing a pin with a new file is awkward).
+    if image_path:
+        try:
+            file = discord.File(image_path)
+            await channel.send(embed=e, file=file)
+        except Exception:
+            # if the file is missing, still update the pinned panel without image
+            edit_round_message(bot, channel, rid, e, view=None)
+            return
+
+    # Update your pinned/live round panel (no image here)
+    edit_round_message(bot, channel, rid, e, view=None)
 
 @bot.tree.command(name="eh_resolve", description="(Admin) Resolve the current roulette round")
 @app_commands.default_permissions(manage_guild=True)
@@ -1854,29 +1901,30 @@ async def eh_resolve(interaction: discord.Interaction):
         m = interaction.guild.get_member(int(uid))
         top_mentions.append(m.mention if m else f"<@{uid}>")
 
-    # --- Casino-style result embed ---
-    result_embed = build_roulette_result_embed(
-        rlabel=rlabel,
-        outcome=outcome, roll=roll,
-        total_bets=len(rows),
-        total_pool=total_pool,
-        winners_mentions=[],  # not used anymore
-        seed_display=seed_display,
-    )
+    # Top winners as (discord_id, payout) for the helper
+    winners_top = [(str(uid), int(amount)) for uid, amount in winners][:5]
+    pool_sum = total_pool  # whatever var you use for the round pool
     
-    if msg_id:
-        try:
-            msg = await interaction.channel.fetch_message(msg_id)
-            e = msg.embeds[0] if msg.embeds else discord.Embed(color=_result_color(outcome))
-            e.title = f"🎯 Roulette — Round {rlabel}"
-            e.description = f"**RESULT:** {outcome.upper()} • #{roll}"
-            e.set_footer(text=f"Seed: {seed_display}")
-            await msg.edit(embed=e, view=None)
+    await _roulette_send_result(
+        bot,
+        interaction.channel,    # or `channel` if you already have it
+        rid=rid,
+        result_color=str(outcome).upper(),  # "RED"/"BLACK"/"GREEN"
+        result_number=int(roll),
+        winners_top=winners_top,
+        pool_sum=int(pool_sum),
+        # Optional image mockup:
+        # image_path=f"assets/roulette/result_{str(outcome).lower()}.png"
+    )
+
         except Exception:
             pass
     
-    await interaction.channel.send(embed=result_embed)
-    await interaction.response.send_message("Round resolved.", ephemeral=True)
+    #await interaction.channel.send(embed=result_embed)
+    # Ephemeral confirmation (optional)
+    sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+    await sender("Round resolved.", ephemeral=True)
+
 
 
 @bot.tree.command(name="eh_cancelround", description="(Admin) Cancel the current roulette round and refund")
@@ -1977,37 +2025,6 @@ async def eh_drawlotto(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=ClaimView(prize_id))
     await interaction.response.send_message("Winner posted.", ephemeral=True)
 
-# ---- Prize fulfilment ----
-@bot.tree.command(name="eh_fulfil_next", description="(Admin) Show next WL claim to fulfil")
-@app_commands.default_permissions(manage_guild=True)
-async def eh_fulfil_next(interaction: discord.Interaction):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""SELECT pq.id, pq.prize_id, pq.winner_id, pq.imvu_name, pq.imvu_profile, p.amount, p.meta
-                     FROM prize_queue pq
-                     JOIN prizes p ON p.id = pq.prize_id
-                     WHERE pq.status='ready'
-                     ORDER BY pq.created_ts ASC
-                     LIMIT 1""")
-        row = c.fetchone()
-    if not row:
-        return await interaction.response.send_message("No pending WL claims to fulfil.", ephemeral=True)
-    pq_id, prize_id, winner_id, imvu_name, imvu_profile, amount, meta = row
-    imvu_link = imvu_profile or f"https://www.imvu.com/catalog/web_mypage.php?av={imvu_name}"
-    meta_obj = {}
-    try:
-        meta_obj = json.loads(meta or "{}")
-    except Exception:
-        pass
-    await interaction.response.send_message(
-        f"Fulfil queue **#{pq_id}** → Prize **#{prize_id}** for <@{winner_id}>\n"
-        f"IMVU: **{imvu_name}** • {imvu_link}\n"
-        f"Gifts to send: **{amount}** from **{meta_obj.get('shop', SHOP_NAME)}**\n"
-        f"After gifting, run `/eh_fulfil_done {pq_id}`.",
-        ephemeral=True
-    )
 
 @bot.tree.command(name="eh_fulfil_done", description="(Admin) Mark a WL fulfilment done")
 @app_commands.default_permissions(manage_guild=True)
@@ -2270,37 +2287,7 @@ def set_slots_pot(channel_id: int, pot: int):
     # Pot can never fall below the configured seed
     set_state(_slots_pot_key(channel_id), str(max(pot, SLOTS_SEED)))
 
-    # --- RESULT (color + pill) ---
-    color_map = {
-        "RED":   (220, 38, 38),
-        "BLACK": (24, 24, 27),
-        "GREEN": (16, 185, 129),
-    }
-    pill_text = {
-        "RED":   "🔴 **RED**",
-        "BLACK": "⬛ **BLACK**",
-        "GREEN": "🟩 **GREEN**",
-    }
     
-    color_key = str(result_color).upper()
-    rgb = color_map.get(color_key, (24, 24, 27))      # (R, G, B)
-    pill = pill_text.get(color_key, "⬛ **BLACK**")    # text pill
-    
-    bets_count, pool_sum = _round_stats(rid)
-    
-    result_embed = discord.Embed(
-        title=f"🎰 EliHaus Roulette — Round #{rid}",
-        colour=discord.Colour.from_rgb(rgb[0], rgb[1], rgb[2]),
-    )
-    result_embed.add_field(name="RESULT", value=f"{pill} · **#{int(result_number)}**", inline=False)
-    result_embed.add_field(name="Total Bets", value=str(bets_count), inline=True)
-    result_embed.add_field(name="Pool", value=str(pool_sum), inline=True)
-    result_embed.add_field(name="Winners (top)", value="—", inline=False)
-    result_embed.set_footer(
-        text=f"ROUL-{rid} • {(now_local().strftime('%b %d, %H:%M') if 'now_local' in globals() else datetime.now().strftime('%b %d, %H:%M'))}"
-    )
-    
-    edit_round_message(bot, channel, rid, result_embed, view=None)
 
 # ---- UI: Modal + View ----
 class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
@@ -2501,7 +2488,6 @@ class SlotsView(discord.ui.View):
         await interaction.response.send_modal(SlotsModal(self.channel_id))
 
 # ---- Slash Commands ----
-
 # (admin) open a panel in the current channel
 from discord import app_commands
 import discord
