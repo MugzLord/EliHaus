@@ -1604,20 +1604,25 @@ async def eh_weekly(interaction: discord.Interaction):
         c.execute("UPDATE users SET last_weekly=? WHERE discord_id=?", (iso(nowt), uid))
     await interaction.response.send_message(f"Weekly claimed: **{WEEKLY_AMOUNT}** coins. New balance: **{new_bal}**", ephemeral=True)
 
-@bot.tree.command(name="eh_balance", description="Check a balance")
-@app_commands.describe(member="Member to check (optional)")
-async def eh_balance(interaction: discord.Interaction, member: discord.Member | None = None):
-    m = member or interaction.user
-    bal = get_balance(str(m.id))
-    await interaction.response.send_message(f"{m.mention} has **{bal}** coins.", ephemeral=True)
+@bot.tree.command(name="eh_balance", description="Check your coin balance (or someone else's)")
+@app_commands.describe(user="(optional) member to check")
+async def eh_balance(interaction: discord.Interaction, user: discord.Member | None = None):
+    target = user or interaction.user
+    uid = str(target.id)          # <-- define uid
+    ensure_user(uid)              # <-- keep your helper usage
 
-    # balance check
-    bal = get_balance(uid)
-    if bal < amount:
-        return await interaction.response.send_message(
-            f"Insufficient coins. Need **{amount}**, you have **{bal}**.",
-            ephemeral=True
-        )
+    try:
+        bal = get_balance(uid)
+    except Exception as e:
+        import traceback; print("eh_balance error:\n", traceback.format_exc())
+        return await interaction.response.send_message("❌ Couldn't fetch balance.", ephemeral=True)
+
+    # self check = ephemeral, other = public (tweak if you want all ephemeral)
+    if user is None:
+        await interaction.response.send_message(f"💰 Your balance: **{bal}** coins.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"💰 {target.mention} balance: **{bal}** coins.")
+
 
     # deduct immediately (kind = wl_deposit)
     new_bal = change_balance(uid, -amount, "wl_deposit", meta=f"wl_deposit by user; imvu={imvu}")
