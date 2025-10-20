@@ -46,7 +46,8 @@ from collections import defaultdict
 
 MESSAGE_COUNTER = defaultdict(int)   # channel_id -> count since last bump
 ACTIVE_PANEL_MSG: dict[int, int] = {}  # channel_id -> betting panel message_id
-
+# Only this user can use /eh_deposit
+DEPOSITOR_ID = int(os.getenv("DEPOSITOR_ID", "0"))  # set your Discord User ID in env
 
 # Economy
 DAILY_AMOUNT = 1_800
@@ -2967,5 +2968,60 @@ async def setup_hook():
     # Register handlers for the custom_id buttons so old messages keep working after restarts
     bot.add_view(RouletteBetView(0))   # rid here is a dummy; you’ll attach a fresh view to live rounds
 
+from discord import app_commands
+
+@bot.tree.command(name="eh_deposit", description="(owner-only) Deposit coins to a user")
+@app_commands.describe(
+    user="Member to receive coins",
+    amount="How many coins to deposit (positive integer)",
+    reason="Note (optional)"
+)
+async def eh_deposit(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    amount: int,
+    reason: str | None = None
+):
+    # --- PERMISSION: strictly you only ---
+    if interaction.user.id != DEPOSITOR_ID:
+        return await interaction.response.send_message("You can’t use this command.", ephemeral=True)
+
+    if amount <= 0:
+        return await interaction.response.send_message("Amount must be a positive number.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # ensure recipient exists
+    uid = str(user.id)
+    ensure_user(uid)
+
+    try:
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE users SET balance = balance + ? WHERE discord_id = ?", (amount, uid))
+            meta = f"deposit|by:{interaction.user.id}" + (f"|reason:{reason}" if reason else "")
+            c.execute(
+                "INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                (uid, "deposit", amount, meta, iso(now_local()))
+            )
+        new_bal = get_balance(uid)
+    except Exception as e:
+        import traceback; print("DEPOSIT ERROR:\n", traceback.format_exc())
+        return await interaction.followup.send(f"❌ Deposit failed: {e}", ephemeral=True)
+
+    # confirm to you (ephemeral)
+    await interaction.followup.send(
+        f"✅ Deposited **{amount}** coins to {user.mention}. New balance: **{new_bal}**.",
+        ephemeral=True
+    )
+
+    # (optional) public log — delete if you want it silent
+    try:
+        await interaction.channel.send(
+            f"💰 Admin deposit: {user.mention} received **{amount}** coins."
+            + (f" _({reason})_" if reason else "")
+        )
+    except Exception:
+        pass
 
 bot.run(TOKEN)
