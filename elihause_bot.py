@@ -2314,18 +2314,23 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
     async def on_submit(self, interaction: discord.Interaction):
         # ACK the modal immediately
         await interaction.response.defer(ephemeral=True, thinking=True)
+        sent = False
     
         # parse count
         try:
             n = int(str(self.spins.value).strip())
         except Exception:
-            return await interaction.followup.send("Enter a valid number of spins (1–5).", ephemeral=True)
+            await interaction.followup.send("Enter a valid number of spins (1–5).", ephemeral=True)
+            sent = True
+            return
     
         if n < 1 or n > SLOTS_MAX_SPINS:
-            return await interaction.followup.send(
+            await interaction.followup.send(
                 f"Spins must be between 1 and {SLOTS_MAX_SPINS}.",
                 ephemeral=True
             )
+            sent = True
+            return
     
         uid = str(interaction.user.id)
         ensure_user(uid)
@@ -2333,10 +2338,12 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
         total_cost = SLOTS_COST * n
         bal = get_balance(uid)
         if bal < total_cost:
-            return await interaction.followup.send(
+            await interaction.followup.send(
                 f"Insufficient coins. **{total_cost}** required for {n} spin(s). Balance **{bal}**.",
                 ephemeral=True
             )
+            sent = True
+            return
 
 
         # charge upfront
@@ -2424,40 +2431,51 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
             print("SLOTS panel refresh error:", e)
             pass
 
-        # ephemeral summary
+    # --- results & output ---
+    try:
+        # EPHEMERAL SUMMARY
         show = 6
         body = "\n".join(lines[:show]) + (f"\n.. and {len(lines)-show} more." if len(lines) > show else "")
-        
         await interaction.followup.send(
             f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
             ephemeral=True
         )
-
-        # --- Public attachment with full result for everyone ---
+        sent = True
+    
+        # PUBLIC attachment (optional)
         import io, time
-        try:
-            details = []
-            details.append(f"User: {interaction.user} ({interaction.user.id})")
-            details.append(f"Spins: {n}")
-            details.extend(lines)  # the per-spin lines you already built
-            details.append("")
-            details.append(f"Total won: {total_win}")
-            details.append(f"Pot now: {get_slots_pot(self.channel_id)}")
-            txt = "\n".join(details)
-        
-            buf = io.BytesIO(txt.encode("utf-8"))
-            filename = f"slots_{interaction.user.id}_{int(time.time())}.txt"
-            file = discord.File(buf, filename=filename)
-        
-            public_summary = (
-                f"{interaction.user.mention} spun **{n}x** • "
-                f"{'+'+str(total_win) if total_win else 'no win'} • "
-                f"Pot **{get_slots_pot(self.channel_id)}**"
-            )
-            # since we already deferred, use followup for the public post
-            await interaction.followup.send(public_summary, file=file)
-        except Exception:
-            pass
+        details = []
+        details.append(f"User: {interaction.user} ({interaction.user.id})")
+        details.append(f"Spins: {n}")
+        details.extend(lines)
+        details.append("")
+        details.append(f"Total won: {total_win}")
+        details.append(f"Pot now: {get_slots_pot(self.channel_id)}")
+        txt = "\n".join(details)
+    
+        buf = io.BytesIO(txt.encode("utf-8"))
+        filename = f"slots_{interaction.user.id}_{int(time.time())}.txt"
+        file = discord.File(buf, filename=filename)
+    
+        public_summary = (
+            f"{interaction.user.mention} spun **{n}x** • "
+            f"{'+'+str(total_win) if total_win else 'no win'} • "
+            f"Pot **{get_slots_pot(self.channel_id)}**"
+        )
+        await interaction.followup.send(public_summary, file=file)
+    
+    except Exception as e:
+        import traceback
+        print("SLOTS results send error:\n", traceback.format_exc())
+        if not sent:
+            await interaction.followup.send("❌ Something went wrong sending your result.", ephemeral=True)
+            sent = True
+    finally:
+        if not sent:
+            try:
+                await interaction.followup.send("✅ Done.", ephemeral=True)
+            except Exception:
+                pass
 
 
         
