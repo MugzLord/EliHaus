@@ -53,7 +53,6 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 ASSETS_DIR = BASE_DIR / "assets"
 
-
 # Economy
 DAILY_AMOUNT = 1_800
 WEEKLY_AMOUNT = 6_000
@@ -2267,21 +2266,9 @@ def edit_round_message(bot, channel, rid: int, embed, view=None):
     """Safe from non-async code: schedules the edit on the loop."""
     return asyncio.create_task(_edit_round_message(bot, channel, rid, embed, view))
 
-def get_slots_pot(channel_id: int) -> int:
-    val = get_state(_slots_pot_key(channel_id))
-    if val is None:
-        set_state(_slots_pot_key(channel_id), str(SLOTS_SEED))
-        return SLOTS_SEED
-    try:
-        return int(val)
-    except Exception:
-        set_state(_slots_pot_key(channel_id), str(SLOTS_SEED))
-        return SLOTS_SEED
-
 def set_slots_pot(channel_id: int, pot: int):
     # Pot can never fall below the configured seed
     set_state(_slots_pot_key(channel_id), str(max(pot, SLOTS_SEED)))
-
 
     # --- RESULT (color + pill) ---
     color_map = {
@@ -2328,25 +2315,23 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
         super().__init__(timeout=180)
         self.channel_id = channel_id
 
+    
     # inside class SlotsModal(...)
     async def on_submit(self, interaction: discord.Interaction):
-        # acknowledge the modal immediately
         await interaction.response.defer(ephemeral=True, thinking=True)
         sent = False
-    
         try:
-            # --- parse spins ---
+            # parse spins
             try:
                 n = int(str(self.spins.value).strip())
             except Exception:
                 await interaction.followup.send("Enter a valid number of spins (1–5).", ephemeral=True)
                 return
-    
             if n < 1 or n > SLOTS_MAX_SPINS:
                 await interaction.followup.send(f"Spins must be between 1 and {SLOTS_MAX_SPINS}.", ephemeral=True)
                 return
     
-            # --- user + balance checks ---
+            # user + balance checks
             uid = str(interaction.user.id)
             ensure_user(uid)
     
@@ -2359,7 +2344,7 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                 )
                 return
     
-            # --- charge upfront ---
+            # charge upfront
             with db() as conn:
                 c = conn.cursor()
                 c.execute("UPDATE users SET balance = balance - ? WHERE discord_id = ?", (total_cost, uid))
@@ -2368,11 +2353,11 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                     (uid, "bet", -total_cost, f"slots|entry x{n}", iso(now_local()))
                 )
     
-            # --- add to pot ---
+            # add to pot
             pot = get_slots_pot(self.channel_id) + total_cost
             set_slots_pot(self.channel_id, pot)
     
-            # --- run spins ---
+            # run spins
             import random
             total_win = 0
             lines = []
@@ -2397,7 +2382,6 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                     set_slots_pot(self.channel_id, pot)
                     total_win += win
     
-                # record spin
                 with db() as conn:
                     c = conn.cursor()
                     c.execute(
@@ -2410,7 +2394,7 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                 last_roll = f"{r1}{r2}{r3}"
                 last_win = win
     
-            # --- pay out bundle if any ---
+            # pay out bundle if any
             if total_win > 0:
                 with db() as conn:
                     c = conn.cursor()
@@ -2420,7 +2404,7 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                         (uid, "payout", total_win, f"slots|bundle x{n}", iso(now_local()))
                     )
     
-            # --- refresh the panel (safe) ---
+            # refresh the panel (safe)
             try:
                 mid = get_state(_slots_msg_key(self.channel_id))
                 if mid:
@@ -2431,7 +2415,7 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                     e.description = (
                         f"Entry: **{SLOTS_COST}** coins per spin.\n"
                         f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
-                        f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**×.\n"
+                        f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**.\n"
                         f"Pot never drops below seed **{SLOTS_SEED}**."
                     )
                     e.add_field(name="Pot",  value=str(get_slots_pot(self.channel_id)), inline=True)
@@ -2445,7 +2429,7 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
             except Exception as e:
                 print("SLOTS panel refresh error:", e)
     
-            # --- ephemeral summary (guaranteed send) ---
+            # ephemeral summary (single send)
             show = 6
             body = "\n".join(lines[:show]) + (f"\n.. and {len(lines)-show} more." if len(lines) > show else "")
             await interaction.followup.send(
@@ -2454,13 +2438,11 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
             )
             sent = True
     
-        except Exception as e:
+        except Exception:
             import traceback
             print("SLOTS on_submit fatal:\n", traceback.format_exc())
             if not sent:
                 await interaction.followup.send("❌ Something went wrong running your spins.", ephemeral=True)
-    
-
 
         # --- results & output ---
         try:
