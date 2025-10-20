@@ -1917,9 +1917,6 @@ async def eh_resolve(interaction: discord.Interaction):
         # image_path=f"assets/roulette/result_{str(outcome).lower()}.png"
     )
 
-        except Exception:
-            pass
-    
     #await interaction.channel.send(embed=result_embed)
     # Ephemeral confirmation (optional)
     sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
