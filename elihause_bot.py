@@ -2312,14 +2312,17 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
         self.channel_id = channel_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Prevent Discord modal timeout (3s)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         # parse count
         try:
             n = int(str(self.spins).strip())
         except Exception:
-            return await interaction.response.send_message("Enter a valid number of spins.", ephemeral=True)
+            return await interaction.followup.send(f"Spins must be between 1 and {SLOTS_MAX_SPINS}.", ephemeral=True)
         if n < 1 or n > SLOTS_MAX_SPINS:
-            return await interaction.response.send_message(
-                f"Spins must be between 1 and {SLOTS_MAX_SPINS}.", ephemeral=True
+            return await interaction.followup.send("Enter a valid number of spins.", ephemeral=True)
+
             )
 
         uid = str(interaction.user.id)
@@ -2328,10 +2331,11 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
         total_cost = SLOTS_COST * n
         bal = get_balance(uid)
         if bal < total_cost:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"Insufficient coins. **{total_cost}** required for {n} spin(s). Balance **{bal}**.",
                 ephemeral=True
             )
+
 
         # charge upfront
         with db() as conn:
@@ -2408,9 +2412,11 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                     value=f"{last_roll} → {'+'+str(last_win) if last_win else '—'}",
                     inline=False
                 )
-                await panel.edit(embed=e, view=SlotsView(self.channel_id))
-        except Exception:
-            pass
+                await interaction.followup.send(
+                    f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
+                    ephemeral=True
+                )
+
 
         # ephemeral summary
         show = 6
