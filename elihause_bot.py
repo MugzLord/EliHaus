@@ -2407,30 +2407,26 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                     e = panel.embeds[0]
                 else:
                     e = discord.Embed(color=discord.Color.gold())
+                    e.title = "🎰 Emoji Slots — Shared Pot"
                 e.clear_fields()
-                e.title = "🎰 Emoji Slots — Shared Pot"
                 e.description = (
                     f"Entry: **{SLOTS_COST}** coins per spin.\n"
                     f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
-                    f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**.\n"
+                    f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**×.\n"
                     f"Pot never drops below seed **{SLOTS_SEED}**."
                 )
-                e.add_field(name="Pot", value=str(get_slots_pot(self.channel_id)), inline=True)
-                e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
+                e.add_field(name="Pot",  value=str(get_slots_pot(self.channel_id)), inline=True)
+                e.add_field(name="Seed", value=str(SLOTS_SEED),              inline=True)
                 e.add_field(
                     name="Last roll",
-                    value=f"{last_roll} → {'+'+str(last_win) if last_win else '—'}",
+                    value=f"{last_roll} {'+'+str(last_win) if last_win else '–'}",
                     inline=False
                 )
-                await interaction.followup.send(
-                    f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
-                    ephemeral=True
-                )
-
+                await panel.edit(embed=e, view=SlotsView(self.channel_id))
         except Exception as e:
-            # keep it quiet in chat, log to console
             print("SLOTS panel refresh error:", e)
             pass
+
 
     # --- results & output ---
     try:
@@ -2477,7 +2473,6 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                 await interaction.followup.send("✅ Done.", ephemeral=True)
             except Exception:
                 pass
-
 
         
 class SlotsView(discord.ui.View):
@@ -2553,18 +2548,39 @@ async def slots_reset(interaction: discord.Interaction):
     if not (interaction.user.guild_permissions.manage_guild or interaction.guild.owner_id == interaction.user.id):
         return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
 
+    # set pot
     set_slots_pot(interaction.channel.id, SLOTS_SEED)
 
     # refresh the panel
     try:
-        mid = get_state(_slots_msg_key(self.channel_id))
+        mid = get_state(_slots_msg_key(interaction.channel.id))
         if mid:
             panel = await interaction.channel.fetch_message(int(mid))
+            # get (or build) embed
             if panel.embeds:
                 e = panel.embeds[0]
             else:
                 e = discord.Embed(color=discord.Color.gold())
                 e.title = "🎰 Emoji Slots — Shared Pot"
+
+            # (optional) pull last roll; safe fallback if none
+            last_roll = "-"
+            last_win = 0
+            try:
+                with db() as conn:
+                    c = conn.cursor()
+                    row = c.execute(
+                        "SELECT r1,r2,r3,win FROM slots_spins WHERE channel_id=? ORDER BY ts DESC LIMIT 1",
+                        (str(interaction.channel.id),)
+                    ).fetchone()
+                    if row:
+                        r1, r2, r3, w = row
+                        last_roll = f"{r1}{r2}{r3}"
+                        last_win = int(w or 0)
+            except Exception:
+                pass  # ignore if table empty, etc.
+
+            # rebuild embed
             e.clear_fields()
             e.description = (
                 f"Entry: **{SLOTS_COST}** coins per spin.\n"
@@ -2572,19 +2588,20 @@ async def slots_reset(interaction: discord.Interaction):
                 f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**×.\n"
                 f"Pot never drops below seed **{SLOTS_SEED}**."
             )
-            e.add_field(name="Pot", value=str(get_slots_pot(self.channel_id)), inline=True)
+            e.add_field(name="Pot", value=str(get_slots_pot(interaction.channel.id)), inline=True)
             e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
             e.add_field(
                 name="Last roll",
                 value=f"{last_roll} {'+'+str(last_win) if last_win else '–'}",
                 inline=False
             )
-            await panel.edit(embed=e, view=SlotsView(self.channel_id))
-    except Exception:
-        pass
+            await panel.edit(embed=e, view=SlotsView(interaction.channel.id))
+    except Exception as e:
+        print("slots_reset panel refresh error:", e)
 
-
+    # final ack
     await interaction.response.send_message("Slots pot reset to seed.", ephemeral=True)
+
 
 # top winners (by total coins won) in this channel
 @bot.tree.command(name="slots_top", description="Show top Slots winners (by total coins won) for this channel")
