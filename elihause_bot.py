@@ -49,6 +49,11 @@ ACTIVE_PANEL_MSG: dict[int, int] = {}  # channel_id -> betting panel message_id
 # Only this user can use /eh_deposit
 DEPOSITOR_ID = int(os.getenv("DEPOSITOR_ID", "0"))  # set your Discord User ID in env
 
+from pathlib import Path
+BASE_DIR = Path(__file__).parent
+ASSETS_DIR = BASE_DIR / "assets"
+
+
 # Economy
 DAILY_AMOUNT = 1_800
 WEEKLY_AMOUNT = 6_000
@@ -320,10 +325,11 @@ from io import BytesIO
 
 # where your 3 base chips live
 CHIP_ASSETS = {
-    "RED":   "assets/chip_red.png",
-    "BLACK": "assets/chip_black.png",
-    "GREEN": "assets/chip_green.png",
+    "RED":    str(ASSETS_DIR / "chip_red.png"),
+    "BLACK":  str(ASSETS_DIR / "chip_black.png"),
+    "GREEN":  str(ASSETS_DIR / "chip_green.png"),
 }
+
 
 def roulette_color_from_number(n: int) -> str:
     red = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -335,56 +341,61 @@ def roulette_color_from_number(n: int) -> str:
 # and import io
 
 def render_chip_badge(result_color: str, result_number: int) -> io.BytesIO | None:
-    """
-    Returns a PNG (in-memory) of a LARGE chip with a BIG, centered number.
-    Expects base chip asset at: assets/chip_red.png / chip_black.png / chip_green.png (108x108 ok)
-    """
-    try:
-        base_path = f"assets/chip_{result_color.lower()}.png"
-        chip = Image.open(base_path).convert("RGBA")
-
-        # --- upscale chip so text can be huge ---
-        SCALE = 5                       # 108 * 5 = 540 px
-        W, H = chip.size
-        chip = chip.resize((W*SCALE, H*SCALE), Image.LANCZOS)
-
-        draw = ImageDraw.Draw(chip)
-
-        # --- choose a big font relative to chip size ---
-        # try common fonts; fall back if needed
-        font = None
-        for fp in ("DejaVuSans-Bold.ttf", "Arial.ttf", "arial.ttf"):
-            try:
-                font = ImageFont.truetype(fp, size=int(chip.width * 0.42))
-                break
-            except Exception:
-                pass
-        if font is None:
-            # last resort: small default font (still better than nothing)
-            font = ImageFont.load_default()
-
-        # text + styles
-        text = str(int(result_number))
-        cx, cy = chip.width // 2, chip.height // 2
-
-        # outline for contrast
-        draw.text(
-            (cx, cy),
-            text,
-            font=font,
-            fill=(255, 255, 255, 255),
-            anchor="mm",
-            stroke_width=max(2, chip.width // 60),
-            stroke_fill=(0, 0, 0, 255),
-        )
-
-        # export to bytes for discord.File
-        out = io.BytesIO()
-        chip.save(out, format="PNG")
-        out.seek(0)
-        return out
-    except Exception:
+    # normalise key and resolve asset
+    key = str(result_color).strip().upper()
+    base_path = CHIP_ASSETS.get(key)
+    if not base_path:
+        print(f"[chips] no asset mapping for color '{key}'")
         return None
+
+    try:  # <-- THIS is the 'first try' I was referring to
+        chip = Image.open(base_path).convert("RGBA")
+    except Exception as e:
+        print(f"[chips] failed to open asset '{base_path}': {e}")
+        return None
+
+    # upscale chip so text is crisp
+    SCALE = 5
+    W, H = chip.size
+    chip = chip.resize((W*SCALE, H*SCALE), Image.LANCZOS)
+
+    draw = ImageDraw.Draw(chip)
+
+    # font selection (second try is for fonts only)
+    font = None
+    for fp in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "DejaVuSans-Bold.ttf",
+        "Arial.ttf",
+        "arial.ttf",
+    ):
+        try:
+            font = ImageFont.truetype(fp, size=int(chip.width * 0.42))
+            break
+        except Exception:
+            pass
+    if font is None:
+        font = ImageFont.load_default()
+
+    # text + outline
+    text = str(int(result_number))
+    cx, cy = chip.width // 2, chip.height // 2
+    draw.text(
+        (cx, cy),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+        anchor="mm",
+        stroke_width=max(2, chip.width // 60),
+        stroke_fill=(0, 0, 0, 255),
+    )
+
+    # export to BytesIO for discord.File
+    out = io.BytesIO()
+    chip.save(out, format="PNG")
+    out.seek(0)
+    return out
+
 
 
     # open base chip
@@ -2317,120 +2328,138 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
         super().__init__(timeout=180)
         self.channel_id = channel_id
 
+    # inside class SlotsModal(...)
     async def on_submit(self, interaction: discord.Interaction):
-        # ACK the modal immediately
+        # acknowledge the modal immediately
         await interaction.response.defer(ephemeral=True, thinking=True)
         sent = False
     
-        # parse count
         try:
-            n = int(str(self.spins.value).strip())
-        except Exception:
-            await interaction.followup.send("Enter a valid number of spins (1–5).", ephemeral=True)
-            sent = True
-            return
+            # --- parse spins ---
+            try:
+                n = int(str(self.spins.value).strip())
+            except Exception:
+                await interaction.followup.send("Enter a valid number of spins (1–5).", ephemeral=True)
+                return
     
-        if n < 1 or n > SLOTS_MAX_SPINS:
-            await interaction.followup.send(
-                f"Spins must be between 1 and {SLOTS_MAX_SPINS}.",
-                ephemeral=True
-            )
-            sent = True
-            return
+            if n < 1 or n > SLOTS_MAX_SPINS:
+                await interaction.followup.send(f"Spins must be between 1 and {SLOTS_MAX_SPINS}.", ephemeral=True)
+                return
     
-        uid = str(interaction.user.id)
-        ensure_user(uid)
+            # --- user + balance checks ---
+            uid = str(interaction.user.id)
+            ensure_user(uid)
     
-        total_cost = SLOTS_COST * n
-        bal = get_balance(uid)
-        if bal < total_cost:
-            await interaction.followup.send(
-                f"Insufficient coins. **{total_cost}** required for {n} spin(s). Balance **{bal}**.",
-                ephemeral=True
-            )
-            sent = True
-            return
-
-
-        # charge upfront
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (total_cost, uid))
-            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                      (uid, "bet", -total_cost, f"slots|entry x{n}", iso(now_local())))
-
-        # add to pot
-        pot = get_slots_pot(self.channel_id) + total_cost
-        set_slots_pot(self.channel_id, pot)
-
-        total_win = 0
-        lines = []
-        last_roll = "—"
-        last_win = 0
-
-        for i in range(1, n + 1):
-            # spin
-            r1, r2, r3 = random.choice(SLOTS_EMOJIS), random.choice(SLOTS_EMOJIS), random.choice(SLOTS_EMOJIS)
-            available = max(0, pot - SLOTS_SEED)
-            win = 0
-            if r1 == r2 == r3:
-                win = int(available * SLOTS_PAYOUT_TRIPLE)
-            elif (r1 == r2) or (r1 == r3) or (r2 == r3):
-                win = min(SLOTS_PAYOUT_DOUBLE, available)
-
-            pot_before = pot
-            if win > 0:
-                pot -= win
-                set_slots_pot(self.channel_id, pot)
-                total_win += win
-
-            # record spin
+            total_cost = SLOTS_COST * n
+            bal = get_balance(uid)
+            if bal < total_cost:
+                await interaction.followup.send(
+                    f"Insufficient coins. **{total_cost}** required for {n} spin(s). Balance **{bal}**.",
+                    ephemeral=True
+                )
+                return
+    
+            # --- charge upfront ---
             with db() as conn:
                 c = conn.cursor()
-                c.execute("""INSERT INTO slots_spins(channel_id,discord_id,r1,r2,r3,win,pot_before,ts)
-                             VALUES(?,?,?,?,?,?,?,?)""",
-                          (str(self.channel_id), uid, r1, r2, r3, win, pot_before, iso(now_local())))
-
-            sign = f"+{win}" if win else "—"
-            lines.append(f"{i}. {r1}{r2}{r3} → {sign}")
-            last_roll, last_win = f"{r1}{r2}{r3}", win
-
-        # pay out once after bundle
-        if total_win > 0:
-            with db() as conn:
-                c = conn.cursor()
-                c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (total_win, uid))
-                c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                          (uid, "payout", total_win, f"slots|bundle x{n}", iso(now_local())))
-
-        # refresh the panel
-        try:
-            mid = get_state(_slots_msg_key(self.channel_id))
-            if mid:
-                panel = await interaction.channel.fetch_message(int(mid))
-                if panel.embeds:
-                    e = panel.embeds[0]
-                else:
-                    e = discord.Embed(color=discord.Color.gold())
+                c.execute("UPDATE users SET balance = balance - ? WHERE discord_id = ?", (total_cost, uid))
+                c.execute(
+                    "INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                    (uid, "bet", -total_cost, f"slots|entry x{n}", iso(now_local()))
+                )
+    
+            # --- add to pot ---
+            pot = get_slots_pot(self.channel_id) + total_cost
+            set_slots_pot(self.channel_id, pot)
+    
+            # --- run spins ---
+            import random
+            total_win = 0
+            lines = []
+            last_roll = "-"
+            last_win = 0
+    
+            for _ in range(n):
+                r1 = random.choice(SLOTS_EMOJIS)
+                r2 = random.choice(SLOTS_EMOJIS)
+                r3 = random.choice(SLOTS_EMOJIS)
+    
+                available = max(0, pot - SLOTS_SEED)
+                win = 0
+                if r1 == r2 == r3:
+                    win = int(available * SLOTS_PAYOUT_TRIPLE)
+                elif (r1 == r2) or (r1 == r3) or (r2 == r3):
+                    win = min(SLOTS_PAYOUT_DOUBLE, available)
+    
+                pot_before = pot
+                if win > 0:
+                    pot -= win
+                    set_slots_pot(self.channel_id, pot)
+                    total_win += win
+    
+                # record spin
+                with db() as conn:
+                    c = conn.cursor()
+                    c.execute(
+                        "INSERT INTO slots_spins(channel_id,discord_id,r1,r2,r3,win,pot_before,ts) VALUES(?,?,?,?,?,?,?,?)",
+                        (str(self.channel_id), uid, r1, r2, r3, win, pot_before, iso(now_local()))
+                    )
+    
+                sign = f"+{win}" if win else "–"
+                lines.append(f"{r1} {r2} {r3}   {sign}")
+                last_roll = f"{r1}{r2}{r3}"
+                last_win = win
+    
+            # --- pay out bundle if any ---
+            if total_win > 0:
+                with db() as conn:
+                    c = conn.cursor()
+                    c.execute("UPDATE users SET balance = balance + ? WHERE discord_id = ?", (total_win, uid))
+                    c.execute(
+                        "INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                        (uid, "payout", total_win, f"slots|bundle x{n}", iso(now_local()))
+                    )
+    
+            # --- refresh the panel (safe) ---
+            try:
+                mid = get_state(_slots_msg_key(self.channel_id))
+                if mid:
+                    panel = await interaction.channel.fetch_message(int(mid))
+                    e = panel.embeds[0] if panel.embeds else discord.Embed(color=discord.Color.gold())
                     e.title = "🎰 Emoji Slots — Shared Pot"
-                e.clear_fields()
-                e.description = (
-                    f"Entry: **{SLOTS_COST}** coins per spin.\n"
-                    f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
-                    f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**×.\n"
-                    f"Pot never drops below seed **{SLOTS_SEED}**."
-                )
-                e.add_field(name="Pot",  value=str(get_slots_pot(self.channel_id)), inline=True)
-                e.add_field(name="Seed", value=str(SLOTS_SEED),              inline=True)
-                e.add_field(
-                    name="Last roll",
-                    value=f"{last_roll} {'+'+str(last_win) if last_win else '–'}",
-                    inline=False
-                )
-                await panel.edit(embed=e, view=SlotsView(self.channel_id))
+                    e.clear_fields()
+                    e.description = (
+                        f"Entry: **{SLOTS_COST}** coins per spin.\n"
+                        f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
+                        f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**×.\n"
+                        f"Pot never drops below seed **{SLOTS_SEED}**."
+                    )
+                    e.add_field(name="Pot",  value=str(get_slots_pot(self.channel_id)), inline=True)
+                    e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
+                    e.add_field(
+                        name="Last roll",
+                        value=f"{last_roll} {'+'+str(last_win) if last_win else '–'}",
+                        inline=False
+                    )
+                    await panel.edit(embed=e, view=SlotsView(self.channel_id))
+            except Exception as e:
+                print("SLOTS panel refresh error:", e)
+    
+            # --- ephemeral summary (guaranteed send) ---
+            show = 6
+            body = "\n".join(lines[:show]) + (f"\n.. and {len(lines)-show} more." if len(lines) > show else "")
+            await interaction.followup.send(
+                f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
+                ephemeral=True
+            )
+            sent = True
+    
         except Exception as e:
-            print("SLOTS panel refresh error:", e)
-            pass
+            import traceback
+            print("SLOTS on_submit fatal:\n", traceback.format_exc())
+            if not sent:
+                await interaction.followup.send("❌ Something went wrong running your spins.", ephemeral=True)
+    
 
 
         # --- results & output ---
