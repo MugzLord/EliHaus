@@ -2422,15 +2422,15 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
 
         # ephemeral summary
         show = 6
-        body = "\n".join(lines[:show]) + (f"\n… and {len(lines)-show} more." if len(lines) > show else "")
-        await interaction.response.send_message(
+        body = "\n".join(lines[:show]) + (f"\n.. and {len(lines)-show} more." if len(lines) > show else "")
+        
+        await interaction.followup.send(
             f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
             ephemeral=True
         )
         
         # --- Public attachment with full result for everyone ---
-        import io, time  # put these at top of file if not already imported
-        
+        import io, time
         try:
             details = []
             details.append(f"User: {interaction.user} ({interaction.user.id})")
@@ -2446,14 +2446,15 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
             file = discord.File(buf, filename=filename)
         
             public_summary = (
-                f"🎰 {interaction.user.mention} spun **{n}x** → "
+                f"{interaction.user.mention} spun **{n}x** • "
                 f"{'+'+str(total_win) if total_win else 'no win'} • "
                 f"Pot **{get_slots_pot(self.channel_id)}**"
             )
-            # since you've already responded ephemerally above, use followup for the public post
+            # since we already deferred, use followup for the public post
             await interaction.followup.send(public_summary, file=file)
         except Exception:
             pass
+
 
         
 class SlotsView(discord.ui.View):
@@ -2531,27 +2532,34 @@ async def slots_reset(interaction: discord.Interaction):
 
     set_slots_pot(interaction.channel.id, SLOTS_SEED)
 
-    # refresh panel if exists
+    # refresh the panel
     try:
-        mid = get_state(_slots_msg_key(interaction.channel.id))
+        mid = get_state(_slots_msg_key(self.channel_id))
         if mid:
             panel = await interaction.channel.fetch_message(int(mid))
             if panel.embeds:
                 e = panel.embeds[0]
             else:
                 e = discord.Embed(color=discord.Color.gold())
+                e.title = "🎰 Emoji Slots — Shared Pot"
             e.clear_fields()
-            e.title = "🎰 Emoji Slots — Shared Pot"
             e.description = (
                 f"Entry: **{SLOTS_COST}** coins per spin.\n"
                 f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
-                f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**."
+                f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**×.\n"
+                f"Pot never drops below seed **{SLOTS_SEED}**."
             )
-            e.add_field(name="Pot", value=str(SLOTS_SEED), inline=True)
+            e.add_field(name="Pot", value=str(get_slots_pot(self.channel_id)), inline=True)
             e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
-            await panel.edit(embed=e, view=SlotsView(interaction.channel.id))
+            e.add_field(
+                name="Last roll",
+                value=f"{last_roll} {'+'+str(last_win) if last_win else '–'}",
+                inline=False
+            )
+            await panel.edit(embed=e, view=SlotsView(self.channel_id))
     except Exception:
         pass
+
 
     await interaction.response.send_message("Slots pot reset to seed.", ephemeral=True)
 
