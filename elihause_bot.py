@@ -2419,6 +2419,10 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                     ephemeral=True
                 )
 
+        except Exception as e:
+            # keep it quiet in chat, log to console
+            print("SLOTS panel refresh error:", e)
+            pass
 
         # ephemeral summary
         show = 6
@@ -2428,7 +2432,7 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
             f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
             ephemeral=True
         )
-        
+
         # --- Public attachment with full result for everyone ---
         import io, time
         try:
