@@ -2312,22 +2312,24 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
         self.channel_id = channel_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Prevent Discord modal timeout (3s)
+        # ACK the modal immediately
         await interaction.response.defer(ephemeral=True, thinking=True)
-
+    
         # parse count
         try:
-            n = int(str(self.spins).strip())
+            n = int(str(self.spins.value).strip())
         except Exception:
-            return await interaction.followup.send(f"Spins must be between 1 and {SLOTS_MAX_SPINS}.", ephemeral=True)
+            return await interaction.followup.send("Enter a valid number of spins (1–5).", ephemeral=True)
+    
         if n < 1 or n > SLOTS_MAX_SPINS:
-            return await interaction.followup.send("Enter a valid number of spins.", ephemeral=True)
-
+            return await interaction.followup.send(
+                f"Spins must be between 1 and {SLOTS_MAX_SPINS}.",
+                ephemeral=True
             )
-
+    
         uid = str(interaction.user.id)
         ensure_user(uid)
-
+    
         total_cost = SLOTS_COST * n
         bal = get_balance(uid)
         if bal < total_cost:
