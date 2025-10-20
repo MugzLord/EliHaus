@@ -2428,51 +2428,51 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
             pass
 
 
-    # --- results & output ---
-    try:
-        # EPHEMERAL SUMMARY
-        show = 6
-        body = "\n".join(lines[:show]) + (f"\n.. and {len(lines)-show} more." if len(lines) > show else "")
-        await interaction.followup.send(
-            f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
-            ephemeral=True
-        )
-        sent = True
-    
-        # PUBLIC attachment (optional)
-        import io, time
-        details = []
-        details.append(f"User: {interaction.user} ({interaction.user.id})")
-        details.append(f"Spins: {n}")
-        details.extend(lines)
-        details.append("")
-        details.append(f"Total won: {total_win}")
-        details.append(f"Pot now: {get_slots_pot(self.channel_id)}")
-        txt = "\n".join(details)
-    
-        buf = io.BytesIO(txt.encode("utf-8"))
-        filename = f"slots_{interaction.user.id}_{int(time.time())}.txt"
-        file = discord.File(buf, filename=filename)
-    
-        public_summary = (
-            f"{interaction.user.mention} spun **{n}x** • "
-            f"{'+'+str(total_win) if total_win else 'no win'} • "
-            f"Pot **{get_slots_pot(self.channel_id)}**"
-        )
-        await interaction.followup.send(public_summary, file=file)
-    
-    except Exception as e:
-        import traceback
-        print("SLOTS results send error:\n", traceback.format_exc())
-        if not sent:
-            await interaction.followup.send("❌ Something went wrong sending your result.", ephemeral=True)
+        # --- results & output ---
+        try:
+            # EPHEMERAL SUMMARY
+            show = 6
+            body = "\n".join(lines[:show]) + (f"\n.. and {len(lines)-show} more." if len(lines) > show else "")
+            await interaction.followup.send(
+                f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
+                ephemeral=True
+            )
             sent = True
-    finally:
-        if not sent:
-            try:
-                await interaction.followup.send("✅ Done.", ephemeral=True)
-            except Exception:
-                pass
+        
+            # PUBLIC attachment (optional)
+            import io, time
+            details = []
+            details.append(f"User: {interaction.user} ({interaction.user.id})")
+            details.append(f"Spins: {n}")
+            details.extend(lines)
+            details.append("")
+            details.append(f"Total won: {total_win}")
+            details.append(f"Pot now: {get_slots_pot(self.channel_id)}")
+            txt = "\n".join(details)
+        
+            buf = io.BytesIO(txt.encode("utf-8"))
+            filename = f"slots_{interaction.user.id}_{int(time.time())}.txt"
+            file = discord.File(buf, filename=filename)
+        
+            public_summary = (
+                f"{interaction.user.mention} spun **{n}x** • "
+                f"{'+'+str(total_win) if total_win else 'no win'} • "
+                f"Pot **{get_slots_pot(self.channel_id)}**"
+            )
+            await interaction.followup.send(public_summary, file=file)
+        
+        except Exception as e:
+            import traceback
+            print("SLOTS results send error:\n", traceback.format_exc())
+            if not sent:
+                await interaction.followup.send("❌ Something went wrong sending your result.", ephemeral=True)
+                sent = True
+        finally:
+            if not sent:
+                try:
+                    await interaction.followup.send("✅ Done.", ephemeral=True)
+                except Exception:
+                    pass
 
         
 class SlotsView(discord.ui.View):
