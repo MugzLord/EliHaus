@@ -822,7 +822,7 @@ def _insert_bet(rid: str, channel_id: int, uid: str, choice: str, stake: int):
 
 # ===== Roulette bet limits =====
 ROUL_MIN_BET = int(os.getenv("ROUL_MIN_BET", "100"))
-ROUL_MAX_BET = int(os.getenv("ROUL_MAX_BET", "999999"))
+ROUL_MAX_BET = int(os.getenv("ROUL_MAX_BET", "10000"))
 
 # ===== Bet modals (use ROUL_MIN_BET / ROUL_MAX_BET) =====
 
