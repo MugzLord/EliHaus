@@ -2187,7 +2187,7 @@ def _mention_or_id(guild: discord.Guild | None, uid: str) -> str:
 async def eh_leaderboard(
     interaction: discord.Interaction,
     mode: str = "balance",
-    public: bool = False
+    public: bool = True
 ):
     # prevent 3s timeout
     await interaction.response.defer(ephemeral=not public, thinking=True)
