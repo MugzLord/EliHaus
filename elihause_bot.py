@@ -498,8 +498,8 @@ def _prize_msg_key(prize_id: int) -> str:
 def _prize_ticket_key(prize_id: int) -> str:
     return f"prize_ticket:{prize_id}"
 
-# ---------------- Views & Modals ----------------
-# ---------- Roulette buttons (colored) ----------
+# ------------- Views & Modals -------------
+# --------- Roulette buttons (colored) -----
 class RouletteBetView(discord.ui.View):
     def __init__(self, rid: int, timeout: float | None = None):
         super().__init__(timeout=timeout)
@@ -508,6 +508,16 @@ class RouletteBetView(discord.ui.View):
     # 🔴 RED
     @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger, emoji="🎯", custom_id="eh_roul_red")
     async def bet_red(self, itx: discord.Interaction, _: discord.ui.Button):
+        uid = str(itx.user.id)
+
+        # 👉 1 bet per round
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
+            if c.fetchone():
+                await itx.response.send_message("⚠️ You already placed a bet this spin. Wait for the next wheel.", ephemeral=True)
+                return
+
         try:
             await itx.response.send_modal(RedBetModal(self.rid))
         except Exception as e:
@@ -516,9 +526,19 @@ class RouletteBetView(discord.ui.View):
             else:
                 await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
 
-    # ⬛ BLACK
+    # ⚫ BLACK
     @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="🎯", custom_id="eh_roul_black")
     async def bet_black(self, itx: discord.Interaction, _: discord.ui.Button):
+        uid = str(itx.user.id)
+
+        # 👉 1 bet per round
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
+            if c.fetchone():
+                await itx.response.send_message("⚠️ You already locked in a bet this round.", ephemeral=True)
+                return
+
         try:
             await itx.response.send_modal(BlackBetModal(self.rid))
         except Exception as e:
@@ -527,9 +547,19 @@ class RouletteBetView(discord.ui.View):
             else:
                 await itx.followup.send(f"❌ Failed to open Black bet modal: `{e}`", ephemeral=True)
 
-    # 🟩 GREEN
+    # 💚 GREEN
     @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🎯", custom_id="eh_roul_green")
     async def bet_green(self, itx: discord.Interaction, _: discord.ui.Button):
+        uid = str(itx.user.id)
+
+        # 👉 1 bet per round
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
+            if c.fetchone():
+                await itx.response.send_message("⚠️ Bet already placed. Try next spin, boss.", ephemeral=True)
+                return
+
         try:
             await itx.response.send_modal(GreenBetModal(self.rid))
         except Exception as e:
@@ -538,9 +568,19 @@ class RouletteBetView(discord.ui.View):
             else:
                 await itx.followup.send(f"❌ Failed to open Green bet modal: `{e}`", ephemeral=True)
 
-    # 🎯 NUMBER
+    # 🔢 NUMBER
     @discord.ui.button(label="Bet NUMBER", style=discord.ButtonStyle.secondary, emoji="🎯", custom_id="eh_roul_number")
     async def bet_number(self, itx: discord.Interaction, _: discord.ui.Button):
+        uid = str(itx.user.id)
+
+        # 👉 1 bet per round
+        with db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
+            if c.fetchone():
+                await itx.response.send_message("⚠️ You’ve already got a ticket on this wheel.", ephemeral=True)
+                return
+
         try:
             await itx.response.send_modal(NumberBetModal(self.rid))
         except Exception as e:
@@ -550,7 +590,7 @@ class RouletteBetView(discord.ui.View):
                 await itx.followup.send(f"❌ Failed to open Number bet modal: `{e}`", ephemeral=True)
 
     # ❓ My Bet
-    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="🎯", custom_id="eh_roul_mybet")
+    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="📍", custom_id="eh_roul_mybet")
     async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
         await itx.response.defer(ephemeral=True, thinking=True)
         uid = str(itx.user.id)
@@ -562,7 +602,7 @@ class RouletteBetView(discord.ui.View):
         if not row:
             return await itx.followup.send(f"You have **no bet** this round.\nBalance: **{bal}**", ephemeral=True)
         choice, stake = row
-        await itx.followup.send(f"🎲 Your bet: **{choice}** — **{stake}** coins.\nBalance: **{bal}**", ephemeral=True)
+        await itx.followup.send(f"🧾 Your bet: **{choice}** → **{stake}** coins.\nBalance: **{bal}**", ephemeral=True)
 
 
 class DisabledClaimView(discord.ui.View):
