@@ -855,10 +855,16 @@ def _deduct(uid: str, amount: int):
                   (uid, "bet", -amount, "roulette", iso(now_local())))
 
 def _insert_bet(rid: str, channel_id: int, uid: str, choice: str, stake: int):
+    # take the coins first
+    _deduct(uid, stake)
+
     with db() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
-                  (rid, str(channel_id), uid, choice, stake, iso(now_local())))
+        c.execute(
+            "INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
+            (rid, str(channel_id), uid, choice, stake, iso(now_local()))
+        )
+
 
 # ===== Roulette bet limits =====
 ROUL_MIN_BET = int(os.getenv("ROUL_MIN_BET", "100"))
@@ -1674,8 +1680,8 @@ async def eh_weekly(interaction: discord.Interaction):
 @app_commands.describe(user="(optional) member to check")
 async def eh_balance(interaction: discord.Interaction, user: discord.Member | None = None):
     target = user or interaction.user
-    uid = str(target.id)          # <-- define uid
-    ensure_user(uid)              # <-- keep your helper usage
+    uid = str(target.id)          
+    ensure_user(uid)             
 
     try:
         bal = get_balance(uid)
@@ -1683,7 +1689,7 @@ async def eh_balance(interaction: discord.Interaction, user: discord.Member | No
         import traceback; print("eh_balance error:\n", traceback.format_exc())
         return await interaction.response.send_message("❌ Couldn't fetch balance.", ephemeral=True)
 
-    # self check = ephemeral, other = public (tweak if you want all ephemeral)
+    # self check = ephemeral
     if user is None:
         await interaction.response.send_message(f"💰 Your balance: **{bal}** coins.", ephemeral=True)
     else:
@@ -1734,7 +1740,6 @@ async def eh_balance(interaction: discord.Interaction, user: discord.Member | No
         f"Balance: **{bal} ➜ {new_bal}**",
         ephemeral=True
     )
-
     
 def _result_color(outcome: str) -> discord.Colour:
     m = {"red": (220, 38, 38), "black": (24, 24, 27), "green": (16, 185, 129)}
@@ -1757,10 +1762,10 @@ def build_roulette_result_embed(*, rlabel: str, outcome: str, roll: int,
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(seconds="Betting window (10–600s)")
 async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SECONDS_DEFAULT):
-    await safe_ack(interaction, ephemeral=True)  # <<< immediate ack to avoid timeout
+    await safe_ack(interaction, ephemeral=True)  
 
     try:
-        # --- your existing permission checks ---
+        # --- existing perm checks ---
         if not user_is_admin(interaction.user):
             return await safe_followup(interaction, "You don’t have permission.", True)
 
@@ -1817,7 +1822,6 @@ async def eh_table(interaction: discord.Interaction):
         f"Round **{ClaimView.get_round_label(rid)}** — Bets: **{cnt}** | Pool: **{pool}** | Time left: **{remain}s**",
         ephemeral=True
     )
-
 
 @bot.event
 async def on_message(message: discord.Message):
