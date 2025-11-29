@@ -20,7 +20,7 @@ try:
 except Exception:
     TZ = timezone.utc
 
-WL_COINS_PER_GIFT = int(os.getenv("WL_COINS_PER_GIFT", "5000"))  # default 10k coins = 1 WL
+WL_COINS_PER_GIFT = int(os.getenv("WL_COINS_PER_GIFT", "15000"))  # default 10k coins = 1 WL
 MIN_WL_GIFTS = int(os.getenv("MIN_WL_GIFTS", "1"))
 MAX_WL_GIFTS = int(os.getenv("MAX_WL_GIFTS", "40"))
 ROULETTE_STATE = {"resolved": False}
