@@ -341,33 +341,6 @@ async def safe_followup(interaction: discord.Interaction, content: str, ephemera
             await interaction.response.send_message(content, ephemeral=ephemeral)
     except Exception:
         pass
-
-# -------- EliHaus config (shop / lotto / policy) --------
-CONFIG_STATE_KEY = "cfg:elihause"
-
-WEEKDAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-
-def get_config() -> dict:
-    """Load config from state, falling back to defaults from constants."""
-    base = {
-        "shop_name": SHOP_NAME,
-        "shop_url": SHOP_YAELI_URL,
-        "lotto_wl": LOTTO_WL_COUNT,
-        "lotto_winners": LOTTO_WINNERS,
-        "draw_weekday": 5,   # 0=Mon ... 5=Sat
-        "draw_hour": 20,     # 20:00
-    }
-    raw = get_state(CONFIG_STATE_KEY)
-    if raw:
-        try:
-            base.update(json.loads(raw))
-        except Exception:
-            pass
-    return base
-
-def save_config(cfg: dict) -> None:
-    set_state(CONFIG_STATE_KEY, json.dumps(cfg))
-
 # ---------- Roulette badge rendering ----------
 from io import BytesIO
 
@@ -377,18 +350,6 @@ CHIP_ASSETS = {
     "BLACK":  str(ASSETS_DIR / "chip_black.png"),
     "GREEN":  str(ASSETS_DIR / "chip_green.png"),
 }
-
-# --- Policy helper (uses DB override if present) ---
-POLICY_STATE_KEY = "policy:text"
-
-def get_policy_text() -> str:
-    """
-    Returns the current policy text.
-    If a custom one is stored in the state table, use that.
-    Otherwise fall back to the original POLICY_TEXT constant.
-    """
-    override = get_state(POLICY_STATE_KEY)
-    return override or POLICY_TEXT
 
 def roulette_color_from_number(n: int) -> str:
     red = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -812,16 +773,13 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
         staff_tag = f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"
         profile_line = f"[{uname}]({profile_url})" if profile_url else uname
         wishlist_line = f"[Open Wishlist]({wishlist_url})" if wishlist_url else "—"
-        
-        policy_text = get_policy_text()
 
         # --- announce + staff tag in the TICKET channel
         await ticket.send(
             f"{staff_tag} New WL claim for {interaction.user.mention}\n"
             f"**IMVU:** {profile_line}\n"
             f"**Wishlist:** {wishlist_line}\n"
-            f"**Notes:** {self.note or '—'}\n"
-            f"{policy_text}"
+            f"**Notes:** {self.note or '—'}"
         )
 
         
@@ -1715,82 +1673,19 @@ async def eh_help(interaction: discord.Interaction):
         "",
         "🎁 **Prizes / WL**",
         "`/eh_withdraw` – request WL gifts using your coins",
-        "`/eh_policy` – view EliHaus prize / claim policy",
         "`/eh_leaderboard` – view top balances / roulette net",
     ]
 
     admin_lines = [
         "🎛️ **Admin only**",
         "`/eh_openround` – open roulette round",
-
+        "`/eh_lotto_config` – configure weekly lotto draw (day / time / prize / shop)",
         "`/eh_drawlotto` – draw weekly lotto winner",
         "`/slots_open` – open Slots panel in this channel",
-        "`/eh_policy_edit` – edit policy shop / min items",
         "`/eh_deposit` – owner-only manual coin deposit",
         # keep /eh_sync available but not advertised unless you want it:
         # "`/eh_sync` – re-sync slash commands (debug)",
     ]
-
-    embed = discord.Embed(
-        title="EliHaus Commands",
-        colour=discord.Colour.gold(),
-    )
-
-    embed.add_field(
-        name="Public",
-        value="\n".join(public_lines),
-        inline=False,
-    )
-
-    if is_admin:
-        embed.add_field(
-            name="Admin",
-            value="\n".join(admin_lines),
-            inline=False,
-        )
-
-    embed.set_footer(text="Use /eh_policy to read how prizes & WL claims work.")
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ---- Lotto config (simple state-based) ----
-DEFAULT_LOTTO_DAY       = "Saturday"
-DEFAULT_LOTTO_TIME      = "20:00"          # 24h
-DEFAULT_LOTTO_GIFTS     = LOTTO_WL_COUNT   # default 10
-DEFAULT_LOTTO_WINNERS   = LOTTO_WINNERS    # default 1
-DEFAULT_LOTTO_SHOP_NAME = SHOP_NAME
-DEFAULT_LOTTO_SHOP_URL  = SHOP_YAELI_URL
-
-def get_lotto_config() -> dict:
-    """Read current lotto settings from state table, fallback to defaults."""
-    day       = get_state("lotto:day")        or DEFAULT_LOTTO_DAY
-    time_str  = get_state("lotto:time")       or DEFAULT_LOTTO_TIME
-    gifts     = get_state("lotto:gifts")      or str(DEFAULT_LOTTO_GIFTS)
-    winners   = get_state("lotto:winners")    or str(DEFAULT_LOTTO_WINNERS)
-    shop_name = get_state("lotto:shop_name")  or DEFAULT_LOTTO_SHOP_NAME
-    shop_url  = get_state("lotto:shop_url")   or DEFAULT_LOTTO_SHOP_URL
-
-    try:
-        gifts_i = int(gifts)
-    except Exception:
-        gifts_i = DEFAULT_LOTTO_GIFTS
-    try:
-        winners_i = int(winners)
-    except Exception:
-        winners_i = DEFAULT_LOTTO_WINNERS
-
-    return {
-        "day": day,
-        "time": time_str,
-        "gifts": gifts_i,
-        "winners": winners_i,
-        "shop_name": shop_name,
-        "shop_url": shop_url,
-    }
-
-def set_lotto_field(key: str, value: str):
-    """Small helper to write one field."""
-    set_state(f"lotto:{key}", str(value))
 
 # ========= Roulette single-card helpers =========
 import asyncio
@@ -2035,26 +1930,7 @@ async def tick_round(channel, rid: int, exp_iso: str):
         except Exception:
             pass
 
-@bot.tree.command(name="eh_policy", description="Show the EliHaus prize / claim policy")
-@app_commands.describe(public="Post in channel (True) or only to you (False)")
-async def eh_policy(interaction: discord.Interaction, public: bool = False):
-    cfg = get_lotto_config()
 
-    desc = (
-        f"**Policy:** To claim your winnings, you must have **10 items** added from "
-        f"**[{cfg['shop_name']}]({cfg['shop_url']})**. Failure to comply is subject to **disqualification**.\n\n"
-        f"**Weekly Lotto:** Draw every **{cfg['day']}** at **{cfg['time']}**.\n"
-        f"Prize: **{cfg['gifts']} WL gifts** from **{cfg['shop_name']}** "
-        f"to **{cfg['winners']} winner(s)**."
-    )
-
-    e = discord.Embed(
-        title="📜 EliHaus Policy",
-        description=desc,
-        color=discord.Color.gold()
-    )
-    await interaction.response.send_message(embed=e, ephemeral=not public)
-    
 @bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
 async def eh_join(interaction: discord.Interaction):
     await safe_ack(interaction, ephemeral=True)  # prevents "The application did not respond"
@@ -2656,7 +2532,6 @@ LOTTO_WL_COUNT  = 10              # default WL gifts if no config saved yet
 SHOP_NAME       = "Shop YaEli"
 
 LOTTO_CONFIG_KEY = "lotto_config"
-
 
 def _lotto_defaults() -> dict:
     return {
