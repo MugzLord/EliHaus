@@ -381,25 +381,18 @@ def now_london() -> datetime:
     return datetime.now(LONDON_TZ)
 
 def next_draw_dt(ref: datetime | None = None) -> datetime:
-    """
-    Next configured lotto draw date/time in your main TIMEZONE.
-    Uses DB overrides if present.
-    """
-    ref = ref or now_local()
-    s = get_settings()
-    target_wd = s["draw_dow"]
+    """Next configured draw (weekday/hour) in London time."""
+    ref = ref or now_london()
+    cfg = get_config()
+    target_wd = int(cfg.get("draw_weekday", 5))  # 0=Mon
+    hour = int(cfg.get("draw_hour", 20))
 
     days_ahead = (target_wd - ref.weekday()) % 7
-    candidate = ref.replace(
-        hour=s["draw_hour"],
-        minute=s["draw_min"],
-        second=0,
-        microsecond=0,
-    ) + timedelta(days=days_ahead)
-
+    candidate = (ref + timedelta(days=days_ahead)).replace(
+        hour=hour, minute=0, second=0, microsecond=0
+    )
     if candidate <= ref:
         candidate += timedelta(days=7)
-
     return candidate
 
 def human_left(dt: datetime, ref: datetime | None = None) -> str:
@@ -472,6 +465,32 @@ async def safe_followup(interaction: discord.Interaction, content: str, ephemera
             await interaction.response.send_message(content, ephemeral=ephemeral)
     except Exception:
         pass
+
+# -------- EliHaus config (shop / lotto / policy) --------
+CONFIG_STATE_KEY = "cfg:elihause"
+
+WEEKDAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+def get_config() -> dict:
+    """Load config from state, falling back to defaults from constants."""
+    base = {
+        "shop_name": SHOP_NAME,
+        "shop_url": SHOP_YAELI_URL,
+        "lotto_wl": LOTTO_WL_COUNT,
+        "lotto_winners": LOTTO_WINNERS,
+        "draw_weekday": 5,   # 0=Mon ... 5=Sat
+        "draw_hour": 20,     # 20:00
+    }
+    raw = get_state(CONFIG_STATE_KEY)
+    if raw:
+        try:
+            base.update(json.loads(raw))
+        except Exception:
+            pass
+    return base
+
+def save_config(cfg: dict) -> None:
+    set_state(CONFIG_STATE_KEY, json.dumps(cfg))
 
 # ---------- Roulette badge rendering ----------
 from io import BytesIO
@@ -2983,17 +3002,30 @@ async def eh_leaderboard(
             ephemeral=True
         )
 
-@bot.tree.command(name="eh_policy", description="Show the EliHaus prize/claim policy")
-@app_commands.describe(public="Post in channel (True) or show only to you (False)")
+def get_policy_text() -> str:
+    cfg = get_config()
+    wd = int(cfg.get("draw_weekday", 5)) % 7
+    hour = int(cfg.get("draw_hour", 20))
+    day_name = WEEKDAY_NAMES[wd]
+
+    return (
+        f"**Policy:** To claim your winnings, you must have **10 items** added from "
+        f"**[{cfg['shop_name']}]({cfg['shop_url']})**. Failure to comply is subject to "
+        f"**disqualification**.\n\n"
+        f"**Weekly Lotto:** Draw every **{day_name}** at **{hour:02d}:00**. "
+        f"Prize: **{cfg['lotto_wl']} WL gifts** from **{cfg['shop_name']}** "
+        f"to **{cfg['lotto_winners']}** winner(s)."
+    )
+
+@bot.tree.command(name="eh_policy", description="Show the EliHaus prize / claim policy")
+@app_commands.describe(public="Post in channel (True) or only to you (False)")
 async def eh_policy(interaction: discord.Interaction, public: bool = False):
-    text = get_policy_text()
     e = discord.Embed(
         title="📜 EliHaus Policy",
-        description=text,
+        description=get_policy_text(),
         color=discord.Color.gold()
     )
     await interaction.response.send_message(embed=e, ephemeral=not public)
-
 
 # =========================
 # 🎰 Emoji Slots (Shared Pot) — FULL ADD-ON
@@ -3065,6 +3097,84 @@ def set_slots_pot(channel_id: int, pot: int):
     # Pot can never fall below the configured seed
     set_state(_slots_pot_key(channel_id), str(max(pot, SLOTS_SEED)))
 
+class PolicySettingsModal(discord.ui.Modal, title="Edit EliHaus settings"):
+    shop_name = discord.ui.TextInput(label="Shop name", max_length=100)
+    shop_url = discord.ui.TextInput(label="Shop URL", max_length=200)
+    lotto_wl = discord.ui.TextInput(label="Lotto prize (WL gifts)", max_length=5)
+    lotto_winners = discord.ui.TextInput(label="Number of winners", max_length=3)
+    draw_weekday = discord.ui.TextInput(
+        label="Draw weekday (name or 0-6)",
+        placeholder="Saturday or 5",
+        max_length=10
+    )
+    draw_hour = discord.ui.TextInput(
+        label="Draw hour (0–23)",
+        placeholder="20",
+        max_length=2
+    )
+
+    def __init__(self):
+        super().__init__(timeout=300)
+        cfg = get_config()
+        # pre-fill with current values
+        self.shop_name.default = cfg["shop_name"]
+        self.shop_url.default = cfg["shop_url"]
+        self.lotto_wl.default = str(cfg["lotto_wl"])
+        self.lotto_winners.default = str(cfg["lotto_winners"])
+        self.draw_weekday.default = WEEKDAY_NAMES[cfg["draw_weekday"]]
+        self.draw_hour.default = str(cfg["draw_hour"])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not user_is_admin(interaction.user):
+            return await interaction.response.send_message(
+                "You don’t have permission to edit settings.",
+                ephemeral=True
+            )
+
+        cfg = get_config()
+
+        # shop
+        cfg["shop_name"] = str(self.shop_name).strip() or cfg["shop_name"]
+        cfg["shop_url"] = str(self.shop_url).strip() or cfg["shop_url"]
+
+        # prize numbers
+        try:
+            cfg["lotto_wl"] = max(1, int(str(self.lotto_wl).strip()))
+        except Exception:
+            pass
+        try:
+            cfg["lotto_winners"] = max(1, int(str(self.lotto_winners).strip()))
+        except Exception:
+            pass
+
+        # weekday: allow "Saturday" or "5"
+        wd_raw = str(self.draw_weekday).strip()
+        wd = cfg["draw_weekday"]
+        if wd_raw:
+            lower = wd_raw.lower()
+            if lower.isdigit():
+                wd = max(0, min(6, int(lower)))
+            else:
+                for i, name in enumerate(WEEKDAY_NAMES):
+                    if name.lower().startswith(lower[:3]):
+                        wd = i
+                        break
+        cfg["draw_weekday"] = wd
+
+        # hour
+        try:
+            h = int(str(self.draw_hour).strip())
+            if 0 <= h <= 23:
+                cfg["draw_hour"] = h
+        except Exception:
+            pass
+
+        save_config(cfg)
+
+        await interaction.response.send_message(
+            "✅ EliHaus shop / lotto / policy settings updated.",
+            ephemeral=True
+        )
     
 
 # ---- UI: Modal + View ----
@@ -3483,17 +3593,13 @@ def _init_withdraw_tables():
         c.execute("CREATE INDEX IF NOT EXISTS idx_withdraw_user_status ON withdraw_requests(discord_id, status)")
 _init_withdraw_tables()
 
-@bot.tree.command(name="eh_policy_edit", description="(admin) Edit policy text / shop mention")
+@bot.tree.command(name="eh_policy_edit", description="(admin) Edit shop / lotto / policy settings")
+@app_commands.default_permissions(manage_guild=True)
 async def eh_policy_edit(interaction: discord.Interaction):
     if not user_is_admin(interaction.user):
-        return await interaction.response.send_message(
-            "You don’t have permission to edit the policy.",
-            ephemeral=True
-        )
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+    await interaction.response.send_modal(PolicySettingsModal())
 
-    current = get_policy_text()
-    modal = PolicyEditModal(current_text=current)
-    await interaction.response.send_modal(modal)
 
 # --- Slash: open withdraw modal ---
 @bot.tree.command(name="eh_withdraw", description="Convert your coins to WL gifts (opens a ticket; admin approval)")
