@@ -53,9 +53,10 @@ WEEKLY_AMOUNT = 6_000
 STARTER_AMOUNT = 5_000
 
 # Lotto draw schedule (0=Mon .. 6=Sun), default Saturday 20:00 in TIMEZONE_NAME
-LOTTO_DRAW_DOW     = int(os.getenv("LOTTO_DRAW_DOW", "5"))   # 5 = Saturday
-LOTTO_DRAW_HOUR    = int(os.getenv("LOTTO_DRAW_HOUR", "20")) # 20:00
-LOTTO_DRAW_MINUTE  = int(os.getenv("LOTTO_DRAW_MINUTE", "0"))
+LOTTO_DRAW_DOW    = int(os.getenv("LOTTO_DRAW_DOW", "5"))   # 5 = Saturday
+LOTTO_DRAW_HOUR   = int(os.getenv("LOTTO_DRAW_HOUR", "20")) # 20:00
+LOTTO_DRAW_MINUTE = int(os.getenv("LOTTO_DRAW_MINUTE", "0"))
+
 
 # Lotto
 TICKET_COST = 10_000
@@ -78,6 +79,80 @@ POLICY_TEXT = os.getenv("ELIHAUS_POLICY", DEFAULT_POLICY_TEXT)
 import json
 
 POLICY_STATE_KEY = "policy_config"
+# --- Policy / lotto settings in DB (override env + defaults) ---
+POLICY_SHOP_NAME_KEY   = "policy:shop_name"
+POLICY_SHOP_URL_KEY    = "policy:shop_url"
+POLICY_MIN_ITEMS_KEY   = "policy:min_items"
+
+LOTTO_WL_COUNT_KEY     = "lotto:wl_count"
+LOTTO_WINNERS_KEY      = "lotto:winners"
+LOTTO_DRAW_DOW_KEY     = "lotto:draw_dow"
+LOTTO_DRAW_HOUR_KEY    = "lotto:draw_hour"
+LOTTO_DRAW_MIN_KEY     = "lotto:draw_minute"
+
+def get_settings():
+    """Return all policy/lotto settings with DB overrides if present."""
+    shop_name = get_state(POLICY_SHOP_NAME_KEY) or SHOP_NAME
+    shop_url  = get_state(POLICY_SHOP_URL_KEY)  or SHOP_YAELI_URL
+    try:
+        min_items = int(get_state(POLICY_MIN_ITEMS_KEY) or "10")
+    except ValueError:
+        min_items = 10
+
+    try:
+        lotto_wl = int(get_state(LOTTO_WL_COUNT_KEY) or str(LOTTO_WL_COUNT))
+    except ValueError:
+        lotto_wl = LOTTO_WL_COUNT
+
+    try:
+        lotto_winners = int(get_state(LOTTO_WINNERS_KEY) or str(LOTTO_WINNERS))
+    except ValueError:
+        lotto_winners = LOTTO_WINNERS
+
+    try:
+        draw_dow = int(get_state(LOTTO_DRAW_DOW_KEY) or str(LOTTO_DRAW_DOW))
+    except ValueError:
+        draw_dow = LOTTO_DRAW_DOW
+
+    try:
+        draw_hour = int(get_state(LOTTO_DRAW_HOUR_KEY) or str(LOTTO_DRAW_HOUR))
+    except ValueError:
+        draw_hour = LOTTO_DRAW_HOUR
+
+    try:
+        draw_min = int(get_state(LOTTO_DRAW_MIN_KEY) or str(LOTTO_DRAW_MINUTE))
+    except ValueError:
+        draw_min = LOTTO_DRAW_MINUTE
+
+    return {
+        "shop_name": shop_name,
+        "shop_url": shop_url,
+        "min_items": min_items,
+        "lotto_wl": lotto_wl,
+        "lotto_winners": lotto_winners,
+        "draw_dow": draw_dow,
+        "draw_hour": draw_hour,
+        "draw_min": draw_min,
+    }
+
+
+DAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+def get_policy_text() -> str:
+    """Build the policy text from the current structured settings."""
+    s = get_settings()
+    day_name = DAY_NAMES[s["draw_dow"] % 7]
+    # uses your main TZ
+    tz_label = now_local().strftime("%Z") or TIMEZONE_NAME
+
+    return (
+        f"**Policy:** To claim your winnings, you must have **{s['min_items']} items** added from "
+        f"**[{s['shop_name']}]({s['shop_url']})**.\n\n"
+        f"• Lotto prize: **{s['lotto_wl']} WL gifts** shared between **{s['lotto_winners']}** winner(s).\n"
+        f"• Draw every **{day_name} at {s['draw_hour']:02d}:{s['draw_min']:02d} {tz_label}**.\n\n"
+        f"Failure to comply is subject to **disqualification**."
+    )
+
 
 def get_policy_config() -> dict:
     """
@@ -308,26 +383,25 @@ def now_london() -> datetime:
 def next_draw_dt(ref: datetime | None = None) -> datetime:
     """
     Next configured lotto draw date/time in your main TIMEZONE.
-    LOTTO_DRAW_DOW: 0=Mon .. 6=Sun
+    Uses DB overrides if present.
     """
-    ref = ref or now_local()  # uses TZ from TIMEZONE_NAME
+    ref = ref or now_local()
+    s = get_settings()
+    target_wd = s["draw_dow"]
 
-    target_wd = LOTTO_DRAW_DOW
     days_ahead = (target_wd - ref.weekday()) % 7
-
-    # start from today's date at draw time, then add days_ahead
     candidate = ref.replace(
-        hour=LOTTO_DRAW_HOUR,
-        minute=LOTTO_DRAW_MINUTE,
+        hour=s["draw_hour"],
+        minute=s["draw_min"],
         second=0,
         microsecond=0,
     ) + timedelta(days=days_ahead)
 
-    # if that time already passed today, jump a week ahead
     if candidate <= ref:
         candidate += timedelta(days=7)
 
     return candidate
+
 def human_left(dt: datetime, ref: datetime | None = None) -> str:
     ref = ref or now_local()
     secs = max(0, int((dt - ref).total_seconds()))
@@ -2661,6 +2735,36 @@ async def eh_buyticket(interaction: discord.Interaction, count: int = 1):
         f"Balance: **{bal} ➜ {new_bal}**",
         ephemeral=True
     )
+
+@bot.tree.command(name="eh_lotto", description="Show weekly lotto status")
+async def eh_lotto(interaction: discord.Interaction):
+    wk = week_id()
+    uid = str(interaction.user.id)
+
+    # when is the next configured draw
+    draw_dt = next_draw_dt()
+    draw_str = draw_dt.strftime("%a %d %b %Y • %I:%M %p %Z")
+    left = human_left(draw_dt)
+
+    # how many tickets exist / you own
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=?", (wk,))
+        total = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=? AND discord_id=?", (wk, uid))
+        mine = c.fetchone()[0] or 0
+
+    s = get_settings()  # shop, prize, winners, schedule
+
+    await interaction.response.send_message(
+        f"🎟️ **Weekly Lotto** — Week {wk}\n"
+        f"Draw: **{draw_str}** _(in {left})_\n"
+        f"Total tickets: **{total}** • Your tickets: **{mine}**\n"
+        f"Prize: **{s['lotto_wl']} WL gifts** from **{s['shop_name']}** "
+        f"to **{s['lotto_winners']}** winner(s).",
+        ephemeral=True
+    )
+
 
 @bot.tree.command(name="eh_drawlotto", description="(Admin) Draw this week’s lotto")
 @app_commands.default_permissions(manage_guild=True)
