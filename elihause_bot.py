@@ -1708,7 +1708,6 @@ async def eh_help(interaction: discord.Interaction):
 
         "",
         "🎰 **Games**",
-        "`/eh_table` – current roulette round status",
         "`/eh_buyticket` – buy lotto tickets",
         "`/eh_lotto` – see lotto status",
         "`/eh_dice_duel` – 1v1 dice duel (stake coins vs someone)",
