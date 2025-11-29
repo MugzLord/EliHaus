@@ -2736,7 +2736,6 @@ class LottoConfigModal(discord.ui.Modal, title="Configure Weekly Lotto"):
             ephemeral=True
         )
 
-
 @bot.tree.command(name="eh_lotto_config", description="(admin) Configure lotto draw day/time & prize")
 @app_commands.default_permissions(manage_guild=True)
 async def eh_lotto_config(interaction: discord.Interaction):
@@ -3052,112 +3051,6 @@ def edit_round_message(bot, channel, rid: int, embed, view=None):
     """Safe from non-async code: schedules the edit on the loop."""
     return asyncio.create_task(_edit_round_message(bot, channel, rid, embed, view))
 
-def set_slots_pot(channel_id: int, pot: int):
-    # Pot can never fall below the configured seed
-    set_state(_slots_pot_key(channel_id), str(max(pot, SLOTS_SEED)))
-
-class LottoConfigModal(discord.ui.Modal, title="Configure Weekly Lotto"):
-    draw_day = discord.ui.TextInput(
-        label="Draw day (e.g. Saturday)",
-        max_length=12,
-        required=True,
-    )
-    draw_time = discord.ui.TextInput(
-        label="Draw time (HH:MM, 24h)",
-        placeholder="20:00",
-        max_length=5,
-        required=True,
-    )
-    gifts = discord.ui.TextInput(
-        label="WL gifts (per draw)",
-        placeholder="10",
-        max_length=4,
-        required=True,
-    )
-    winners = discord.ui.TextInput(
-        label="Number of winners",
-        placeholder="1",
-        max_length=3,
-        required=True,
-    )
-    shop_name = discord.ui.TextInput(
-        label="Shop name",
-        placeholder="Shop YaEli",
-        max_length=100,
-        required=True,
-    )
-    shop_url = discord.ui.TextInput(
-        label="Shop URL",
-        placeholder="https://www.imvu.com/…",
-        max_length=200,
-        required=False,
-    )
-
-    def __init__(self):
-        cfg = get_lotto_config()
-        super().__init__(timeout=300)
-
-        # pre-fill with current values
-        self.draw_day.default = cfg["day"]
-        self.draw_time.default = cfg["time"]
-        self.gifts.default = str(cfg["gifts"])
-        self.winners.default = str(cfg["winners"])
-        self.shop_name.default = cfg["shop_name"]
-        self.shop_url.default = cfg["shop_url"]
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message(
-                "You don’t have permission to configure the lotto.", ephemeral=True
-            )
-
-        # validate time
-        t_str = str(self.draw_time.value).strip()
-        try:
-            h_str, m_str = t_str.split(":")
-            hh = int(h_str)
-            mm = int(m_str)
-            if not (0 <= hh <= 23 and 0 <= mm <= 59):
-                raise ValueError
-        except Exception:
-            return await interaction.response.send_message(
-                "Time must be in **HH:MM** 24-hour format, e.g. `20:00`.",
-                ephemeral=True,
-            )
-
-        # validate ints
-        try:
-            gifts_i = int(str(self.gifts.value).strip())
-            winners_i = int(str(self.winners.value).strip())
-        except Exception:
-            return await interaction.response.send_message(
-                "Gifts and winners must be numbers.", ephemeral=True
-            )
-        if gifts_i <= 0 or winners_i <= 0:
-            return await interaction.response.send_message(
-                "Gifts and winners must be positive.", ephemeral=True
-            )
-
-        # save
-        set_lotto_field("day", self.draw_day.value.strip())
-        set_lotto_field("time", t_str)
-        set_lotto_field("gifts", str(gifts_i))
-        set_lotto_field("winners", str(winners_i))
-        set_lotto_field("shop_name", self.shop_name.value.strip())
-        if self.shop_url.value:
-            set_lotto_field("shop_url", self.shop_url.value.strip())
-
-        await interaction.response.send_message(
-            "✅ Lotto settings updated.", ephemeral=True
-        )
-
-
-@bot.tree.command(name="eh_lotto_config", description="(admin) Configure weekly lotto settings")
-@app_commands.default_permissions(manage_guild=True)
-async def eh_lotto_config(interaction: discord.Interaction):
-    if not _is_admin_member(interaction.guild, interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    await interaction.response.send_modal(LottoConfigModal())
 
 # ---- UI: Modal + View ----
 class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
