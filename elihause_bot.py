@@ -2142,6 +2142,14 @@ def build_roulette_result_embed(*, rlabel: str, outcome: str, roll: int,
     opponent="Who you want to duel",
     stake="Coins each player stakes (both pay this amount)"
 )
+@bot.tree.command(
+    name="eh_dice_duel",
+    description="Challenge someone to a dice duel (both stake coins)"
+)
+@app_commands.describe(
+    opponent="Person you want to challenge",
+    stake="Coins each player bets"
+)
 async def eh_dice_duel(
     interaction: discord.Interaction,
     opponent: discord.Member,
@@ -2149,119 +2157,199 @@ async def eh_dice_duel(
 ):
     challenger = interaction.user
 
-    # basic checks
     if opponent.bot:
         return await interaction.response.send_message(
-            "You can’t duel a bot, love.",
+            "You can’t duel a bot, babe.",
             ephemeral=True
         )
     if opponent.id == challenger.id:
         return await interaction.response.send_message(
-            "You can’t duel yourself. Go play roulette for that.",
+            "You can’t duel yourself. Go play Slots instead.",
             ephemeral=True
         )
+
     if stake <= 0:
         return await interaction.response.send_message(
             "Stake must be a positive number of coins.",
             ephemeral=True
         )
 
-    uid_chal = str(challenger.id)
-    uid_opp  = str(opponent.id)
+    chal_id = str(challenger.id)
+    opp_id = str(opponent.id)
+    ensure_user(chal_id)
+    ensure_user(opp_id)
 
-    ensure_user(uid_chal)
-    ensure_user(uid_opp)
+    chal_bal = get_balance(chal_id)
+    opp_bal = get_balance(opp_id)
 
-    bal_chal = get_balance(uid_chal)
-    bal_opp  = get_balance(uid_opp)
-
-    if bal_chal < stake:
+    if chal_bal < stake:
         return await interaction.response.send_message(
-            f"You don’t have enough coins. Need **{stake}**, you have **{bal_chal}**.",
-            ephemeral=True
-        )
-    if bal_opp < stake:
-        return await interaction.response.send_message(
-            f"{opponent.mention} doesn’t have enough coins to play.",
+            f"You only have **{chal_bal}** coins. You need **{stake}** to start this duel.",
             ephemeral=True
         )
 
-    # we’re good – charge both first
-    change_balance(
-        uid_chal,
-        -stake,
-        "bet",
-        meta=f"dice_duel:vs:{uid_opp}"
-    )
-    change_balance(
-        uid_opp,
-        -stake,
-        "bet",
-        meta=f"dice_duel:vs:{uid_chal}"
-    )
+    if opp_bal < stake:
+        return await interaction.response.send_message(
+            f"{opponent.mention} doesn’t have enough coins for that stake.",
+            ephemeral=True
+        )
 
-    # roll dice
-    roll_chal = random.randint(1, 6)
-    roll_opp  = random.randint(1, 6)
-
-    # decide outcome
-    desc_lines = [
-        f"{challenger.mention} rolled **{roll_chal}** 🎲",
-        f"{opponent.mention} rolled **{roll_opp}** 🎲",
-        ""
-    ]
-
-    if roll_chal > roll_opp:
-        # challenger wins full pot (2 x stake)
-        pot = 2 * stake
-        change_balance(
-            uid_chal,
-            pot,
-            "payout",
-            meta=f"dice_duel_win:vs:{uid_opp}"
-        )
-        desc_lines.append(
-            f"🏆 **{challenger.mention} wins** the pot of **{pot}** coins!"
-        )
-    elif roll_opp > roll_chal:
-        # opponent wins full pot
-        pot = 2 * stake
-        change_balance(
-            uid_opp,
-            pot,
-            "payout",
-            meta=f"dice_duel_win:vs:{uid_chal}"
-        )
-        desc_lines.append(
-            f"🏆 **{opponent.mention} wins** the pot of **{pot}** coins!"
-        )
-    else:
-        # tie – refund stakes
-        change_balance(
-            uid_chal,
-            stake,
-            "payout",
-            meta="dice_duel_refund"
-        )
-        change_balance(
-            uid_opp,
-            stake,
-            "payout",
-            meta="dice_duel_refund"
-        )
-        desc_lines.append(
-            "🤝 It’s a tie – stakes refunded to both players."
-        )
+    # Create the challenge embed + view
+    view = DiceDuelRequestView(challenger, opponent, stake)
 
     embed = discord.Embed(
-        title="🎲 EliHaus Dice Duel",
-        description="\n".join(desc_lines),
+        title="🎲 Dice Duel Challenge",
+        description=(
+            f"{challenger.mention} has challenged {opponent.mention} to a dice duel!\n\n"
+            f"**Stake:** {stake} coins each (pot **{stake * 2}**)\n\n"
+            f"{opponent.mention}, click **Accept duel** below to play, "
+            "or **Decline** to refuse."
+        ),
         colour=discord.Colour.gold(),
         timestamp=now_local()
     )
-    embed.set_footer(text="EliHaus Dice • peer-to-peer")
 
-    await interaction.response.send_message(embed=embed)
+    msg = await interaction.response.send_message(
+        content=opponent.mention,
+        embed=embed,
+        view=view
+    )
+    # store message on the view for timeout edit
+    try:
+        view.message = await interaction.original_response()
+    except Exception:
+        view.message = None
+
+class DiceDuelRequestView(discord.ui.View):
+    def __init__(self, challenger: discord.Member, opponent: discord.Member, stake: int):
+        super().__init__(timeout=120)  # 2 min to respond
+        self.challenger = challenger
+        self.opponent = opponent
+        self.stake = stake
+        self.resolved = False
+
+    async def _end(self, message: discord.Message, content: str | None = None, embed: discord.Embed | None = None):
+        """Helper to disable buttons and optionally edit message."""
+        self.resolved = True
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        try:
+            await message.edit(content=content, embed=embed, view=self)
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Accept duel", style=discord.ButtonStyle.success, emoji="✅")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Only the challenged user can accept
+        if interaction.user.id != self.opponent.id:
+            return await interaction.response.send_message(
+                "Only the challenged player can accept this duel.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # Re-check balances right now (no stale info)
+        chal_id = str(self.challenger.id)
+        opp_id = str(self.opponent.id)
+        ensure_user(chal_id)
+        ensure_user(opp_id)
+
+        chal_bal = get_balance(chal_id)
+        opp_bal = get_balance(opp_id)
+
+        if chal_bal < self.stake or opp_bal < self.stake:
+            note = []
+            if chal_bal < self.stake:
+                note.append(f"{self.challenger.mention} has only **{chal_bal}**.")
+            if opp_bal < self.stake:
+                note.append(f"{self.opponent.mention} has only **{opp_bal}**.")
+            await self._end(
+                interaction.message,
+                content="❌ Duel cancelled. Someone no longer has enough coins.\n" + "\n".join(note)
+            )
+            return
+
+        # Take coins from both
+        pot = self.stake * 2
+        change_balance(chal_id, -self.stake, "bet", meta=f"dice_duel:vs:{opp_id}")
+        change_balance(opp_id, -self.stake, "bet", meta=f"dice_duel:vs:{chal_id}")
+
+        # Roll dice (2d6 each)
+        import random
+        c1, c2 = random.randint(1, 6), random.randint(1, 6)
+        o1, o2 = random.randint(1, 6), random.randint(1, 6)
+        chal_total = c1 + c2
+        opp_total = o1 + o2
+
+        desc_lines = [
+            f"**Stake:** {self.stake} coins each (pot **{pot}**)",
+            "",
+            f"{self.challenger.mention}: 🎲 `{c1} + {c2} = {chal_total}`",
+            f"{self.opponent.mention}: 🎲 `{o1} + {o2} = {opp_total}`",
+            "",
+        ]
+
+        winner_text = ""
+        if chal_total > opp_total:
+            change_balance(chal_id, pot, "payout", meta=f"dice_duel_win:vs:{opp_id}")
+            winner_text = f"🏆 {self.challenger.mention} wins **{pot}** coins!"
+        elif opp_total > chal_total:
+            change_balance(opp_id, pot, "payout", meta=f"dice_duel_win:vs:{chal_id}")
+            winner_text = f"🏆 {self.opponent.mention} wins **{pot}** coins!"
+        else:
+            # tie → refund both
+            change_balance(chal_id, self.stake, "payout", meta="dice_duel_refund")
+            change_balance(opp_id, self.stake, "payout", meta="dice_duel_refund")
+            winner_text = "🤝 It’s a tie! Both players are refunded."
+
+        desc_lines.append(winner_text)
+
+        result_embed = discord.Embed(
+            title="🎲 Dice Duel Result",
+            description="\n".join(desc_lines),
+            colour=discord.Colour.gold(),
+            timestamp=now_local()
+        )
+
+        await self._end(interaction.message, embed=result_embed)
+        # Private confirmation
+        await interaction.followup.send("Duel resolved.", ephemeral=True)
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="🛑")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Only opponent OR challenger can decline
+        if interaction.user.id not in (self.opponent.id, self.challenger.id):
+            return await interaction.response.send_message(
+                "Only the challenger or the challenged player can cancel this duel.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        await self._end(
+            interaction.message,
+            content=f"❌ Dice duel cancelled by {interaction.user.mention}."
+        )
+        await interaction.followup.send("Duel cancelled.", ephemeral=True)
+
+    async def on_timeout(self):
+        if self.resolved:
+            return
+        try:
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    item.disabled = True
+            # best effort edit
+            await self.message.edit(
+                content="⏰ Dice duel request expired (no response).",
+                view=self
+            )
+        except Exception:
+            pass
+
+
 
 @bot.tree.command(name="eh_dice", description="Show the available EliHaus dice games")
 async def eh_dice(interaction: discord.Interaction):
