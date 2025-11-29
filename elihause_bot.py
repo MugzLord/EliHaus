@@ -1,5 +1,3 @@
-# elihause_bot.py — EliHaus (coins + admin roulette + weekly lotto + prize queue) — SLASH ver (eh_*)
-# Requires: pip install -U discord.py
 import os, sqlite3, random, json, traceback
 from datetime import datetime, timedelta, timezone
 
@@ -9,13 +7,11 @@ from discord import app_commands
 from zoneinfo import ZoneInfo  # proper DST (e.g., Europe/London)
 import io, time
 
-
 # ---------------- Config ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN")
 
-# Optional: fast guild sync during development
 GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0"))
 
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/London")
@@ -23,8 +19,7 @@ try:
     TZ = ZoneInfo(TIMEZONE_NAME)
 except Exception:
     TZ = timezone.utc
-# --- Coin → WL conversion (user-initiated withdraw) ---
-# How many coins = 1 WL gift
+
 WL_COINS_PER_GIFT = int(os.getenv("WL_COINS_PER_GIFT", "5000"))  # default 10k coins = 1 WL
 MIN_WL_GIFTS = int(os.getenv("MIN_WL_GIFTS", "1"))
 MAX_WL_GIFTS = int(os.getenv("MAX_WL_GIFTS", "40"))
@@ -39,7 +34,6 @@ INTENTS.members = True
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
-# Admin role (optional): users with Manage Server or this role ID are treated as admins
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
 
 from collections import defaultdict
@@ -848,11 +842,8 @@ def _has_existing_bet(rid: str, uid: str) -> tuple[bool, tuple[str,int] | None]:
     return (r is not None, (r[0], r[1]) if r else None)
 
 def _deduct(uid: str, amount: int):
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (amount, uid))
-        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                  (uid, "bet", -amount, "roulette", iso(now_local())))
+    # Use the central helper so all logging & checks stay consistent
+    change_balance(uid, -amount, "bet", "roulette")
 
 def _insert_bet(rid: str, channel_id: int, uid: str, choice: str, stake: int):
     # take the coins first
@@ -886,22 +877,24 @@ class RedBetModal(discord.ui.Modal, title="Bet: RED"):
             amt = int(str(self.stake).strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
+
         if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
             return await interaction.response.send_message(
                 f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
             )
+
         uid = str(interaction.user.id)
         bal = get_balance(uid)
         if bal < amt:
             return await interaction.response.send_message(
                 f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
             )
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("REPLACE INTO bets(rid, discord_id, choice, stake) VALUES(?, ?, ?, ?)",
-                      (self.rid, uid, "RED", amt))
+
+        # 🔻 DEDUCT + INSERT BET
+        _insert_bet(str(self.rid), interaction.channel.id, uid, "RED", amt)
+
         return await interaction.response.send_message(
-            f"🎯 Bet placed: **RED** — **{amt}** coins.", ephemeral=True
+            f"🟥 Bet placed: **RED** — **{amt}** coins.", ephemeral=True
         )
 
 
@@ -917,24 +910,25 @@ class BlackBetModal(discord.ui.Modal, title="Bet: BLACK"):
             amt = int(str(self.stake).strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
+
         if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
             return await interaction.response.send_message(
                 f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
             )
+
         uid = str(interaction.user.id)
         bal = get_balance(uid)
         if bal < amt:
             return await interaction.response.send_message(
                 f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
             )
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("REPLACE INTO bets(rid, discord_id, choice, stake) VALUES(?, ?, ?, ?)",
-                      (self.rid, uid, "BLACK", amt))
+
+        # 🔻 DEDUCT + INSERT BET
+        _insert_bet(str(self.rid), interaction.channel.id, uid, "BLACK", amt)
+
         return await interaction.response.send_message(
             f"⬛ Bet placed: **BLACK** — **{amt}** coins.", ephemeral=True
         )
-
 
 class GreenBetModal(discord.ui.Modal, title="Bet: GREEN"):
     stake = discord.ui.TextInput(label="Stake (coins)", placeholder="enter amount", required=True, max_length=10)
@@ -948,24 +942,25 @@ class GreenBetModal(discord.ui.Modal, title="Bet: GREEN"):
             amt = int(str(self.stake).strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
+
         if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
             return await interaction.response.send_message(
                 f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
             )
+
         uid = str(interaction.user.id)
         bal = get_balance(uid)
         if bal < amt:
             return await interaction.response.send_message(
                 f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
             )
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("REPLACE INTO bets(rid, discord_id, choice, stake) VALUES(?, ?, ?, ?)",
-                      (self.rid, uid, "GREEN", amt))
+
+        # 🔻 DEDUCT + INSERT BET
+        _insert_bet(str(self.rid), interaction.channel.id, uid, "GREEN", amt)
+
         return await interaction.response.send_message(
             f"🟩 Bet placed: **GREEN** — **{amt}** coins.", ephemeral=True
         )
-
 
 class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
     number = discord.ui.TextInput(label="Number (0–36)", placeholder="e.g., 17", required=True, max_length=2)
@@ -977,26 +972,29 @@ class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            n = int(str(self.number).strip())
+            n   = int(str(self.number).strip())
             amt = int(str(self.stake).strip())
         except Exception:
             return await interaction.response.send_message("Enter valid number and stake.", ephemeral=True)
+
         if not (0 <= n <= 36):
             return await interaction.response.send_message("Number must be between 0 and 36.", ephemeral=True)
+
         if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
             return await interaction.response.send_message(
                 f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
             )
+
         uid = str(interaction.user.id)
         bal = get_balance(uid)
         if bal < amt:
             return await interaction.response.send_message(
                 f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
             )
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("REPLACE INTO bets(rid, discord_id, choice, stake) VALUES(?, ?, ?, ?)",
-                      (self.rid, uid, f"NUM:{n}", amt))
+
+        # 🔻 DEDUCT + INSERT BET
+        _insert_bet(str(self.rid), interaction.channel.id, uid, f"NUM:{n}", amt)
+
         return await interaction.response.send_message(
             f"🎲 Bet placed: **#{n}** — **{amt}** coins.", ephemeral=True
         )
@@ -1245,8 +1243,6 @@ def get_open_or_last_round(channel_id: int):
         except Exception:
             return row[0], now_local()
     return None
-
-
 async def _bump_round_message(channel, rid: str):
     # read latest totals + the old message id
     with db() as conn:
@@ -1263,7 +1259,6 @@ async def _bump_round_message(channel, rid: str):
                      ORDER BY ts DESC LIMIT 10""", (rid,))
         last_rows = c.fetchall()
 
-    # remaining time
     try:
         exp_dt = datetime.fromisoformat(exp_iso)
     except Exception:
@@ -1333,6 +1328,316 @@ def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
                   (uid, kind, delta, meta, iso(now_local())))
         c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
         return c.fetchone()[0]
+
+# Track which channels already have an open dice party
+DICE_PARTY_CHANNELS: set[int] = set()
+
+
+class DicePartyView(discord.ui.View):
+    def __init__(self, host_id: int, stake: int, channel_id: int, max_players: int = 10):
+        super().__init__(timeout=None)
+        self.host_id = host_id
+        self.stake = stake
+        self.channel_id = channel_id
+        self.max_players = max(2, min(max_players, 20))
+        # store user IDs
+        self.players: list[int] = [host_id]
+        self.game_id = f"{channel_id}-{int(now_local().timestamp())}"
+        self.started = False
+
+    def _is_admin(self, member: discord.Member) -> bool:
+        return (
+            getattr(member.guild_permissions, "manage_guild", False)
+            or member.id == getattr(member.guild, "owner_id", 0)
+        )
+
+    def _can_control(self, user: discord.Member) -> bool:
+        return user.id == self.host_id or self._is_admin(user)
+
+    def _player_list_text(self, guild: discord.Guild | None) -> str:
+        if not self.players:
+            return "—"
+        names = []
+        for uid in self.players:
+            m = guild.get_member(uid) if guild else None
+            names.append(m.mention if m else f"<@{uid}>")
+        return "\n".join(f"{i+1}. {name}" for i, name in enumerate(names))
+
+    async def _update_message(self, interaction: discord.Interaction):
+        """Refresh the lobby embed on the original message."""
+        try:
+            msg = interaction.message
+            e = msg.embeds[0] if msg.embeds else discord.Embed(colour=discord.Colour.gold())
+        except Exception:
+            return
+
+        e.title = "🎲 EliHaus Dice Party"
+        e.description = (
+            f"Stake: **{self.stake}** coins per player\n"
+            f"Players: **{len(self.players)}/{self.max_players}**\n\n"
+            "Click **Join** to enter. Host presses **Start** to roll."
+        )
+        e.clear_fields()
+        e.add_field(name="Players", value=self._player_list_text(interaction.guild), inline=False)
+        await msg.edit(embed=e, view=self)
+
+    # --- Buttons ---
+
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.primary, emoji="🙋")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.started:
+            return await interaction.response.send_message(
+                "This party has already started.", ephemeral=True
+            )
+
+        user = interaction.user
+        if user.bot:
+            return await interaction.response.send_message(
+                "Bots can’t join, sorry.", ephemeral=True
+            )
+
+        if user.id in self.players:
+            return await interaction.response.send_message(
+                "You’re already in this dice party.", ephemeral=True
+            )
+
+        if len(self.players) >= self.max_players:
+            return await interaction.response.send_message(
+                f"Party is full (**{self.max_players}** players).", ephemeral=True
+            )
+
+        uid = str(user.id)
+        ensure_user(uid)
+        bal = get_balance(uid)
+        if bal < self.stake:
+            return await interaction.response.send_message(
+                f"You need at least **{self.stake}** coins to join. "
+                f"You currently have **{bal}**.",
+                ephemeral=True
+            )
+
+        self.players.append(user.id)
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        await self._update_message(interaction)
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🚀")
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.started:
+            return await interaction.response.send_message(
+                "This party has already been played.", ephemeral=True
+            )
+
+        if not self._can_control(interaction.user):
+            return await interaction.response.send_message(
+                "Only the host or an admin can start this party.",
+                ephemeral=True
+            )
+
+        if len(self.players) < 2:
+            return await interaction.response.send_message(
+                "Need at least **2** players to start.", ephemeral=True
+            )
+
+        # Re-check balances and drop anyone who can’t afford now
+        valid_players: list[int] = []
+        removed: list[int] = []
+        for uid_int in self.players:
+            uid = str(uid_int)
+            bal = get_balance(uid)
+            if bal >= self.stake:
+                valid_players.append(uid_int)
+            else:
+                removed.append(uid_int)
+
+        self.players = valid_players
+
+        if len(self.players) < 2:
+            # nothing deducted yet, so safe to bail
+            return await interaction.response.send_message(
+                "After balance check there are fewer than 2 eligible players. "
+                "Party cancelled.",
+                ephemeral=True
+            )
+
+        # Lock the game
+        self.started = True
+        DICE_PARTY_CHANNELS.discard(self.channel_id)
+
+        # Deduct stake from all valid players
+        pot = 0
+        for uid_int in self.players:
+            uid = str(uid_int)
+            change_balance(
+                uid,
+                -self.stake,
+                "bet",
+                meta=f"dice_party:{self.game_id}"
+            )
+            pot += self.stake
+
+        # Roll dice
+        rolls: dict[int, int] = {}
+        for uid_int in self.players:
+            rolls[uid_int] = random.randint(1, 6)
+
+        max_roll = max(rolls.values())
+        winners = [uid for uid, r in rolls.items() if r == max_roll]
+
+        # Split pot between winners
+        share = pot // len(winners)
+        leftover = pot - share * len(winners)
+
+        for i, uid_int in enumerate(winners):
+            payout = share + (leftover if i == 0 else 0)
+            uid = str(uid_int)
+            change_balance(
+                uid,
+                payout,
+                "payout",
+                meta=f"dice_party_win:{self.game_id}"
+            )
+
+        # Build result embed
+        lines = []
+        guild = interaction.guild
+        for uid_int, r in rolls.items():
+            m = guild.get_member(uid_int) if guild else None
+            name = m.mention if m else f"<@{uid_int}>"
+            mark = "🏆" if uid_int in winners else " "
+            lines.append(f"{mark} {name} rolled **{r}**")
+
+        desc = "\n".join(lines)
+        if len(winners) == 1:
+            w_member = guild.get_member(winners[0]) if guild else None
+            w_name = w_member.mention if w_member else f"<@{winners[0]}>"
+            result_line = f"\n\n🏆 **{w_name} wins** the pot of **{pot}** coins!"
+        else:
+            winner_mentions = []
+            for uid_int in winners:
+                m = guild.get_member(uid_int) if guild else None
+                winner_mentions.append(m.mention if m else f"<@{uid_int}>")
+            result_line = (
+                f"\n\n🤝 Tie on **{max_roll}**. "
+                f"{', '.join(winner_mentions)} share the pot (**{pot}** total)."
+            )
+
+        embed = discord.Embed(
+            title="🎲 EliHaus Dice Party — Result",
+            description=desc + result_line,
+            colour=discord.Colour.gold(),
+            timestamp=now_local()
+        )
+        embed.add_field(name="Stake per player", value=str(self.stake), inline=True)
+        embed.add_field(name="Players", value=str(len(self.players)), inline=True)
+        embed.add_field(name="Pot", value=str(pot), inline=True)
+        embed.set_footer(text="EliHaus Dice Party")
+
+        # Disable buttons
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+        try:
+            await interaction.response.edit_message(embed=embed, view=self)
+        except discord.InteractionResponded:
+            await interaction.followup.send(embed=embed, ephemeral=False)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="🛑")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.started:
+            return await interaction.response.send_message(
+                "This party has already been played; you can’t cancel it now.",
+                ephemeral=True
+            )
+
+        if not self._can_control(interaction.user):
+            return await interaction.response.send_message(
+                "Only the host or an admin can cancel this party.",
+                ephemeral=True
+            )
+
+        self.started = True
+        DICE_PARTY_CHANNELS.discard(self.channel_id)
+
+        # Disable buttons
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+        try:
+            msg = interaction.message
+            e = msg.embeds[0] if msg.embeds else discord.Embed(colour=discord.Colour.dark_grey())
+            e.title = "🎲 EliHaus Dice Party — Cancelled"
+            e.description = "The host cancelled this dice party. No coins were taken."
+            e.clear_fields()
+            await msg.edit(embed=e, view=self)
+        except Exception:
+            pass
+
+        await interaction.response.send_message("Dice party cancelled.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="eh_dice_party",
+    description="Start a multi-player dice party (everyone stakes coins; highest roll wins)"
+)
+@app_commands.describe(
+    stake="Coins each player must stake",
+    max_players="Max number of players (including you, default 10, max 20)"
+)
+async def eh_dice_party(
+    interaction: discord.Interaction,
+    stake: int,
+    max_players: int = 10
+):
+    if stake <= 0:
+        return await interaction.response.send_message(
+            "Stake must be a positive number of coins.",
+            ephemeral=True
+        )
+
+    ch_id = interaction.channel.id
+    if ch_id in DICE_PARTY_CHANNELS:
+        return await interaction.response.send_message(
+            "There’s already an open dice party in this channel. Finish or cancel it first.",
+            ephemeral=True
+        )
+
+    host = interaction.user
+    uid_host = str(host.id)
+    ensure_user(uid_host)
+    bal_host = get_balance(uid_host)
+    if bal_host < stake:
+        return await interaction.response.send_message(
+            f"You need at least **{stake}** coins to host a party. "
+            f"You currently have **{bal_host}**.",
+            ephemeral=True
+        )
+
+    DICE_PARTY_CHANNELS.add(ch_id)
+
+    view = DicePartyView(
+        host_id=host.id,
+        stake=stake,
+        channel_id=ch_id,
+        max_players=max_players
+    )
+
+    # Initial lobby embed
+    e = discord.Embed(
+        title="🎲 EliHaus Dice Party",
+        description=(
+            f"Stake: **{stake}** coins per player\n"
+            f"Players: **1/{view.max_players}**\n\n"
+            "Click **Join** to enter. Host presses **Start** to roll."
+        ),
+        colour=discord.Colour.gold(),
+        timestamp=now_local()
+    )
+    e.add_field(name="Players", value=host.mention, inline=False)
+    e.set_footer(text="Everyone stakes; highest roll wins the pot.")
+
+    await interaction.response.send_message(embed=e, view=view)
 
 
 # ---- Help (slash) ----
@@ -1694,19 +1999,7 @@ async def eh_balance(interaction: discord.Interaction, user: discord.Member | No
         await interaction.response.send_message(f"💰 Your balance: **{bal}** coins.", ephemeral=True)
     else:
         await interaction.response.send_message(f"💰 {target.mention} balance: **{bal}** coins.")
-
-
-    # deduct immediately (kind = wl_deposit)
-    new_bal = change_balance(uid, -amount, "wl_deposit", meta=f"wl_deposit by user; imvu={imvu}")
-
-    # open (or create) the WL tickets category
-    cat = await _get_or_create_tickets_category(interaction.guild)
-    if not cat:
-        return await interaction.response.send_message(
-            "Could not create a ticket channel. Please ping an admin.",
-            ephemeral=True
-        )
-
+   
     # create a private ticket for this user + staff
     overwrites = {
         interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -1757,6 +2050,134 @@ def build_roulette_result_embed(*, rlabel: str, outcome: str, roll: int,
     e.add_field(name="Winners (top)", value=("• " + "\n• ".join(winners_mentions)) if winners_mentions else "—", inline=False)
     e.set_footer(text=f"Seed: {seed_display}")
     return e
+
+#dice====
+@bot.tree.command(name="eh_dice_duel", description="Peer-to-peer dice duel for coins")
+@app_commands.describe(
+    opponent="Who you want to duel",
+    stake="Coins each player stakes (both pay this amount)"
+)
+async def eh_dice_duel(
+    interaction: discord.Interaction,
+    opponent: discord.Member,
+    stake: int
+):
+    challenger = interaction.user
+
+    # basic checks
+    if opponent.bot:
+        return await interaction.response.send_message(
+            "You can’t duel a bot, love.",
+            ephemeral=True
+        )
+    if opponent.id == challenger.id:
+        return await interaction.response.send_message(
+            "You can’t duel yourself. Go play roulette for that.",
+            ephemeral=True
+        )
+    if stake <= 0:
+        return await interaction.response.send_message(
+            "Stake must be a positive number of coins.",
+            ephemeral=True
+        )
+
+    uid_chal = str(challenger.id)
+    uid_opp  = str(opponent.id)
+
+    ensure_user(uid_chal)
+    ensure_user(uid_opp)
+
+    bal_chal = get_balance(uid_chal)
+    bal_opp  = get_balance(uid_opp)
+
+    if bal_chal < stake:
+        return await interaction.response.send_message(
+            f"You don’t have enough coins. Need **{stake}**, you have **{bal_chal}**.",
+            ephemeral=True
+        )
+    if bal_opp < stake:
+        return await interaction.response.send_message(
+            f"{opponent.mention} doesn’t have enough coins to play.",
+            ephemeral=True
+        )
+
+    # we’re good – charge both first
+    change_balance(
+        uid_chal,
+        -stake,
+        "bet",
+        meta=f"dice_duel:vs:{uid_opp}"
+    )
+    change_balance(
+        uid_opp,
+        -stake,
+        "bet",
+        meta=f"dice_duel:vs:{uid_chal}"
+    )
+
+    # roll dice
+    roll_chal = random.randint(1, 6)
+    roll_opp  = random.randint(1, 6)
+
+    # decide outcome
+    desc_lines = [
+        f"{challenger.mention} rolled **{roll_chal}** 🎲",
+        f"{opponent.mention} rolled **{roll_opp}** 🎲",
+        ""
+    ]
+
+    if roll_chal > roll_opp:
+        # challenger wins full pot (2 x stake)
+        pot = 2 * stake
+        change_balance(
+            uid_chal,
+            pot,
+            "payout",
+            meta=f"dice_duel_win:vs:{uid_opp}"
+        )
+        desc_lines.append(
+            f"🏆 **{challenger.mention} wins** the pot of **{pot}** coins!"
+        )
+    elif roll_opp > roll_chal:
+        # opponent wins full pot
+        pot = 2 * stake
+        change_balance(
+            uid_opp,
+            pot,
+            "payout",
+            meta=f"dice_duel_win:vs:{uid_chal}"
+        )
+        desc_lines.append(
+            f"🏆 **{opponent.mention} wins** the pot of **{pot}** coins!"
+        )
+    else:
+        # tie – refund stakes
+        change_balance(
+            uid_chal,
+            stake,
+            "payout",
+            meta="dice_duel_refund"
+        )
+        change_balance(
+            uid_opp,
+            stake,
+            "payout",
+            meta="dice_duel_refund"
+        )
+        desc_lines.append(
+            "🤝 It’s a tie – stakes refunded to both players."
+        )
+
+    embed = discord.Embed(
+        title="🎲 EliHaus Dice Duel",
+        description="\n".join(desc_lines),
+        colour=discord.Colour.gold(),
+        timestamp=now_local()
+    )
+    embed.set_footer(text="EliHaus Dice • peer-to-peer")
+
+    await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="eh_openround", description="(Admin) Open a roulette round")
 @app_commands.default_permissions(manage_guild=True)
@@ -2010,40 +2431,37 @@ async def eh_cancelround(interaction: discord.Interaction):
 @app_commands.describe(count="How many tickets (1-100)")
 async def eh_buyticket(interaction: discord.Interaction, count: int = 1):
     if count <= 0 or count > 100:
-        return await interaction.response.send_message("You can buy between 1 and 100 tickets at once.", ephemeral=True)
+        return await interaction.response.send_message(
+            "You can buy between 1 and 100 tickets at once.",
+            ephemeral=True
+        )
+
     uid = str(interaction.user.id)
     cost = TICKET_COST * count
     bal = get_balance(uid)
-    if bal < cost:
-        return await interaction.response.send_message(f"Not enough coins. Need **{cost}**, you have **{bal}**.", ephemeral=True)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (cost, uid))
-        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                  (uid, "redeem", -cost, f"tickets {count}", iso(now_local())))
-        wk = week_id()
-        for _ in range(count):
-            c.execute("INSERT INTO tickets(week_id,discord_id,ts) VALUES(?,?,?)", (wk, uid, iso(now_local())))
-    await interaction.response.send_message(f"🎟️ Bought **{count}** ticket(s) for this week’s Lotto. Good luck!", ephemeral=True)
 
-@bot.tree.command(name="eh_lotto", description="Show weekly lotto status")
-async def eh_lotto(interaction: discord.Interaction):
+    if bal < cost:
+        return await interaction.response.send_message(
+            f"Not enough coins. Need **{cost}**, you have **{bal}**.",
+            ephemeral=True
+        )
+
+    # 🔻 deduct using the central helper
+    new_bal = change_balance(uid, -cost, "lotto", meta=f"tickets {count}")
+
+    # record tickets for this week
     wk = week_id()
-    uid = str(interaction.user.id)
-    draw_dt = next_draw_dt()
-    draw_str = draw_dt.strftime("%a %d %b %Y • %I:%M %p %Z")
-    left = human_left(draw_dt)
     with db() as conn:
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=?", (wk,))
-        total = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=? AND discord_id=?", (wk, uid))
-        mine = c.fetchone()[0]
+        for _ in range(count):
+            c.execute(
+                "INSERT INTO tickets(week_id,discord_id,ts) VALUES(?,?,?)",
+                (wk, uid, iso(now_local()))
+            )
+
     await interaction.response.send_message(
-        f"🎟️ **Weekly Lotto** — Week {wk}\n"
-        f"Draw: **{draw_str}** _(in {left})_\n"
-        f"Total tickets: **{total}** • Your tickets: **{mine}**\n"
-        f"Prize: **{LOTTO_WL_COUNT} WL gifts** from **{SHOP_NAME}** to **{LOTTO_WINNERS}** winner.",
+        f"🎟️ Bought **{count}** ticket(s) for this week’s Lotto. Good luck!\n"
+        f"Balance: **{bal} ➜ {new_bal}**",
         ephemeral=True
     )
 
@@ -2402,7 +2820,6 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
             set_slots_pot(self.channel_id, pot)
     
             # run spins
-            import random
             total_win = 0
             lines = []
             last_roll = "-"
