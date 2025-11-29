@@ -52,154 +52,6 @@ DAILY_AMOUNT = 1_800
 WEEKLY_AMOUNT = 6_000
 STARTER_AMOUNT = 5_000
 
-# Lotto draw schedule (0=Mon .. 6=Sun), default Saturday 20:00 in TIMEZONE_NAME
-LOTTO_DRAW_DOW    = int(os.getenv("LOTTO_DRAW_DOW", "5"))   # 5 = Saturday
-LOTTO_DRAW_HOUR   = int(os.getenv("LOTTO_DRAW_HOUR", "20")) # 20:00
-LOTTO_DRAW_MINUTE = int(os.getenv("LOTTO_DRAW_MINUTE", "0"))
-
-
-# Lotto
-TICKET_COST = 10_000
-LOTTO_WINNERS = 1
-LOTTO_WL_COUNT = 10
-SHOP_NAME = "Shop YaEli"
-# Keep SHOP_YAELI_URL defined first
-SHOP_YAELI_URL = os.getenv(
-    "SHOP_YAELI_URL",
-    "https://www.imvu.com/shop/web_search.php?manufacturers_id=360644281"
-)
-
-# Then define the policy (can be overridden via ELIHAUS_POLICY env var)
-DEFAULT_POLICY_TEXT = (
-    f"**Policy:** To claim your winnings, you must have **10 items** added from "
-    f"**[Shop YaEli]({SHOP_YAELI_URL})**. Failure to comply is subject to **disqualification**."
-)
-POLICY_TEXT = os.getenv("ELIHAUS_POLICY", DEFAULT_POLICY_TEXT)
-
-import json
-
-POLICY_STATE_KEY = "policy_config"
-# --- Policy / lotto settings in DB (override env + defaults) ---
-POLICY_SHOP_NAME_KEY   = "policy:shop_name"
-POLICY_SHOP_URL_KEY    = "policy:shop_url"
-POLICY_MIN_ITEMS_KEY   = "policy:min_items"
-
-LOTTO_WL_COUNT_KEY     = "lotto:wl_count"
-LOTTO_WINNERS_KEY      = "lotto:winners"
-LOTTO_DRAW_DOW_KEY     = "lotto:draw_dow"
-LOTTO_DRAW_HOUR_KEY    = "lotto:draw_hour"
-LOTTO_DRAW_MIN_KEY     = "lotto:draw_minute"
-
-def get_settings():
-    """Return all policy/lotto settings with DB overrides if present."""
-    shop_name = get_state(POLICY_SHOP_NAME_KEY) or SHOP_NAME
-    shop_url  = get_state(POLICY_SHOP_URL_KEY)  or SHOP_YAELI_URL
-    try:
-        min_items = int(get_state(POLICY_MIN_ITEMS_KEY) or "10")
-    except ValueError:
-        min_items = 10
-
-    try:
-        lotto_wl = int(get_state(LOTTO_WL_COUNT_KEY) or str(LOTTO_WL_COUNT))
-    except ValueError:
-        lotto_wl = LOTTO_WL_COUNT
-
-    try:
-        lotto_winners = int(get_state(LOTTO_WINNERS_KEY) or str(LOTTO_WINNERS))
-    except ValueError:
-        lotto_winners = LOTTO_WINNERS
-
-    try:
-        draw_dow = int(get_state(LOTTO_DRAW_DOW_KEY) or str(LOTTO_DRAW_DOW))
-    except ValueError:
-        draw_dow = LOTTO_DRAW_DOW
-
-    try:
-        draw_hour = int(get_state(LOTTO_DRAW_HOUR_KEY) or str(LOTTO_DRAW_HOUR))
-    except ValueError:
-        draw_hour = LOTTO_DRAW_HOUR
-
-    try:
-        draw_min = int(get_state(LOTTO_DRAW_MIN_KEY) or str(LOTTO_DRAW_MINUTE))
-    except ValueError:
-        draw_min = LOTTO_DRAW_MINUTE
-
-    return {
-        "shop_name": shop_name,
-        "shop_url": shop_url,
-        "min_items": min_items,
-        "lotto_wl": lotto_wl,
-        "lotto_winners": lotto_winners,
-        "draw_dow": draw_dow,
-        "draw_hour": draw_hour,
-        "draw_min": draw_min,
-    }
-
-
-DAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-
-def get_policy_text() -> str:
-    """Build the policy text from the current structured settings."""
-    s = get_settings()
-    day_name = DAY_NAMES[s["draw_dow"] % 7]
-    # uses your main TZ
-    tz_label = now_local().strftime("%Z") or TIMEZONE_NAME
-
-    return (
-        f"**Policy:** To claim your winnings, you must have **{s['min_items']} items** added from "
-        f"**[{s['shop_name']}]({s['shop_url']})**.\n\n"
-        f"• Lotto prize: **{s['lotto_wl']} WL gifts** shared between **{s['lotto_winners']}** winner(s).\n"
-        f"• Draw every **{day_name} at {s['draw_hour']:02d}:{s['draw_min']:02d} {tz_label}**.\n\n"
-        f"Failure to comply is subject to **disqualification**."
-    )
-
-
-def get_policy_config() -> dict:
-    """
-    Returns current policy config from DB state, or sensible defaults.
-    Keys: shop_name, shop_url, min_items.
-    """
-    raw = get_state(POLICY_STATE_KEY)
-    if not raw:
-        # fallback to env / defaults
-        return {
-            "shop_name": SHOP_NAME,
-            "shop_url": SHOP_YAELI_URL,
-            "min_items": 10,
-        }
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return {
-            "shop_name": SHOP_NAME,
-            "shop_url": SHOP_YAELI_URL,
-            "min_items": 10,
-        }
-
-    # fill any missing keys
-    data.setdefault("shop_name", SHOP_NAME)
-    data.setdefault("shop_url", SHOP_YAELI_URL)
-    data.setdefault("min_items", 10)
-    return data
-
-def set_policy_config(shop_name: str, shop_url: str, min_items: int):
-    cfg = {
-        "shop_name": shop_name,
-        "shop_url": shop_url,
-        "min_items": int(min_items),
-    }
-    set_state(POLICY_STATE_KEY, json.dumps(cfg))
-
-def build_policy_text() -> str:
-    cfg = get_policy_config()
-    sname = cfg["shop_name"]
-    surl = cfg["shop_url"]
-    n    = cfg["min_items"]
-    return (
-        f"**Policy:** To claim your winnings, you must have **{n} items** added from "
-        f"**[{sname}]({surl})**. Failure to comply is subject to **disqualification**."
-    )
-
 # Roulette (admin-led)
 ROUND_SECONDS_DEFAULT = 120
 PAYOUT_RED_BLACK = 2.0
@@ -2775,8 +2627,6 @@ async def eh_resolve(interaction: discord.Interaction):
     sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
     await sender("Round resolved.", ephemeral=True)
 
-
-
 @bot.tree.command(name="eh_cancelround", description="(Admin) Cancel the current roulette round and refund")
 @app_commands.default_permissions(manage_guild=True)
 async def eh_cancelround(interaction: discord.Interaction):
@@ -2797,46 +2647,107 @@ async def eh_cancelround(interaction: discord.Interaction):
                       (uid, "payout", stake, f"roulette:{rid}|refund", iso(now_local())))
         c.execute("UPDATE rounds SET status='CANCELLED', resolved_at=? WHERE rid=?", (iso(now_local()), rid))
     await interaction.response.send_message(f"Round **{ClaimView.get_round_label(rid)}** cancelled and bets refunded.", ephemeral=True)
+# ---- Lotto (configurable draw) ----
 
-# ---- Lotto ----
+# These are ONLY defaults. The real values are stored in state["lotto_config"].
+TICKET_COST     = 10_000
+LOTTO_WINNERS   = 1               # we keep 1 winner (ClaimView already assumes 1)
+LOTTO_WL_COUNT  = 10              # default WL gifts if no config saved yet
+SHOP_NAME       = "Shop YaEli"
+
+LOTTO_CONFIG_KEY = "lotto_config"
+
+
+def _lotto_defaults() -> dict:
+    return {
+        "day": "Saturday",                # draw day name
+        "time": "20:00",                  # HH:MM (24h)
+        "prize": LOTTO_WL_COUNT,         # WL gifts for the single winner
+        "shop_name": SHOP_NAME,
+        "shop_url": SHOP_YAELI_URL,      # from your env
+    }
+
+
+def get_lotto_config() -> dict:
+    """Read lotto config from DB, falling back to sane defaults."""
+    base = _lotto_defaults()
+    raw = get_state(LOTTO_CONFIG_KEY)
+    if not raw:
+        return base
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return base
+    for k in base.keys():
+        if k in data and data[k] not in (None, ""):
+            base[k] = data[k]
+    return base
+
+
+def set_lotto_config(cfg: dict) -> None:
+    base = _lotto_defaults()
+    base.update(cfg)
+    set_state(LOTTO_CONFIG_KEY, json.dumps(base))
+
+
+# override previous next_draw_dt with a configurable one
+def next_draw_dt(ref: datetime | None = None) -> datetime:
+    """
+    Next draw datetime using the configured day & time.
+    Always at least 'next' occurrence (never in the past).
+    """
+    cfg = get_lotto_config()
+    ref = ref or now_london()
+
+    # day of week
+    day_name = str(cfg.get("day", "Saturday")).strip().lower()
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    try:
+        target_wd = days.index(day_name)
+    except ValueError:
+        target_wd = 5  # Saturday fallback
+
+    # time (HH:MM 24h)
+    time_str = str(cfg.get("time", "20:00")).strip()
+    try:
+        h_str, m_str = time_str.split(":", 1)
+        hour = max(0, min(23, int(h_str)))
+        minute = max(0, min(59, int(m_str)))
+    except Exception:
+        hour, minute = 20, 0
+
+    days_ahead = (target_wd - ref.weekday()) % 7
+    candidate = (ref + timedelta(days=days_ahead)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    if candidate <= ref:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+# --- buy tickets (unchanged coins logic) ---
 @bot.tree.command(name="eh_buyticket", description="Buy tickets for this week’s Lotto")
 @app_commands.describe(count="How many tickets (1-100)")
 async def eh_buyticket(interaction: discord.Interaction, count: int = 1):
     if count <= 0 or count > 100:
-        return await interaction.response.send_message(
-            "You can buy between 1 and 100 tickets at once.",
-            ephemeral=True
-        )
-
+        return await interaction.response.send_message("You can buy between 1 and 100 tickets at once.", ephemeral=True)
     uid = str(interaction.user.id)
     cost = TICKET_COST * count
     bal = get_balance(uid)
-
     if bal < cost:
-        return await interaction.response.send_message(
-            f"Not enough coins. Need **{cost}**, you have **{bal}**.",
-            ephemeral=True
-        )
-
-    # 🔻 deduct using the central helper
-    new_bal = change_balance(uid, -cost, "lotto", meta=f"tickets {count}")
-
-    # record tickets for this week
-    wk = week_id()
+        return await interaction.response.send_message(f"Not enough coins. Need **{cost}**, you have **{bal}**.", ephemeral=True)
     with db() as conn:
         c = conn.cursor()
+        c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (cost, uid))
+        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
+                  (uid, "redeem", -cost, f"tickets {count}", iso(now_local())))
+        wk = week_id()
         for _ in range(count):
-            c.execute(
-                "INSERT INTO tickets(week_id,discord_id,ts) VALUES(?,?,?)",
-                (wk, uid, iso(now_local()))
-            )
+            c.execute("INSERT INTO tickets(week_id,discord_id,ts) VALUES(?,?,?)", (wk, uid, iso(now_local())))
+    await interaction.response.send_message(f"🎟️ Bought **{count}** ticket(s) for this week’s Lotto. Good luck!", ephemeral=True)
 
-    await interaction.response.send_message(
-        f"🎟️ Bought **{count}** ticket(s) for this week’s Lotto. Good luck!\n"
-        f"Balance: **{bal} ➜ {new_bal}**",
-        ephemeral=True
-    )
 
+# --- view lotto status ---
 @bot.tree.command(name="eh_lotto", description="Show weekly lotto status")
 async def eh_lotto(interaction: discord.Interaction):
     cfg = get_lotto_config()
@@ -2854,48 +2765,156 @@ async def eh_lotto(interaction: discord.Interaction):
         c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=? AND discord_id=?", (wk, uid))
         mine = c.fetchone()[0]
 
-    text = (
+    msg = (
         f"🎟️ **Weekly Lotto** — Week {wk}\n"
-        f"Draw: **{draw_str}** _(in {left})_\n"
+        f"Draw: every **{cfg['day']}** at **{cfg['time']}** "
+        f"(next draw **{draw_str}** — in {left}).\n"
         f"Total tickets: **{total}** • Your tickets: **{mine}**\n"
-        f"Prize: **{cfg['gifts']} WL gifts** from **{cfg['shop_name']}** "
-        f"to **{cfg['winners']}** winner(s)."
+        f"Prize: **{cfg['prize']} WL gifts** from **{cfg['shop_name']}** to **1** winner."
     )
-    await interaction.response.send_message(text, ephemeral=True)
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
+# --- config modal (admin) ---
+class LottoConfigModal(discord.ui.Modal, title="Configure Weekly Lotto"):
+    day = discord.ui.TextInput(
+        label="Draw day (Mon–Sun)",
+        placeholder="Saturday",
+        max_length=10
+    )
+    time = discord.ui.TextInput(
+        label="Draw time (HH:MM 24h)",
+        placeholder="20:00",
+        max_length=5
+    )
+    prize = discord.ui.TextInput(
+        label="WL gifts for the winner",
+        placeholder="10",
+        max_length=5
+    )
+    shop = discord.ui.TextInput(
+        label="Shop name | optional URL",
+        placeholder="Shop YaEli | https://…",
+        max_length=200
+    )
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        # pre-fill current values
+        self.day.default = cfg.get("day", "Saturday")
+        self.time.default = cfg.get("time", "20:00")
+        self.prize.default = str(cfg.get("prize", LOTTO_WL_COUNT))
+        combo = cfg.get("shop_name", SHOP_NAME)
+        url = cfg.get("shop_url", SHOP_YAELI_URL)
+        if url:
+            combo = f"{combo} | {url}"
+        self.shop.default = combo
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not user_is_admin(interaction.user):
+            return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+
+        # day
+        day = str(self.day.value or "Saturday").strip()
+        if not day:
+            day = "Saturday"
+
+        # time
+        t_raw = str(self.time.value or "20:00").strip()
+        try:
+            h_str, m_str = t_raw.split(":", 1)
+            hour = max(0, min(23, int(h_str)))
+            minute = max(0, min(59, int(m_str)))
+            t_norm = f"{hour:02d}:{minute:02d}"
+        except Exception:
+            t_norm = "20:00"
+
+        # prize
+        try:
+            prize = int(str(self.prize.value or "10").strip())
+        except Exception:
+            prize = LOTTO_WL_COUNT
+        if prize <= 0:
+            prize = LOTTO_WL_COUNT
+
+        # shop name + optional URL
+        raw_shop = str(self.shop.value or SHOP_NAME).strip()
+        if "|" in raw_shop:
+            name_part, url_part = raw_shop.split("|", 1)
+            shop_name = name_part.strip() or SHOP_NAME
+            shop_url = url_part.strip() or SHOP_YAELI_URL
+        else:
+            shop_name = raw_shop or SHOP_NAME
+            shop_url = SHOP_YAELI_URL
+
+        set_lotto_config({
+            "day": day,
+            "time": t_norm,
+            "prize": prize,
+            "shop_name": shop_name,
+            "shop_url": shop_url,
+        })
+
+        await interaction.response.send_message(
+            f"✅ Lotto updated: draw every **{day}** at **{t_norm}**, "
+            f"prize **{prize} WL gifts** from **{shop_name}**.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="eh_lotto_config", description="(admin) Configure lotto draw day/time & prize")
+@app_commands.default_permissions(manage_guild=True)
+async def eh_lotto_config(interaction: discord.Interaction):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+    cfg = get_lotto_config()
+    await interaction.response.send_modal(LottoConfigModal(cfg))
+
+
+# --- draw lotto (admin) ---
 @bot.tree.command(name="eh_drawlotto", description="(Admin) Draw this week’s lotto")
 @app_commands.default_permissions(manage_guild=True)
 async def eh_drawlotto(interaction: discord.Interaction):
     if not user_is_admin(interaction.user):
         return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+
+    cfg = get_lotto_config()
     wk = week_id()
+
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT id, discord_id FROM tickets WHERE week_id=?", (wk,))
         all_tix = c.fetchall()
+
     if not all_tix:
         return await interaction.response.send_message(f"No tickets for Week {wk}.", ephemeral=True)
+
     seed = f"LOTTO-{wk}-{int(now_local().timestamp())}-{random.randint(1, 1_000_000)}"
     random.seed(seed)
     winner_ticket = random.choice(all_tix)
     winner_id = winner_ticket[1]
+
     with db() as conn:
         c = conn.cursor()
         c.execute("INSERT INTO lotto_draws(week_id,run_at,winner_id,seed,status) VALUES(?,?,?,?,?)",
                   (wk, iso(now_local()), winner_id, seed, "DONE"))
         c.execute("""INSERT INTO prizes(winner_id,kind,amount,meta,status,created_ts,updated_ts)
                      VALUES(?,?,?,?,?,?,?)""",
-                  (winner_id, "wl", LOTTO_WL_COUNT, json.dumps({"shop": SHOP_NAME, "week": wk}), "pending", iso(now_local()), iso(now_local())))
+                  (winner_id, "wl", cfg["prize"],
+                   json.dumps({"shop": cfg["shop_name"], "week": wk}),
+                   "pending", iso(now_local()), iso(now_local())))
         prize_id = c.lastrowid
+
     member = interaction.guild.get_member(int(winner_id))
     mention = member.mention if member else f"<@{winner_id}>"
+
     embed = discord.Embed(
         title="🎉 Weekly Lotto Winner!",
-        description=f"{mention} wins **{LOTTO_WL_COUNT}** wishlist gifts from **[{SHOP_NAME}]({SHOP_YAELI_URL})**.",
+        description=f"{mention} wins **{cfg['prize']}** wishlist gifts from **[{cfg['shop_name']}]({cfg['shop_url']})**.",
         color=discord.Color.gold()
     )
-    # Post winner publicly with claim button, respond ephemeral to admin
+
+    # Winner gets a claim button via Prize flow
     await interaction.channel.send(embed=embed, view=ClaimView(prize_id))
     await interaction.response.send_message("Winner posted.", ephemeral=True)
 
