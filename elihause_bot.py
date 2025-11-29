@@ -1724,17 +1724,9 @@ async def eh_help(interaction: discord.Interaction):
     admin_lines = [
         "🎛️ **Admin only**",
         "`/eh_openround` – open roulette round",
-        "`/eh_resolve` – resolve roulette round",
-        "`/eh_cancelround` – cancel roulette round (refund bets)",
-        "`/eh_roundreset` – unlock stuck roulette round",
 
         "`/eh_drawlotto` – draw weekly lotto winner",
-        "`/eh_fulfil_done` – mark a WL fulfilment queue as done",
-
         "`/slots_open` – open Slots panel in this channel",
-        "`/slots_reset` – reset Slots pot to seed & refresh panel",
-        "`/slots_top` – show top Slots winners for this channel",
-
         "`/eh_policy_edit` – edit policy shop / min items",
         "`/eh_deposit` – owner-only manual coin deposit",
         # keep /eh_sync available but not advertised unless you want it:
