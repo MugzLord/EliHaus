@@ -2263,6 +2263,25 @@ async def eh_dice_duel(
 
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="eh_dice", description="Show the available EliHaus dice games")
+async def eh_dice(interaction: discord.Interaction):
+    e = discord.Embed(
+        title="🎲 EliHaus Dice Games",
+        colour=discord.Colour.gold(),
+        description=(
+            "`/eh_dice_duel` – 1v1 dice duel:\n"
+            "• You choose a stake and ping an opponent.\n"
+            "• Both players pay the stake, highest total wins the pot.\n"
+            "• Ties refund both players.\n\n"
+            "`/eh_dice_party` – group dice party:\n"
+            "• Host sets a stake and lets multiple people join.\n"
+            "• Everyone pays the stake, highest total wins the whole pot.\n"
+            "• Ties split the pot between top rollers."
+        )
+    )
+    e.set_footer(text="All dice games use your coin balance. Gamble responsibly, babes.")
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
 
 @bot.tree.command(name="eh_openround", description="(Admin) Open a roulette round")
 @app_commands.default_permissions(manage_guild=True)
