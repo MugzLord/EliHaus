@@ -2950,20 +2950,31 @@ async def on_ready():
 
 @bot.tree.command(name="eh_sync", description="(admin) Re-sync slash commands")
 async def eh_sync(interaction: discord.Interaction):
-    if not (interaction.user.guild_permissions.manage_guild or interaction.guild.owner_id == interaction.user.id):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+    guild = interaction.guild
+    # user may be a User (no guild_permissions) outside guild context
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+
+    can_manage = bool(member and member.guild_permissions.manage_guild)
+    is_owner = bool(guild and guild.owner_id == interaction.user.id)
+
+    if not (can_manage or is_owner):
+        return await interaction.response.send_message(
+            "You don’t have permission.", ephemeral=True
+        )
 
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        # Fast guild sync (instant)
-        if interaction.guild:
-            await bot.tree.sync(guild=interaction.guild)
-        # Global sync (removes old globals)
+        # fast guild sync (for this server)
+        if guild:
+            await bot.tree.sync(guild=guild)
+        # global sync (keeps globals in step)
         await bot.tree.sync()
         msg = "✅ Synced slash commands (guild + global)."
     except Exception as e:
         msg = f"❌ Sync error: {e!s}"
+
     await interaction.followup.send(msg, ephemeral=True)
+
 
 @bot.event
 async def on_message(message: discord.Message):
