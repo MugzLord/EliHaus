@@ -52,6 +52,11 @@ DAILY_AMOUNT = 1_800
 WEEKLY_AMOUNT = 6_000
 STARTER_AMOUNT = 5_000
 
+# Lotto draw schedule (0=Mon .. 6=Sun), default Saturday 20:00 in TIMEZONE_NAME
+LOTTO_DRAW_DOW     = int(os.getenv("LOTTO_DRAW_DOW", "5"))   # 5 = Saturday
+LOTTO_DRAW_HOUR    = int(os.getenv("LOTTO_DRAW_HOUR", "20")) # 20:00
+LOTTO_DRAW_MINUTE  = int(os.getenv("LOTTO_DRAW_MINUTE", "0"))
+
 # Lotto
 TICKET_COST = 10_000
 LOTTO_WINNERS = 1
@@ -301,27 +306,41 @@ def now_london() -> datetime:
     return datetime.now(LONDON_TZ)
 
 def next_draw_dt(ref: datetime | None = None) -> datetime:
-    """Next Saturday 20:00 London time."""
-    ref = ref or now_london()
-    target_wd = 5  # 0=Mon ... 5=Sat
+    """
+    Next configured lotto draw date/time in your main TIMEZONE.
+    LOTTO_DRAW_DOW: 0=Mon .. 6=Sun
+    """
+    ref = ref or now_local()  # uses TZ from TIMEZONE_NAME
+
+    target_wd = LOTTO_DRAW_DOW
     days_ahead = (target_wd - ref.weekday()) % 7
-    candidate = (ref + timedelta(days=days_ahead)).replace(
-        hour=20, minute=0, second=0, microsecond=0
-    )
+
+    # start from today's date at draw time, then add days_ahead
+    candidate = ref.replace(
+        hour=LOTTO_DRAW_HOUR,
+        minute=LOTTO_DRAW_MINUTE,
+        second=0,
+        microsecond=0,
+    ) + timedelta(days=days_ahead)
+
+    # if that time already passed today, jump a week ahead
     if candidate <= ref:
         candidate += timedelta(days=7)
-    return candidate
 
+    return candidate
 def human_left(dt: datetime, ref: datetime | None = None) -> str:
-    ref = ref or now_london()
+    ref = ref or now_local()
     secs = max(0, int((dt - ref).total_seconds()))
     d, rem = divmod(secs, 86400)
     h, rem = divmod(rem, 3600)
     m, _ = divmod(rem, 60)
     parts = []
-    if d: parts.append(f"{d}d")
-    if h: parts.append(f"{h}h")
-    if m and not d: parts.append(f"{m}m")
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m and not d:
+        parts.append(f"{m}m")
     return " ".join(parts) or "less than 1m"
 
 # --- Roulette result embed builder ---
@@ -390,6 +409,17 @@ CHIP_ASSETS = {
     "GREEN":  str(ASSETS_DIR / "chip_green.png"),
 }
 
+# --- Policy helper (uses DB override if present) ---
+POLICY_STATE_KEY = "policy:text"
+
+def get_policy_text() -> str:
+    """
+    Returns the current policy text.
+    If a custom one is stored in the state table, use that.
+    Otherwise fall back to the original POLICY_TEXT constant.
+    """
+    override = get_state(POLICY_STATE_KEY)
+    return override or POLICY_TEXT
 
 def roulette_color_from_number(n: int) -> str:
     red = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -813,19 +843,18 @@ class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
         staff_tag = f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"
         profile_line = f"[{uname}]({profile_url})" if profile_url else uname
         wishlist_line = f"[Open Wishlist]({wishlist_url})" if wishlist_url else "—"
-        policy = (
-            f"**Policy:** To claim your winnings, you must have **10 items** added from **[Shop YaEli]({SHOP_YAELI_URL})**. "
-            f"Failure to comply is subject to **disqualification**."
-        )
+        
+        policy_text = get_policy_text()
 
-        # --- announce + staff tag in the TICKET channel (you already have this)
+        # --- announce + staff tag in the TICKET channel
         await ticket.send(
             f"{staff_tag} New WL claim for {interaction.user.mention}\n"
             f"**IMVU:** {profile_line}\n"
             f"**Wishlist:** {wishlist_line}\n"
             f"**Notes:** {self.note or '—'}\n"
-            f"{policy}"
+            f"{policy_text}"
         )
+
         
         # --- approval embed + buttons (send to the TICKET, not interaction.channel)
         embed = discord.Embed(
@@ -2853,13 +2882,14 @@ async def eh_leaderboard(
 @bot.tree.command(name="eh_policy", description="Show the EliHaus prize/claim policy")
 @app_commands.describe(public="Post in channel (True) or show only to you (False)")
 async def eh_policy(interaction: discord.Interaction, public: bool = False):
-    text = build_policy_text()
+    text = get_policy_text()
     e = discord.Embed(
         title="📜 EliHaus Policy",
         description=text,
         color=discord.Color.gold()
     )
     await interaction.response.send_message(embed=e, ephemeral=not public)
+
 
 # =========================
 # 🎰 Emoji Slots (Shared Pot) — FULL ADD-ON
@@ -3120,7 +3150,53 @@ class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
                 except Exception:
                     pass
 
-        
+# --- Modal: edit policy text (admin only) ---
+class PolicyEditModal(discord.ui.Modal, title="Edit EliHaus Policy"):
+    policy_text = discord.ui.TextInput(
+        label="Policy text (markdown allowed)",
+        style=discord.TextStyle.paragraph,
+        max_length=1000
+    )
+
+    def __init__(self, current_text: str):
+        super().__init__(timeout=300)
+        # pre-fill with existing text
+        self.policy_text.default = current_text
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not user_is_admin(interaction.user):
+            return await interaction.response.send_message(
+                "You don’t have permission to edit the policy.",
+                ephemeral=True
+            )
+
+        new_text = str(self.policy_text).strip()
+        if not new_text:
+            return await interaction.response.send_message(
+                "Policy text cannot be empty.",
+                ephemeral=True
+            )
+
+        # save to state + update global in this process
+        set_state(POLICY_STATE_KEY, new_text)
+        global POLICY_TEXT
+        POLICY_TEXT = new_text
+
+        # show a quick preview
+        e = discord.Embed(
+            title="📜 EliHaus Policy (updated)",
+            description=new_text,
+            colour=discord.Colour.gold(),
+            timestamp=now_local()
+        )
+
+        await interaction.response.send_message(
+            "✅ Policy updated.",
+            embed=e,
+            ephemeral=True
+        )
+
+
 class SlotsView(discord.ui.View):
     def __init__(self, channel_id: int, timeout: int | None = None):
         super().__init__(timeout=timeout or None)
@@ -3303,6 +3379,17 @@ def _init_withdraw_tables():
         c.execute("CREATE INDEX IF NOT EXISTS idx_withdraw_user_status ON withdraw_requests(discord_id, status)")
 _init_withdraw_tables()
 
+@bot.tree.command(name="eh_policy_edit", description="(admin) Edit policy text / shop mention")
+async def eh_policy_edit(interaction: discord.Interaction):
+    if not user_is_admin(interaction.user):
+        return await interaction.response.send_message(
+            "You don’t have permission to edit the policy.",
+            ephemeral=True
+        )
+
+    current = get_policy_text()
+    modal = PolicyEditModal(current_text=current)
+    await interaction.response.send_modal(modal)
 
 # --- Slash: open withdraw modal ---
 @bot.tree.command(name="eh_withdraw", description="Convert your coins to WL gifts (opens a ticket; admin approval)")
