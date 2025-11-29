@@ -70,6 +70,56 @@ DEFAULT_POLICY_TEXT = (
 )
 POLICY_TEXT = os.getenv("ELIHAUS_POLICY", DEFAULT_POLICY_TEXT)
 
+import json
+
+POLICY_STATE_KEY = "policy_config"
+
+def get_policy_config() -> dict:
+    """
+    Returns current policy config from DB state, or sensible defaults.
+    Keys: shop_name, shop_url, min_items.
+    """
+    raw = get_state(POLICY_STATE_KEY)
+    if not raw:
+        # fallback to env / defaults
+        return {
+            "shop_name": SHOP_NAME,
+            "shop_url": SHOP_YAELI_URL,
+            "min_items": 10,
+        }
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {
+            "shop_name": SHOP_NAME,
+            "shop_url": SHOP_YAELI_URL,
+            "min_items": 10,
+        }
+
+    # fill any missing keys
+    data.setdefault("shop_name", SHOP_NAME)
+    data.setdefault("shop_url", SHOP_YAELI_URL)
+    data.setdefault("min_items", 10)
+    return data
+
+def set_policy_config(shop_name: str, shop_url: str, min_items: int):
+    cfg = {
+        "shop_name": shop_name,
+        "shop_url": shop_url,
+        "min_items": int(min_items),
+    }
+    set_state(POLICY_STATE_KEY, json.dumps(cfg))
+
+def build_policy_text() -> str:
+    cfg = get_policy_config()
+    sname = cfg["shop_name"]
+    surl = cfg["shop_url"]
+    n    = cfg["min_items"]
+    return (
+        f"**Policy:** To claim your winnings, you must have **{n} items** added from "
+        f"**[{sname}]({surl})**. Failure to comply is subject to **disqualification**."
+    )
+
 # Roulette (admin-led)
 ROUND_SECONDS_DEFAULT = 120
 PAYOUT_RED_BLACK = 2.0
@@ -1648,27 +1698,71 @@ async def withdraw_wl(interaction: discord.Interaction):
 @bot.tree.command(name="eh_help", description="Show EliHaus commands")
 async def eh_help(interaction: discord.Interaction):
     is_admin = user_is_admin(interaction.user)
-    public = [
+
+    public_lines = [
+        "🟡 **Core coins**",
         "`/eh_join` – join EliHaus (starter coins)",
         "`/eh_daily` – claim daily coins",
         "`/eh_weekly` – claim weekly coins",
         "`/eh_balance` – check balance",
+
+        "",
+        "🎰 **Games**",
+        "`/eh_table` – current roulette round status",
         "`/eh_buyticket` – buy lotto tickets",
         "`/eh_lotto` – see lotto status",
-        "`/eh_table` – active roulette round status",
-    ]
-    admin = [
-        "`/eh_openround` – open roulette round",
-        "`/eh_resolve` – resolve round",
-        "`/eh_cancelround` – cancel round",
-        "`/eh_withdrawal` / `/eh_withdraw` – adjust balance",
-        "`/eh_drawlotto` – draw weekly winner",
-        "`/eh_fulfil_next` / `/eh_fulfil_done` – fulfil WL claims",
-        "`/eh_roundreset` – unlock stuck round",
-    ]
-    lines = public + (["\n**Admin**"] + admin if is_admin else [])
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        "`/eh_dice_duel` – 1v1 dice duel (stake coins vs someone)",
+        "`/eh_dice_party` – group dice game (everyone stakes; highest roll wins)",
+        "`/slots_panel` – jump link to the Slots panel",
 
+        "",
+        "🎁 **Prizes / WL**",
+        "`/eh_withdraw` – request WL gifts using your coins",
+        "`/eh_policy` – view EliHaus prize / claim policy",
+        "`/eh_leaderboard` – view top balances / roulette net",
+    ]
+
+    admin_lines = [
+        "🎛️ **Admin only**",
+        "`/eh_openround` – open roulette round",
+        "`/eh_resolve` – resolve roulette round",
+        "`/eh_cancelround` – cancel roulette round (refund bets)",
+        "`/eh_roundreset` – unlock stuck roulette round",
+
+        "`/eh_drawlotto` – draw weekly lotto winner",
+        "`/eh_fulfil_done` – mark a WL fulfilment queue as done",
+
+        "`/slots_open` – open Slots panel in this channel",
+        "`/slots_reset` – reset Slots pot to seed & refresh panel",
+        "`/slots_top` – show top Slots winners for this channel",
+
+        "`/eh_policy_edit` – edit policy shop / min items",
+        "`/eh_deposit` – owner-only manual coin deposit",
+        # keep /eh_sync available but not advertised unless you want it:
+        # "`/eh_sync` – re-sync slash commands (debug)",
+    ]
+
+    embed = discord.Embed(
+        title="EliHaus Commands",
+        colour=discord.Colour.gold(),
+    )
+
+    embed.add_field(
+        name="Public",
+        value="\n".join(public_lines),
+        inline=False,
+    )
+
+    if is_admin:
+        embed.add_field(
+            name="Admin",
+            value="\n".join(admin_lines),
+            inline=False,
+        )
+
+    embed.set_footer(text="Use /eh_policy to read how prizes & WL claims work.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ========= Roulette single-card helpers =========
 import asyncio
@@ -2685,9 +2779,10 @@ async def eh_leaderboard(
 @bot.tree.command(name="eh_policy", description="Show the EliHaus prize/claim policy")
 @app_commands.describe(public="Post in channel (True) or show only to you (False)")
 async def eh_policy(interaction: discord.Interaction, public: bool = False):
+    text = build_policy_text()
     e = discord.Embed(
         title="📜 EliHaus Policy",
-        description=POLICY_TEXT,
+        description=text,
         color=discord.Color.gold()
     )
     await interaction.response.send_message(embed=e, ephemeral=not public)
