@@ -1342,44 +1342,53 @@ DICE_PARTY_CHANNELS: set[int] = set()
 class DicePartyView(discord.ui.View):
     def __init__(self, host: discord.Member, stake: int, max_players: int):
         super().__init__(timeout=180)
-
-        self.host: discord.Member = host
-        self.host_id: int = host.id
-        self.stake: int = stake
-        self.max_players: int = max_players
-
-        # store players as Members
+        self.host = host
+        self.host_id = host.id
+        self.stake = stake
+        self.max_players = max_players
         self.players: list[discord.Member] = [host]
-
         self.message: discord.Message | None = None
-        self.started: bool = False
+        self.started = False
 
+    @discord.ui.button(label="Join", style=discord.ButtonStyle.primary, emoji="🙋")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
 
-    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🎲")
-    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        # --- basic checks (keep these in line with your old code) ---
-        if interaction.user.id != self.host.id:
+        # already in
+        if interaction.user in self.players:
             return await interaction.response.send_message(
-                "Only the host can start the dice party.",
+                "You’ve already joined this dice party.",
                 ephemeral=True,
             )
 
-        if self.started:
+        # full
+        if len(self.players) >= self.max_players:
             return await interaction.response.send_message(
-                "This dice party has already been started.",
-                ephemeral=True,
-            )
-        self.started = True
-
-        if len(self.players) < 2:
-            self.started = False
-            return await interaction.response.send_message(
-                "You need at least 2 players to start the dice party.",
+                "This dice party is already full.",
                 ephemeral=True,
             )
 
-        await interaction.response.defer()
+        # add player
+        self.players.append(interaction.user)
+
+        # rebuild party embed
+        players_list = "\n".join(m.mention for m in self.players)
+
+        embed = discord.Embed(
+            title="🎲 EliHaus Dice Party",
+            description=(
+                f"Stake: **{self.stake}** coins per player\n"
+                f"Players: **{len(self.players)}/{self.max_players}**\n\n"
+                "Click **Join** to enter. Host presses **Start** to roll.\n\n"
+                "**Players**\n"
+                f"{players_list}"
+            ),
+            colour=discord.Colour.gold(),
+            timestamp=now_local(),
+        )
+
+        # edit the main party message to show new player
+        await interaction.response.edit_message(embed=embed, view=self)
+
 
 @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🎲")
 async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
