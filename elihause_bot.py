@@ -1340,52 +1340,106 @@ DICE_PARTY_CHANNELS: set[int] = set()
 
 
 class DicePartyView(discord.ui.View):
-    def __init__(self, host_id: int, stake: int, channel_id: int, max_players: int = 10):
-        super().__init__(timeout=None)
-        self.host_id = host_id
+    def __init__(self, host: discord.Member, stake: int):
+        super().__init__(timeout=180)
+        self.host = host
         self.stake = stake
-        self.channel_id = channel_id
-        self.max_players = max(2, min(max_players, 20))
-        # store user IDs
-        self.players: list[int] = [host_id]
-        self.game_id = f"{channel_id}-{int(now_local().timestamp())}"
+        self.players: list[discord.Member] = [host]
+        self.message: discord.Message | None = None
         self.started = False
 
-    def _is_admin(self, member: discord.Member) -> bool:
-        return (
-            getattr(member.guild_permissions, "manage_guild", False)
-            or member.id == getattr(member.guild, "owner_id", 0)
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🎲")
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        # --- basic checks (keep these in line with your old code) ---
+        if interaction.user.id != self.host.id:
+            return await interaction.response.send_message(
+                "Only the host can start the dice party.",
+                ephemeral=True,
+            )
+
+        if self.started:
+            return await interaction.response.send_message(
+                "This dice party has already been started.",
+                ephemeral=True,
+            )
+        self.started = True
+
+        if len(self.players) < 2:
+            self.started = False
+            return await interaction.response.send_message(
+                "You need at least 2 players to start the dice party.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer()
+
+        # ===== ANIMATION PHASE =====
+        players_list = "\n".join(m.mention for m in self.players)
+        pot = self.stake * len(self.players)
+
+        anim_embed = discord.Embed(
+            title="🎲 EliHaus Dice Party — Rolling",
+            description=(
+                "Locking in players and stakes...\n\n"
+                f"{players_list}\n\n"
+                f"Stake per player: **{self.stake}**\n"
+                f"Players: **{len(self.players)}**\n"
+                f"Pot: **{pot}**"
+            ),
+            colour=discord.Colour.gold(),
+            timestamp=now_local(),
+        )
+        await self.message.edit(embed=anim_embed, view=self)
+        await asyncio.sleep(1)
+
+        anim_embed.description = (
+            "Everyone grabs their dice…\n\n"
+            f"{players_list}"
+        )
+        await self.message.edit(embed=anim_embed, view=self)
+        await asyncio.sleep(1)
+
+        anim_embed.description = "🎲 Shaking… shaking… shaking…"
+        await self.message.edit(embed=anim_embed, view=self)
+        await asyncio.sleep(1)
+
+        # ===== ROLL + RESULT PHASE (same numbers used for result) =====
+        import random
+
+        results: list[tuple[discord.Member, int]] = []
+        for member in self.players:
+            roll = random.randint(1, 6)
+            results.append((member, roll))
+
+        # highest roll wins – keep whatever logic you had if different
+        results.sort(key=lambda x: x[1], reverse=True)
+        winner, winning_roll = results[0]
+
+        lines = []
+        for member, roll in results:
+            lines.append(f"{member.mention} rolled {roll}")
+        lines.append("")
+        lines.append(f"🏆 {winner.mention} wins the pot of **{pot}** coins!")
+        lines.append("")
+        lines.append("Stake per player  |  Players  |  Pot")
+        lines.append(f"{self.stake}  |  {len(self.players)}  |  {pot}")
+
+        result_embed = discord.Embed(
+            title="🎲 EliHaus Dice Party — Result",
+            description="\n".join(lines),
+            colour=discord.Colour.gold(),
+            timestamp=now_local(),
         )
 
-    def _can_control(self, user: discord.Member) -> bool:
-        return user.id == self.host_id or self._is_admin(user)
+        await self.message.edit(embed=result_embed, view=self)
 
-    def _player_list_text(self, guild: discord.Guild | None) -> str:
-        if not self.players:
-            return "—"
-        names = []
-        for uid in self.players:
-            m = guild.get_member(uid) if guild else None
-            names.append(m.mention if m else f"<@{uid}>")
-        return "\n".join(f"{i+1}. {name}" for i, name in enumerate(names))
+        # disable buttons after result
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        await self.message.edit(view=self)
 
-    async def _update_message(self, interaction: discord.Interaction):
-        """Refresh the lobby embed on the original message."""
-        try:
-            msg = interaction.message
-            e = msg.embeds[0] if msg.embeds else discord.Embed(colour=discord.Colour.gold())
-        except Exception:
-            return
-
-        e.title = "🎲 EliHaus Dice Party"
-        e.description = (
-            f"Stake: **{self.stake}** coins per player\n"
-            f"Players: **{len(self.players)}/{self.max_players}**\n\n"
-            "Click **Join** to enter. Host presses **Start** to roll."
-        )
-        e.clear_fields()
-        e.add_field(name="Players", value=self._player_list_text(interaction.guild), inline=False)
-        await msg.edit(embed=e, view=self)
 
     # --- Buttons ---
 
