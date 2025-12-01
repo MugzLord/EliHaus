@@ -2119,29 +2119,52 @@ async def eh_dice_duel(
             ephemeral=True
         )
 
-    view = DiceDuelRequestView(challenger, opponent, stake)
+        view = DiceDuelRequestView(challenger, opponent, stake)
 
-    embed = discord.Embed(
-        title="🎲 Dice Duel Challenge",
-        description=(
-            f"{challenger.mention} has challenged {opponent.mention} to a dice duel!\n\n"
-            f"**Stake:** {stake} coins each (pot **{stake * 2}**)\n\n"
-            f"{opponent.mention}, click **Accept duel** or **Decline** below."
-        ),
-        colour=discord.Colour.gold(),
-        timestamp=now_local()
-    )
+        embed = discord.Embed(
+            title="🎲 Dice Duel Challenge",
+            description=(
+                f"{challenger.mention} has challenged {opponent.mention} to a dice duel!\n\n"
+                f"**Stake:** {stake} coins each (pot **{stake * 2}**)\n\n"
+                f"{opponent.mention}, click **Accept duel** or **Decline** below."
+            ),
+            colour=discord.Colour.gold(),
+            timestamp=now_local(),
+        )
 
-    await interaction.response.send_message(
-        content=opponent.mention,
-        embed=embed,
-        view=view
-    )
-    # store message on view for timeout edits
-    try:
-        view.message = await interaction.original_response()
-    except Exception:
-        view.message = None
+        # 1) Reply in main channel (no view here – just a pointer)
+        await interaction.response.send_message(
+            content=f"{opponent.mention} you’ve been challenged to a dice duel! "
+                    f"A thread has been created for this duel. 🎲",
+            ephemeral=False,
+        )
+
+        # 2) Get that message and create a thread from it
+        try:
+            parent_msg = await interaction.original_response()
+        except Exception:
+            parent_msg = None
+
+        thread = None
+        if parent_msg is not None:
+            try:
+                thread_name = f"🎲 Dice Duel | {challenger.display_name} vs {opponent.display_name}"
+                thread = await parent_msg.create_thread(name=thread_name)
+            except discord.HTTPException:
+                thread = None
+
+        # 3) Send the *actual* duel embed + buttons inside the thread
+        target_channel = thread or interaction.channel  # fallback if thread creation fails
+
+        msg = await target_channel.send(
+            content=opponent.mention,
+            embed=embed,
+            view=view,
+        )
+
+        # store message on View for timeout edits & animation
+        view.message = msg
+
 
 class DiceDuelRequestView(discord.ui.View):
     def __init__(self, challenger: discord.Member, opponent: discord.Member, stake: int):
