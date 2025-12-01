@@ -2172,6 +2172,57 @@ class DiceDuelRequestView(discord.ui.View):
                 "Only the challenged player can accept this duel.",
                 ephemeral=True
             )
+        # --- FUN SHOWDOWN ---
+        duel_embed = discord.Embed(
+            title="🎲 Dice Duel — Showdown",
+            description=(
+                f"{self.challenger.mention} and {self.opponent.mention} are preparing their dice..."
+            ),
+            colour=discord.Colour.gold()
+        )
+        await self.message.edit(embed=duel_embed)
+
+        await asyncio.sleep(1)
+
+        duel_embed.description = (
+            f"{self.challenger.mention} grabs the dice...\n"
+            f"{self.opponent.mention} grabs the dice..."
+        )
+        await self.message.edit(embed=duel_embed)
+
+        await asyncio.sleep(1)
+
+        duel_embed.description = "🎲 Shaking... shaking... shaking..."
+        await self.message.edit(embed=duel_embed)
+
+        await asyncio.sleep(1)
+
+        # ----- ACTUAL ROLLS -----
+        import random
+        c1, c2 = random.randint(1, 6), random.randint(1, 6)
+        o1, o2 = random.randint(1, 6), random.randint(1, 6)
+
+        chal_total = c1 + c2
+        opp_total = o1 + o2
+
+        # gradual reveal
+        duel_embed.description = (
+            f"🎲 **First rolls!**\n"
+            f"{self.challenger.mention}: `{c1}`\n"
+            f"{self.opponent.mention}: `{o1}`"
+        )
+        await self.message.edit(embed=duel_embed)
+
+        await asyncio.sleep(1)
+
+        duel_embed.description = (
+            f"🎲 **Second rolls!**\n"
+            f"{self.challenger.mention}: `{c1} + {c2}`\n"
+            f"{self.opponent.mention}: `{o1} + {o2}`"
+        )
+        await self.message.edit(embed=duel_embed)
+
+        await asyncio.sleep(2)
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
