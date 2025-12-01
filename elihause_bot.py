@@ -1384,18 +1384,37 @@ class DicePartyView(discord.ui.View):
 @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🎲")
 async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
 
+    # Only host can start
     if interaction.user.id != self.host_id:
         return await interaction.response.send_message(
             "Only the host can start the dice party.",
             ephemeral=True,
         )
 
-    # other checks...
+    # Already started?
+    if self.started:
+        return await interaction.response.send_message(
+            "This dice party has already been started.",
+            ephemeral=True,
+        )
+
+    # Enough players?
+    if len(self.players) < 2:
+        return await interaction.response.send_message(
+            "You need at least 2 players to start the dice party.",
+            ephemeral=True,
+        )
+
+    self.started = True
 
     await interaction.response.defer()
 
-    # --- animation block we added ---
+    # ============================
+    # ANIMATION
+    # ============================
     players_list = "\n".join(m.mention for m in self.players)
+    pot = self.stake * len(self.players)
+
     anim_embed = discord.Embed(
         title="🎲 EliHaus Dice Party — Rolling",
         description=(
@@ -1419,55 +1438,46 @@ async def start(self, interaction: discord.Interaction, button: discord.ui.Butto
     await self.message.edit(embed=anim_embed, view=self)
     await asyncio.sleep(1)
 
-    # ---- then your original rolling + result code here ----
+    # ============================
+    # ROLLING + RESULT
+    # ============================
+    import random
 
-        anim_embed.description = (
-            "Everyone grabs their dice…\n\n"
-            f"{players_list}"
-        )
-        await self.message.edit(embed=anim_embed, view=self)
-        await asyncio.sleep(2)
+    results: list[tuple[discord.Member, int]] = []
+    for member in self.players:
+        roll = random.randint(1, 6)
+        results.append((member, roll))
 
-        anim_embed.description = "🎲 Shaking… shaking… shaking…"
-        await self.message.edit(embed=anim_embed, view=self)
-        await asyncio.sleep(2)
+    # determine winner
+    results.sort(key=lambda x: x[1], reverse=True)
+    winner, winning_roll = results[0]
 
-        # ===== ROLL + RESULT PHASE (same numbers used for result) =====
-        import random
+    # build lines
+    lines = []
+    for member, roll in results:
+        lines.append(f"{member.mention} rolled {roll}")
 
-        results: list[tuple[discord.Member, int]] = []
-        for member in self.players:
-            roll = random.randint(1, 6)
-            results.append((member, roll))
+    lines.append("")
+    lines.append(f"🏆 {winner.mention} wins the pot of **{pot}** coins!")
+    lines.append("")
+    lines.append("Stake per player  |  Players  |  Pot")
+    lines.append(f"{self.stake}  |  {len(self.players)}  |  {pot}")
 
-        # highest roll wins – keep whatever logic you had if different
-        results.sort(key=lambda x: x[1], reverse=True)
-        winner, winning_roll = results[0]
+    result_embed = discord.Embed(
+        title="🎲 EliHaus Dice Party — Result",
+        description="\n".join(lines),
+        colour=discord.Colour.gold(),
+        timestamp=now_local(),
+    )
 
-        lines = []
-        for member, roll in results:
-            lines.append(f"{member.mention} rolled {roll}")
-        lines.append("")
-        lines.append(f"🏆 {winner.mention} wins the pot of **{pot}** coins!")
-        lines.append("")
-        lines.append("Stake per player  |  Players  |  Pot")
-        lines.append(f"{self.stake}  |  {len(self.players)}  |  {pot}")
+    await self.message.edit(embed=result_embed, view=self)
 
-        result_embed = discord.Embed(
-            title="🎲 EliHaus Dice Party — Result",
-            description="\n".join(lines),
-            colour=discord.Colour.gold(),
-            timestamp=now_local(),
-        )
+    # disable all buttons
+    for item in self.children:
+        if isinstance(item, discord.ui.Button):
+            item.disabled = True
 
-        await self.message.edit(embed=result_embed, view=self)
-
-        # disable buttons after result
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = True
-        await self.message.edit(view=self)
-
+    await self.message.edit(view=self)
 
     # --- Buttons ---
 
