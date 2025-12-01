@@ -1340,13 +1340,20 @@ DICE_PARTY_CHANNELS: set[int] = set()
 
 
 class DicePartyView(discord.ui.View):
-    def __init__(self, host: discord.Member, stake: int):
+    def __init__(self, host: discord.Member, stake: int, max_players: int):
         super().__init__(timeout=180)
-        self.host = host
-        self.stake = stake
+
+        self.host: discord.Member = host
+        self.host_id: int = host.id
+        self.stake: int = stake
+        self.max_players: int = max_players
+
+        # store players as Members
         self.players: list[discord.Member] = [host]
+
         self.message: discord.Message | None = None
-        self.started = False
+        self.started: bool = False
+
 
     @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🎲")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1374,35 +1381,56 @@ class DicePartyView(discord.ui.View):
 
         await interaction.response.defer()
 
-        # ===== ANIMATION PHASE =====
-        players_list = "\n".join(m.mention for m in self.players)
-        pot = self.stake * len(self.players)
+@discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🎲")
+async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
 
-        anim_embed = discord.Embed(
-            title="🎲 EliHaus Dice Party — Rolling",
-            description=(
-                "Locking in players and stakes...\n\n"
-                f"{players_list}\n\n"
-                f"Stake per player: **{self.stake}**\n"
-                f"Players: **{len(self.players)}**\n"
-                f"Pot: **{pot}**"
-            ),
-            colour=discord.Colour.gold(),
-            timestamp=now_local(),
+    if interaction.user.id != self.host_id:
+        return await interaction.response.send_message(
+            "Only the host can start the dice party.",
+            ephemeral=True,
         )
-        await self.message.edit(embed=anim_embed, view=self)
-        await asyncio.sleep(1)
+
+    # other checks...
+
+    await interaction.response.defer()
+
+    # --- animation block we added ---
+    players_list = "\n".join(m.mention for m in self.players)
+    anim_embed = discord.Embed(
+        title="🎲 EliHaus Dice Party — Rolling",
+        description=(
+            "Locking in players and stakes...\n\n"
+            f"{players_list}"
+        ),
+        colour=discord.Colour.gold(),
+        timestamp=now_local(),
+    )
+    await self.message.edit(embed=anim_embed, view=self)
+    await asyncio.sleep(1)
+
+    anim_embed.description = (
+        "Everyone grabs their dice...\n\n"
+        f"{players_list}"
+    )
+    await self.message.edit(embed=anim_embed, view=self)
+    await asyncio.sleep(1)
+
+    anim_embed.description = "🎲 Shaking… shaking… shaking…"
+    await self.message.edit(embed=anim_embed, view=self)
+    await asyncio.sleep(1)
+
+    # ---- then your original rolling + result code here ----
 
         anim_embed.description = (
             "Everyone grabs their dice…\n\n"
             f"{players_list}"
         )
         await self.message.edit(embed=anim_embed, view=self)
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
         anim_embed.description = "🎲 Shaking… shaking… shaking…"
         await self.message.edit(embed=anim_embed, view=self)
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
         # ===== ROLL + RESULT PHASE (same numbers used for result) =====
         import random
@@ -1663,7 +1691,9 @@ async def eh_dice_party(
             ephemeral=True
         )
 
-    host = interaction.user
+    host = interaction.user  # above
+    view = DicePartyView(host=host, stake=stake, max_players=max_players)
+
     uid_host = str(host.id)
     ensure_user(uid_host)
     bal_host = get_balance(uid_host)
@@ -1677,10 +1707,9 @@ async def eh_dice_party(
     DICE_PARTY_CHANNELS.add(ch_id)
 
     view = DicePartyView(
-        host_id=host.id,
+        host=host,              # this should be the Member object (e.g. interaction.user)
         stake=stake,
-        channel_id=ch_id,
-        max_players=max_players
+        max_players=max_players,
     )
 
     # Initial lobby embed
@@ -2317,7 +2346,7 @@ class DiceDuelRequestView(discord.ui.View):
         )
         await self.message.edit(embed=duel_embed)
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
         duel_embed.description = (
             f"🎲 **Second rolls!**\n"
