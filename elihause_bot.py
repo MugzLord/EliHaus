@@ -2172,7 +2172,34 @@ class DiceDuelRequestView(discord.ui.View):
                 "Only the challenged player can accept this duel.",
                 ephemeral=True
             )
-        # --- FUN SHOWDOWN ---
+
+        # defer IMMEDIATELY so Discord doesn't time out
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # re-check balances
+        chal_id = str(self.challenger.id)
+        opp_id = str(self.opponent.id)
+        ensure_user(chal_id)
+        ensure_user(opp_id)
+
+        chal_bal = get_balance(chal_id)
+        opp_bal = get_balance(opp_id)
+
+        if chal_bal < self.stake or opp_bal < self.stake:
+            msg_bits = []
+            if chal_bal < self.stake:
+                msg_bits.append(f"{self.challenger.mention} has only **{chal_bal}**.")
+            if opp_bal < self.stake:
+                msg_bits.append(f"{self.opponent.mention} has only **{opp_bal}**.")
+            await self._finish("❌ Duel cancelled. Someone no longer has enough coins.\n" + "\n".join(msg_bits))
+            return
+
+        # deduct coins from both (kind = bet)
+        pot = self.stake * 2
+        change_balance(chal_id, -self.stake, "bet", meta=f"dice_duel:vs:{opp_id}")
+        change_balance(opp_id, -self.stake, "bet", meta=f"dice_duel:vs:{chal_id}")
+
+        # --- FUN SHOWDOWN (animation, but only ONE actual roll) ---
         duel_embed = discord.Embed(
             title="🎲 Dice Duel — Showdown",
             description=(
@@ -2182,7 +2209,7 @@ class DiceDuelRequestView(discord.ui.View):
         )
         await self.message.edit(embed=duel_embed)
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
         duel_embed.description = (
             f"{self.challenger.mention} grabs the dice...\n"
@@ -2190,14 +2217,14 @@ class DiceDuelRequestView(discord.ui.View):
         )
         await self.message.edit(embed=duel_embed)
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
         duel_embed.description = "🎲 Shaking... shaking... shaking..."
         await self.message.edit(embed=duel_embed)
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
-        # ----- ACTUAL ROLLS -----
+        # ----- SINGLE ACTUAL ROLL (used for both animation + result) -----
         import random
         c1, c2 = random.randint(1, 6), random.randint(1, 6)
         o1, o2 = random.randint(1, 6), random.randint(1, 6)
@@ -2224,37 +2251,7 @@ class DiceDuelRequestView(discord.ui.View):
 
         await asyncio.sleep(2)
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        # re-check balances
-        chal_id = str(self.challenger.id)
-        opp_id = str(self.opponent.id)
-        ensure_user(chal_id)
-        ensure_user(opp_id)
-
-        chal_bal = get_balance(chal_id)
-        opp_bal = get_balance(opp_id)
-
-        if chal_bal < self.stake or opp_bal < self.stake:
-            msg_bits = []
-            if chal_bal < self.stake:
-                msg_bits.append(f"{self.challenger.mention} has only **{chal_bal}**.")
-            if opp_bal < self.stake:
-                msg_bits.append(f"{self.opponent.mention} has only **{opp_bal}**.")
-            await self._finish("❌ Duel cancelled. Someone no longer has enough coins.\n" + "\n".join(msg_bits))
-            return
-
-        # deduct coins from both (kind = bet)
-        pot = self.stake * 2
-        change_balance(chal_id, -self.stake, "bet", meta=f"dice_duel:vs:{opp_id}")
-        change_balance(opp_id, -self.stake, "bet", meta=f"dice_duel:vs:{chal_id}")
-
-        import random
-        c1, c2 = random.randint(1, 6), random.randint(1, 6)
-        o1, o2 = random.randint(1, 6), random.randint(1, 6)
-        chal_total = c1 + c2
-        opp_total = o1 + o2
-
+        # ----- FINAL RESULT (same numbers as animation) -----
         lines = [
             f"**Stake:** {self.stake} coins each (pot **{pot}**)",
             "",
