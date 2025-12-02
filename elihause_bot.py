@@ -2569,35 +2569,7 @@ async def eh_table(interaction: discord.Interaction):
     )
 
 @bot.event
-async def on_message(message: discord.Message):
-    # ignore bots + DMs
-    if message.author.bot or message.guild is None:
-        return
 
-    # count only real chat messages
-    MESSAGE_COUNTER[message.channel.id] += 1
-
-    # bump threshold (change 15 to what you like)
-    if MESSAGE_COUNTER[message.channel.id] >= 15:
-        MESSAGE_COUNTER[message.channel.id] = 0
-        mid = ACTIVE_PANEL_MSG.get(message.channel.id)
-        if mid:
-            jump = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{mid}"
-            view = discord.ui.View()
-            view.add_item(discord.ui.Button(label="Jump to Betting Panel", url=jump))
-
-            bump = discord.Embed(
-                title="🎰 Roulette — current round",
-                description="Chat flew past. Click below to jump to the betting panel.",
-                colour=discord.Colour.dark_grey()
-            )
-            await message.channel.send(embed=bump, view=view)
-
-    # keep commands working if you use commands.Bot
-    try:
-        await bot.process_commands(message)
-    except Exception:
-        pass
 async def _roulette_send_result(
     bot, channel, *, rid: int,
     result_color: str,           # "RED" | "BLACK" | "GREEN"
