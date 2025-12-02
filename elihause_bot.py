@@ -3959,4 +3959,5 @@ async def eh_deposit(
     except Exception:
         pass
 
-bot.run(TOKEN)
+bot.run(DISCORD_TOKEN)
+
