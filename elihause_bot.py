@@ -1458,7 +1458,7 @@ class DicePartyView(discord.ui.View):
             )
 
         try:
-            # Re-check balances and drop anyone who can’t afford now
+            # --- balance re-check before locking in ---
             valid_players: list[int] = []
             removed: list[int] = []
             for uid_int in self.players:
@@ -1478,42 +1478,46 @@ class DicePartyView(discord.ui.View):
                     ephemeral=True
                 )
 
-            # Lock the game
+            # lock game + free channel
             self.started = True
             DICE_PARTY_CHANNELS.discard(self.channel_id)
 
-            # Deduct stake from all valid players + DM each one
-            pot = 0
+            # --- ROLLING / SHAKING ANIMATION ON MAIN MESSAGE ---
             guild = interaction.guild
+            players_list = self._player_list_text(guild)
+
+            anim_embed = discord.Embed(
+                title="🎲 EliHaus Dice Party — Rolling",
+                description="Locking in players and stakes...\n\n" + players_list,
+                colour=discord.Colour.gold(),
+                timestamp=now_local(),
+            )
+
+            # first update = interaction response
+            await interaction.response.edit_message(embed=anim_embed, view=self)
+            await asyncio.sleep(2)
+
+            anim_embed.description = "Everyone grabs their dice...\n\n" + players_list
+            await interaction.edit_original_response(embed=anim_embed, view=self)
+            await asyncio.sleep(2)
+
+            anim_embed.description = "🎲 Shaking… shaking… shaking…"
+            await interaction.edit_original_response(embed=anim_embed, view=self)
+            await asyncio.sleep(2)
+
+            # --- DEDUCT STAKES (NO DMs) ---
+            pot = 0
             for uid_int in self.players:
                 uid = str(uid_int)
-
                 change_balance(
                     uid,
                     -self.stake,
                     "bet",
-                    meta=f"dice_party:{self.game_id}"
+                    meta=f"dice_party:{self.game_id}",
                 )
                 pot += self.stake
 
-                # DM their deduction + new balance
-                if guild:
-                    member = guild.get_member(uid_int)
-                else:
-                    member = None
-
-                if member:
-                    new_bal = get_balance(uid)
-                    try:
-                        await member.send(
-                            f"🎲 EliHaus Dice Party\n"
-                            f"Bet deducted: **{self.stake}** coins.\n"
-                            f"Your new balance: **{new_bal}** coins."
-                        )
-                    except Exception:
-                        pass
-
-            # Roll dice
+            # --- ROLL THE DICE ---
             rolls: dict[int, int] = {}
             for uid_int in self.players:
                 rolls[uid_int] = random.randint(1, 6)
@@ -1521,7 +1525,7 @@ class DicePartyView(discord.ui.View):
             max_roll = max(rolls.values())
             winners = [uid for uid, r in rolls.items() if r == max_roll]
 
-            # Split pot between winners
+            # --- PAYOUT ---
             share = pot // len(winners)
             leftover = pot - share * len(winners)
 
@@ -1532,12 +1536,11 @@ class DicePartyView(discord.ui.View):
                     uid,
                     payout,
                     "payout",
-                    meta=f"dice_party_win:{self.game_id}"
+                    meta=f"dice_party_win:{self.game_id}",
                 )
 
-            # Build result embed
+            # --- RESULT EMBED ---
             lines = []
-            guild = interaction.guild
             for uid_int, r in rolls.items():
                 m = guild.get_member(uid_int) if guild else None
                 name = m.mention if m else f"<@{uid_int}>"
@@ -1559,29 +1562,26 @@ class DicePartyView(discord.ui.View):
                     f"{', '.join(winner_mentions)} share the pot (**{pot}** total)."
                 )
 
-            embed = discord.Embed(
+            result_embed = discord.Embed(
                 title="🎲 EliHaus Dice Party — Result",
                 description=desc + result_line,
                 colour=discord.Colour.gold(),
-                timestamp=now_local()
+                timestamp=now_local(),
             )
-            embed.add_field(name="Stake per player", value=str(self.stake), inline=True)
-            embed.add_field(name="Players", value=str(len(self.players)), inline=True)
-            embed.add_field(name="Pot", value=str(pot), inline=True)
-            embed.set_footer(text="EliHaus Dice Party")
+            result_embed.add_field(name="Stake per player", value=str(self.stake), inline=True)
+            result_embed.add_field(name="Players", value=str(len(self.players)), inline=True)
+            result_embed.add_field(name="Pot", value=str(pot), inline=True)
+            result_embed.set_footer(text="EliHaus Dice Party")
 
-            # Disable buttons
+            # disable buttons
             for child in self.children:
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
 
-            try:
-                await interaction.response.edit_message(embed=embed, view=self)
-            except discord.InteractionResponded:
-                await interaction.followup.send(embed=embed, ephemeral=False)
+            await interaction.edit_original_response(embed=result_embed, view=self)
 
         except Exception:
-            # if anything goes wrong, at least free the channel
+            # make sure the channel is freed even if something blows up
             self.started = True
             DICE_PARTY_CHANNELS.discard(self.channel_id)
             if not interaction.response.is_done():
@@ -1593,9 +1593,10 @@ class DicePartyView(discord.ui.View):
             else:
                 await interaction.followup.send(
                     "❌ Something went wrong starting this dice party. "
-                    "If coins moved, ping an admin.",
+                    "If coins moved, ping an admin.", 
                     ephemeral=True,
                 )
+
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="🛑")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
