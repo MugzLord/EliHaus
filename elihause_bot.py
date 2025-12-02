@@ -10,7 +10,7 @@ import io, time
 # ---------------- Config ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("Set DISCORD_TOKEN")
+    raise RuntimeError("Set DISCORD_TOKEN")f
 
 GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0"))
 
@@ -1339,20 +1339,30 @@ def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
 DICE_PARTY_CHANNELS: set[int] = set()
 
 
+# ======================= Dice Party =======================
+
 class DicePartyView(discord.ui.View):
-    def __init__(self, host: discord.Member, stake: int, max_players: int):
-        super().__init__(timeout=180)
-        self.host = host
-        self.host_id = host.id
+    def __init__(self, host_id: int, stake: int, channel_id: int, max_players: int = 10):
+        super().__init__(timeout=None)
+        self.host_id = host_id
         self.stake = stake
-        self.max_players = max_players
-        # store player IDs only, not Member objects
-        self.players: list[int] = [host.id]
-        self.message: discord.Message | None = None
+        self.channel_id = channel_id
+        self.max_players = max(2, min(max_players, 20))
+        # store user IDs
+        self.players: list[int] = [host_id]
+        self.game_id = f"{channel_id}-{int(now_local().timestamp())}"
         self.started = False
 
+    def _is_admin(self, member: discord.Member) -> bool:
+        return (
+            getattr(member.guild_permissions, "manage_guild", False)
+            or member.id == getattr(member.guild, "owner_id", 0)
+        )
+
+    def _can_control(self, member: discord.Member) -> bool:
+        return member.id == self.host_id or self._is_admin(member)
+
     def _player_list_text(self, guild: discord.Guild | None) -> str:
-        """Build the players list text for the embed."""
         if not guild:
             return "\n".join(f"<@{uid}>" for uid in self.players)
 
@@ -1363,8 +1373,7 @@ class DicePartyView(discord.ui.View):
         return "\n".join(lines) if lines else "—"
 
     async def _update_message(self, interaction: discord.Interaction):
-        """Refresh the lobby embed on the original message."""
-        msg = interaction.message or self.message
+        msg = interaction.message
         if not msg:
             return
 
@@ -1427,7 +1436,6 @@ class DicePartyView(discord.ui.View):
 
         self.players.append(user.id)
 
-        # defer so we can safely edit the main message
         await interaction.response.defer(ephemeral=True, thinking=False)
         await self._update_message(interaction)
 
@@ -1450,10 +1458,9 @@ class DicePartyView(discord.ui.View):
             )
 
         try:
-            # --- balance check again before locking in ---
+            # Re-check balances and drop anyone who can’t afford now
             valid_players: list[int] = []
             removed: list[int] = []
-
             for uid_int in self.players:
                 uid = str(uid_int)
                 bal = get_balance(uid)
@@ -1465,24 +1472,22 @@ class DicePartyView(discord.ui.View):
             self.players = valid_players
 
             if len(self.players) < 2:
-                # nothing deducted yet, so safe to bail
                 return await interaction.response.send_message(
                     "After balance check there are fewer than 2 eligible players. "
                     "Party cancelled.",
                     ephemeral=True
                 )
 
-            # --- lock game & free channel slot ---
+            # Lock the game
             self.started = True
             DICE_PARTY_CHANNELS.discard(self.channel_id)
 
-            # --- deduct stake from all valid players + DM each one ---
+            # Deduct stake from all valid players + DM each one
             pot = 0
             guild = interaction.guild
             for uid_int in self.players:
                 uid = str(uid_int)
 
-                # deduct coins
                 change_balance(
                     uid,
                     -self.stake,
@@ -1491,7 +1496,7 @@ class DicePartyView(discord.ui.View):
                 )
                 pot += self.stake
 
-                # tell ONLY this player what was deducted + new balance
+                # DM their deduction + new balance
                 if guild:
                     member = guild.get_member(uid_int)
                 else:
@@ -1506,10 +1511,9 @@ class DicePartyView(discord.ui.View):
                             f"Your new balance: **{new_bal}** coins."
                         )
                     except Exception:
-                        # DMs closed etc, ignore
                         pass
 
-            # --- roll dice ---
+            # Roll dice
             rolls: dict[int, int] = {}
             for uid_int in self.players:
                 rolls[uid_int] = random.randint(1, 6)
@@ -1517,7 +1521,7 @@ class DicePartyView(discord.ui.View):
             max_roll = max(rolls.values())
             winners = [uid for uid, r in rolls.items() if r == max_roll]
 
-            # --- split pot between winners ---
+            # Split pot between winners
             share = pot // len(winners)
             leftover = pot - share * len(winners)
 
@@ -1531,7 +1535,7 @@ class DicePartyView(discord.ui.View):
                     meta=f"dice_party_win:{self.game_id}"
                 )
 
-            # --- build result embed ---
+            # Build result embed
             lines = []
             guild = interaction.guild
             for uid_int, r in rolls.items():
@@ -1566,7 +1570,7 @@ class DicePartyView(discord.ui.View):
             embed.add_field(name="Pot", value=str(pot), inline=True)
             embed.set_footer(text="EliHaus Dice Party")
 
-            # disable buttons
+            # Disable buttons
             for child in self.children:
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
@@ -1577,8 +1581,7 @@ class DicePartyView(discord.ui.View):
                 await interaction.followup.send(embed=embed, ephemeral=False)
 
         except Exception:
-            # if anything goes wrong, log and give a proper error instead of "This interaction failed"
-            traceback.print_exc()
+            # if anything goes wrong, at least free the channel
             self.started = True
             DICE_PARTY_CHANNELS.discard(self.channel_id)
             if not interaction.response.is_done():
@@ -1609,7 +1612,7 @@ class DicePartyView(discord.ui.View):
             )
 
         self.started = True
-        DICE_PARTY_CHANNELS.discard(interaction.channel.id)
+        DICE_PARTY_CHANNELS.discard(self.channel_id)
 
         # Disable buttons
         for child in self.children:
@@ -1672,9 +1675,10 @@ async def eh_dice_party(
     DICE_PARTY_CHANNELS.add(ch_id)
 
     view = DicePartyView(
-        host=host,
+        host_id=host.id,
         stake=stake,
-        max_players=max_players,
+        channel_id=ch_id,
+        max_players=max_players
     )
 
     # Initial lobby embed
