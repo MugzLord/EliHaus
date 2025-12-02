@@ -1346,209 +1346,48 @@ class DicePartyView(discord.ui.View):
         self.host_id = host.id
         self.stake = stake
         self.max_players = max_players
-        self.players: list[discord.Member] = [host]
+        # store player IDs only, not Member objects
+        self.players: list[int] = [host.id]
         self.message: discord.Message | None = None
         self.started = False
 
-    @discord.ui.button(label="Join", style=discord.ButtonStyle.primary, emoji="🙋")
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def _player_list_text(self, guild: discord.Guild | None) -> str:
+        """Build the players list text for the embed."""
+        if not guild:
+            return "\n".join(f"<@{uid}>" for uid in self.players)
 
-        # already in
-        if interaction.user in self.players:
-            return await interaction.response.send_message(
-                "You’ve already joined this dice party.",
-                ephemeral=True,
-            )
+        lines: list[str] = []
+        for uid in self.players:
+            m = guild.get_member(uid)
+            lines.append(m.mention if m else f"<@{uid}>")
+        return "\n".join(lines) if lines else "—"
 
-        # full
-        if len(self.players) >= self.max_players:
-            return await interaction.response.send_message(
-                "This dice party is already full.",
-                ephemeral=True,
-            )
+    async def _update_message(self, interaction: discord.Interaction):
+        """Refresh the lobby embed on the original message."""
+        msg = interaction.message or self.message
+        if not msg:
+            return
 
-        # add player
-        self.players.append(interaction.user)
+        guild = interaction.guild
+        players_list = self._player_list_text(guild)
 
-        # rebuild party embed
-        players_list = "\n".join(m.mention for m in self.players)
-
-        embed = discord.Embed(
-            title="🎲 EliHaus Dice Party",
-            description=(
-                f"Stake: **{self.stake}** coins per player\n"
-                f"Players: **{len(self.players)}/{self.max_players}**\n\n"
-                "Click **Join** to enter. Host presses **Start** to roll.\n\n"
-                "**Players**\n"
-                f"{players_list}"
-            ),
+        e = msg.embeds[0] if msg.embeds else discord.Embed(
             colour=discord.Colour.gold(),
             timestamp=now_local(),
         )
-
-        # edit the main party message to show new player
-        await interaction.response.edit_message(embed=embed, view=self)
-
-
-    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🚀")
-    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.started:
-            return await interaction.response.send_message(
-                "This party has already been played.", ephemeral=True
-            )
-
-        if not self._can_control(interaction.user):
-            return await interaction.response.send_message(
-                "Only the host or an admin can start this party.",
-                ephemeral=True
-            )
-
-        if len(self.players) < 2:
-            return await interaction.response.send_message(
-                "Need at least **2** players to start.", ephemeral=True
-            )
-
-        # Re-check balances and drop anyone who can’t afford now
-        valid_players: list[int] = []
-        removed: list[int] = []
-        for uid_int in self.players:
-            uid = str(uid_int)
-            bal = get_balance(uid)
-            if bal >= self.stake:
-                valid_players.append(uid_int)
-            else:
-                removed.append(uid_int)
-
-        self.players = valid_players
-
-        if len(self.players) < 2:
-            # nothing deducted yet, so safe to bail
-            return await interaction.response.send_message(
-                "After balance check there are fewer than 2 eligible players. "
-                "Party cancelled.",
-                ephemeral=True
-            )
-
-        # Lock the game so no more joins
-        self.started = True
-        DICE_PARTY_CHANNELS.discard(self.channel_id)
-
-        # --- fun rolling animation on the main message ---
-        try:
-            guild = interaction.guild
-            player_lines = []
-            for uid_int in self.players:
-                m = guild.get_member(uid_int) if guild else None
-                player_lines.append(m.mention if m else f"<@{uid_int}>")
-            players_list = "\n".join(player_lines)
-
-            anim_embed = discord.Embed(
-                title="🎲 EliHaus Dice Party — Rolling",
-                description=(
-                    "Locking in players and stakes...\n\n"
-                    f"{players_list}"
-                ),
-                colour=discord.Colour.gold(),
-                timestamp=now_local(),
-            )
-
-            # first update also counts as the interaction response
-            await interaction.response.edit_message(embed=anim_embed, view=self)
-            await asyncio.sleep(1)
-
-            anim_embed.description = (
-                "Everyone grabs their dice...\n\n"
-                f"{players_list}"
-            )
-            await interaction.message.edit(embed=anim_embed, view=self)
-            await asyncio.sleep(1)
-
-            anim_embed.description = "🎲 Shaking… shaking… shaking…"
-            await interaction.message.edit(embed=anim_embed, view=self)
-            await asyncio.sleep(1)
-        except Exception:
-            # if anything fails above, just continue to the actual roll
-            pass
-
-        # Deduct stake from all valid players
-        pot = 0
-        for uid_int in self.players:
-            uid = str(uid_int)
-            change_balance(
-                uid,
-                -self.stake,
-                "bet",
-                meta=f"dice_party:{self.game_id}"
-            )
-            pot += self.stake
-
-        # Roll dice
-        import random
-        rolls: dict[int, int] = {}
-        for uid_int in self.players:
-            rolls[uid_int] = random.randint(1, 6)
-
-        max_roll = max(rolls.values())
-        winners = [uid for uid, r in rolls.items() if r == max_roll]
-
-        # Split pot between winners
-        share = pot // len(winners)
-        leftover = pot - share * len(winners)
-
-        for i, uid_int in enumerate(winners):
-            payout = share + (leftover if i == 0 else 0)
-            uid = str(uid_int)
-            change_balance(
-                uid,
-                payout,
-                "payout",
-                meta=f"dice_party_win:{self.game_id}"
-            )
-
-        # Build result embed
-        lines = []
-        guild = interaction.guild
-        for uid_int, r in rolls.items():
-            m = guild.get_member(uid_int) if guild else None
-            name = m.mention if m else f"<@{uid_int}>"
-            mark = "🏆" if uid_int in winners else " "
-            lines.append(f"{mark} {name} rolled **{r}**")
-
-        desc = "\n".join(lines)
-        if len(winners) == 1:
-            w_member = guild.get_member(winners[0]) if guild else None
-            w_name = w_member.mention if w_member else f"<@{winners[0]}>"
-            result_line = f"\n\n🏆 **{w_name} wins** the pot of **{pot}** coins!"
-        else:
-            winner_mentions = []
-            for uid_int in winners:
-                m = guild.get_member(uid_int) if guild else None
-                winner_mentions.append(m.mention if m else f"<@{uid_int}>")
-            result_line = (
-                f"\n\n🤝 Tie on **{max_roll}**. "
-                f"{', '.join(winner_mentions)} share the pot (**{pot}** total)."
-            )
-
-        embed = discord.Embed(
-            title="🎲 EliHaus Dice Party — Result",
-            description=desc + result_line,
-            colour=discord.Colour.gold(),
-            timestamp=now_local()
+        e.title = "🎲 EliHaus Dice Party"
+        e.description = (
+            f"Stake: **{self.stake}** coins per player\n"
+            f"Players: **{len(self.players)}/{self.max_players}**\n\n"
+            "Click **Join** to enter. Host presses **Start** to roll."
         )
-        embed.add_field(name="Stake per player", value=str(self.stake), inline=True)
-        embed.add_field(name="Players", value=str(len(self.players)), inline=True)
-        embed.add_field(name="Pot", value=str(pot), inline=True)
-        embed.set_footer(text="EliHaus Dice Party")
+        e.clear_fields()
+        e.add_field(name="Players", value=players_list, inline=False)
 
-        # Disable buttons
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
-        # final update: overwrite the main message with the result
         try:
-            await interaction.message.edit(embed=embed, view=self)
+            await msg.edit(embed=e, view=self)
         except Exception:
+            # never let a UI edit kill the view
             pass
 
     # --- Buttons ---
@@ -1587,6 +1426,8 @@ class DicePartyView(discord.ui.View):
             )
 
         self.players.append(user.id)
+
+        # defer so we can safely edit the main message
         await interaction.response.defer(ephemeral=True, thinking=False)
         await self._update_message(interaction)
 
@@ -1608,109 +1449,192 @@ class DicePartyView(discord.ui.View):
                 "Need at least **2** players to start.", ephemeral=True
             )
 
-        # Re-check balances and drop anyone who can’t afford now
-        valid_players: list[int] = []
-        removed: list[int] = []
-        for uid_int in self.players:
-            uid = str(uid_int)
-            bal = get_balance(uid)
-            if bal >= self.stake:
-                valid_players.append(uid_int)
-            else:
-                removed.append(uid_int)
-
-        self.players = valid_players
-
-        if len(self.players) < 2:
-            # nothing deducted yet, so safe to bail
-            return await interaction.response.send_message(
-                "After balance check there are fewer than 2 eligible players. "
-                "Party cancelled.",
-                ephemeral=True
-            )
-
-        # Lock the game
-        self.started = True
-        DICE_PARTY_CHANNELS.discard(self.channel_id)
-
-        # Deduct stake from all valid players
-        pot = 0
-        for uid_int in self.players:
-            uid = str(uid_int)
-            change_balance(
-                uid,
-                -self.stake,
-                "bet",
-                meta=f"dice_party:{self.game_id}"
-            )
-            pot += self.stake
-
-        # Roll dice
-        rolls: dict[int, int] = {}
-        for uid_int in self.players:
-            rolls[uid_int] = random.randint(1, 6)
-
-        max_roll = max(rolls.values())
-        winners = [uid for uid, r in rolls.items() if r == max_roll]
-
-        # Split pot between winners
-        share = pot // len(winners)
-        leftover = pot - share * len(winners)
-
-        for i, uid_int in enumerate(winners):
-            payout = share + (leftover if i == 0 else 0)
-            uid = str(uid_int)
-            change_balance(
-                uid,
-                payout,
-                "payout",
-                meta=f"dice_party_win:{self.game_id}"
-            )
-
-        # Build result embed
-        lines = []
-        guild = interaction.guild
-        for uid_int, r in rolls.items():
-            m = guild.get_member(uid_int) if guild else None
-            name = m.mention if m else f"<@{uid_int}>"
-            mark = "🏆" if uid_int in winners else " "
-            lines.append(f"{mark} {name} rolled **{r}**")
-
-        desc = "\n".join(lines)
-        if len(winners) == 1:
-            w_member = guild.get_member(winners[0]) if guild else None
-            w_name = w_member.mention if w_member else f"<@{winners[0]}>"
-            result_line = f"\n\n🏆 **{w_name} wins** the pot of **{pot}** coins!"
-        else:
-            winner_mentions = []
-            for uid_int in winners:
-                m = guild.get_member(uid_int) if guild else None
-                winner_mentions.append(m.mention if m else f"<@{uid_int}>")
-            result_line = (
-                f"\n\n🤝 Tie on **{max_roll}**. "
-                f"{', '.join(winner_mentions)} share the pot (**{pot}** total)."
-            )
-
-        embed = discord.Embed(
-            title="🎲 EliHaus Dice Party — Result",
-            description=desc + result_line,
-            colour=discord.Colour.gold(),
-            timestamp=now_local()
-        )
-        embed.add_field(name="Stake per player", value=str(self.stake), inline=True)
-        embed.add_field(name="Players", value=str(len(self.players)), inline=True)
-        embed.add_field(name="Pot", value=str(pot), inline=True)
-        embed.set_footer(text="EliHaus Dice Party")
-
-        # Disable buttons
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
         try:
-            await interaction.response.edit_message(embed=embed, view=self)
-        except discord.InteractionResponded:
-            await interaction.followup.send(embed=embed, ephemeral=False)
+            # Re-check balances and drop anyone who can’t afford now
+            valid_players: list[int] = []
+            removed: list[int] = []
+            for uid_int in self.players:
+                uid = str(uid_int)
+                bal = get_balance(uid)
+                if bal >= self.stake:
+                    valid_players.append(uid_int)
+                else:
+                    removed.append(uid_int)
+
+            self.players = valid_players
+
+            if len(self.players) < 2:
+                # nothing deducted yet, so safe to bail
+                return await interaction.response.send_message(
+                    "After balance check there are fewer than 2 eligible players. "
+                    "Party cancelled.",
+                    ephemeral=True
+                )
+
+            # Lock the game
+            self.started = True
+            # free this channel for future parties
+            DICE_PARTY_CHANNELS.discard(interaction.channel.id)
+
+            # Optional: quick little animation on the main message
+            try:
+                guild = interaction.guild
+                players_list = self._player_list_text(guild)
+                anim_embed = discord.Embed(
+                    title="🎲 EliHaus Dice Party — Rolling",
+                    description="Locking in players and stakes...\n\n" + players_list,
+                    colour=discord.Colour.gold(),
+                    timestamp=now_local(),
+                )
+                await interaction.response.edit_message(embed=anim_embed, view=self)
+                await asyncio.sleep(1)
+
+                anim_embed.description = "🎲 Shaking the dice..."
+                await interaction.edit_original_response(embed=anim_embed, view=self)
+                await asyncio.sleep(1)
+            except Exception:
+                # if animation fails, just carry on
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+
+     
+            # Deduct stake from all valid players
+            pot = 0
+            game_id = getattr(self, "game_id", f"dice_{interaction.id}")
+            guild = interaction.guild
+            for uid_int in self.players:
+                uid = str(uid_int)
+            
+                # deduct coins
+                change_balance(
+                    uid,
+                    -self.stake,
+                    "bet",
+                    meta=f"dice_party:{game_id}"
+                )
+                pot += self.stake
+            
+                # 🔹 tell ONLY this player what was deducted + new balance
+                if guild:
+                    member = guild.get_member(uid_int)
+                else:
+                    member = None
+            
+                if member:
+                    new_bal = get_balance(uid)
+                    try:
+                        await member.send(
+                            f"🎲 EliHaus Dice Party\n"
+                            f"Bet deducted: **{self.stake}** coins.\n"
+                            f"Your new balance: **{new_bal}** coins."
+                        )
+                    except Exception:
+                        # DMs closed etc.
+                        pass
+
+                # 🔔 DM this player their deduction + new balance
+                await notify_bet_deduction(guild, uid_int, self.stake, "Dice Party")
+
+
+            # Roll dice
+            import random
+            rolls: dict[int, int] = {}
+            for uid_int in self.players:
+                rolls[uid_int] = random.randint(1, 6)
+
+            max_roll = max(rolls.values())
+            winners = [uid for uid, r in rolls.items() if r == max_roll]
+
+            # Split pot between winners
+            share = pot // len(winners)
+            leftover = pot - share * len(winners)
+
+            for i, uid_int in enumerate(winners):
+                payout = share + (leftover if i == 0 else 0)
+                uid = str(uid_int)
+                change_balance(
+                    uid,
+                    payout,
+                    "payout",
+                    meta=f"dice_party_win:{game_id}"
+                )
+            
+                # 🔹 tell ONLY this winner their payout + new balance
+                guild = interaction.guild
+                member = guild.get_member(uid_int) if guild else None
+                if member:
+                    new_bal = get_balance(uid)
+                    try:
+                        await member.send(
+                            f"🎲 EliHaus Dice Party\n"
+                            f"You won **{payout}** coins.\n"
+                            f"Your new balance: **{new_bal}** coins."
+                        )
+                    except Exception:
+                        pass
+
+            # Build result embed
+            lines = []
+            guild = interaction.guild
+            for uid_int, r in rolls.items():
+                m = guild.get_member(uid_int) if guild else None
+                name = m.mention if m else f"<@{uid_int}>"
+                mark = "🏆" if uid_int in winners else " "
+                lines.append(f"{mark} {name} rolled **{r}**")
+
+            desc = "\n".join(lines)
+            if len(winners) == 1:
+                w_member = guild.get_member(winners[0]) if guild else None
+                w_name = w_member.mention if w_member else f"<@{winners[0]}>"
+                result_line = f"\n\n🏆 **{w_name} wins** the pot of **{pot}** coins!"
+            else:
+                winner_mentions = []
+                for uid_int in winners:
+                    m = guild.get_member(uid_int) if guild else None
+                    winner_mentions.append(m.mention if m else f"<@{uid_int}>")
+                result_line = (
+                    f"\n\n🤝 Tie on **{max_roll}**. "
+                    f"{', '.join(winner_mentions)} share the pot (**{pot}** total)."
+                )
+
+            embed = discord.Embed(
+                title="🎲 EliHaus Dice Party — Result",
+                description=desc + result_line,
+                colour=discord.Colour.gold(),
+                timestamp=now_local()
+            )
+            embed.add_field(name="Stake per player", value=str(self.stake), inline=True)
+            embed.add_field(name="Players", value=str(len(self.players)), inline=True)
+            embed.add_field(name="Pot", value=str(pot), inline=True)
+            embed.set_footer(text="EliHaus Dice Party")
+
+            # Disable buttons
+            for child in self.children:
+                if isinstance(child, discord.ui.Button):
+                    child.disabled = True
+
+            try:
+                # we already responded during animation, so edit original
+                await interaction.edit_original_response(embed=embed, view=self)
+            except discord.InteractionResponded:
+                await interaction.followup.send(embed=embed, ephemeral=False)
+
+        except Exception:
+            import traceback
+            print("DICE PARTY START ERROR:\n", traceback.format_exc())
+            # Make sure the channel is freed even on error
+            self.started = True
+            DICE_PARTY_CHANNELS.discard(interaction.channel.id)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Something went wrong starting this dice party. "
+                    "If coins moved, ping an admin.", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ Something went wrong starting this dice party. "
+                    "If coins moved, ping an admin.", ephemeral=True
+                )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="🛑")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1727,7 +1651,7 @@ class DicePartyView(discord.ui.View):
             )
 
         self.started = True
-        DICE_PARTY_CHANNELS.discard(self.channel_id)
+        DICE_PARTY_CHANNELS.discard(interaction.channel.id)
 
         # Disable buttons
         for child in self.children:
@@ -1736,7 +1660,10 @@ class DicePartyView(discord.ui.View):
 
         try:
             msg = interaction.message
-            e = msg.embeds[0] if msg.embeds else discord.Embed(colour=discord.Colour.dark_grey())
+            e = msg.embeds[0] if msg.embeds else discord.Embed(
+                colour=discord.Colour.dark_grey(),
+                timestamp=now_local(),
+            )
             e.title = "🎲 EliHaus Dice Party — Cancelled"
             e.description = "The host cancelled this dice party. No coins were taken."
             e.clear_fields()
@@ -1772,6 +1699,41 @@ async def eh_dice_party(
             "There’s already an open dice party in this channel. Finish or cancel it first.",
             ephemeral=True
         )
+
+    host = interaction.user
+    uid_host = str(host.id)
+    ensure_user(uid_host)
+    bal_host = get_balance(uid_host)
+    if bal_host < stake:
+        return await interaction.response.send_message(
+            f"You need at least **{stake}** coins to host a party. "
+            f"You currently have **{bal_host}**.",
+            ephemeral=True
+        )
+
+    DICE_PARTY_CHANNELS.add(ch_id)
+
+    view = DicePartyView(
+        host=host,
+        stake=stake,
+        max_players=max_players,
+    )
+
+    # Initial lobby embed
+    e = discord.Embed(
+        title="🎲 EliHaus Dice Party",
+        description=(
+            f"Stake: **{stake}** coins per player\n"
+            f"Players: **1/{view.max_players}**\n\n"
+            "Click **Join** to enter. Host presses **Start** to roll."
+        ),
+        colour=discord.Colour.gold(),
+        timestamp=now_local()
+    )
+    e.add_field(name="Players", value=host.mention, inline=False)
+    e.set_footer(text="Everyone stakes; highest roll wins the pot.")
+
+    await interaction.response.send_message(embed=e, view=view)
 
     host = interaction.user  # above
     view = DicePartyView(host=host, stake=stake, max_players=max_players)
@@ -2162,6 +2124,40 @@ async def eh_weekly(interaction: discord.Interaction):
         new_bal = change_balance(uid, WEEKLY_AMOUNT, "claim", "weekly")
         c.execute("UPDATE users SET last_weekly=? WHERE discord_id=?", (iso(nowt), uid))
     await interaction.response.send_message(f"Weekly claimed: **{WEEKLY_AMOUNT}** coins. New balance: **{new_bal}**", ephemeral=True)
+
+
+# ---------- Bet notification helper (used by all games) ----------
+
+async def notify_bet_deduction(
+    guild: discord.Guild | None,
+    user_id: int,
+    amount: int,
+    game_name: str,
+):
+    """
+    DM the player how much was deducted for this bet
+    and show their new total balance.
+    """
+    uid = str(user_id)
+    new_bal = get_balance(uid)
+
+    if not guild:
+        return
+
+    member = guild.get_member(user_id)
+    if not member:
+        return
+
+    try:
+        await member.send(
+            f"🎰 EliHaus {game_name}\n"
+            f"Bet deducted: **{amount}** coins.\n"
+            f"Your new balance: **{new_bal}** coins."
+        )
+    except Exception:
+        # DMs closed / blocked etc. – ignore silently
+        pass
+
 
 @bot.tree.command(name="eh_balance", description="Check your coin balance (or someone else's)")
 @app_commands.describe(user="(optional) member to check")
