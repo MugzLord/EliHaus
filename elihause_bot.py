@@ -8,9 +8,9 @@ from zoneinfo import ZoneInfo  # proper DST (e.g., Europe/London)
 import io, time
 
 # ---------------- Config ----------------
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Set DISCORD_TOKEN")f
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    raise RuntimeError("Set DISCORD_TOKEN")
 
 GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0"))
 
