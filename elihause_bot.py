@@ -1439,7 +1439,7 @@ class DicePartyView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=False)
         await self._update_message(interaction)
 
-    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🚀")
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🎲")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.started:
             return await interaction.response.send_message(
@@ -2193,10 +2193,7 @@ def build_roulette_result_embed(*, rlabel: str, outcome: str, roll: int,
     return e
 
 #dice====
-@bot.tree.command(
-    name="eh_dice_duel",
-    description="Peer-to-peer dice duel (both stake coins)"
-)
+#dice====
 @bot.tree.command(
     name="eh_dice_duel",
     description="Peer-to-peer dice duel (both stake coins)"
@@ -2210,28 +2207,30 @@ async def eh_dice_duel(
     opponent: discord.Member,
     stake: int
 ):
+    """Slash command to start a 1v1 dice duel."""
     challenger = interaction.user
 
-    if stake <= 0:
+    if opponent.bot:
         return await interaction.response.send_message(
-            "Stake must be a positive number of coins.",
-            ephemeral=True,
+            "You can’t duel a bot, babe.",
+            ephemeral=True
         )
 
     if opponent.id == challenger.id:
         return await interaction.response.send_message(
-            "You can’t duel yourself. Calm down.",
-            ephemeral=True,
+            "You can’t duel yourself. Go play Slots instead.",
+            ephemeral=True
         )
 
-    if opponent.bot:
+    if stake <= 0:
         return await interaction.response.send_message(
-            "You can’t duel a bot. They cheat.",
-            ephemeral=True,
+            "Stake must be a positive number of coins.",
+            ephemeral=True
         )
 
     chal_id = str(challenger.id)
     opp_id = str(opponent.id)
+
     ensure_user(chal_id)
     ensure_user(opp_id)
 
@@ -2241,13 +2240,13 @@ async def eh_dice_duel(
     if chal_bal < stake:
         return await interaction.response.send_message(
             f"You only have **{chal_bal}** coins. You need **{stake}**.",
-            ephemeral=True,
+            ephemeral=True
         )
 
     if opp_bal < stake:
         return await interaction.response.send_message(
             f"{opponent.mention} doesn’t have enough coins for that stake.",
-            ephemeral=True,
+            ephemeral=True
         )
 
     view = DiceDuelRequestView(challenger, opponent, stake)
@@ -2260,39 +2259,38 @@ async def eh_dice_duel(
             f"{opponent.mention}, click **Accept duel** or **Decline** below."
         ),
         colour=discord.Colour.gold(),
-        timestamp=now_local(),
+        timestamp=now_local()
     )
 
-    await interaction.response.send_message(
-        content=opponent.mention,
-        embed=embed,
-        view=view,
-    )
-    # store message so the view can edit it later
-    view.message = await interaction.original_response()
+    await interaction.response.send_message(embed=embed, view=view)
 
+    # store message on view for timeout / edits
+    try:
+        view.message = await interaction.original_response()
+    except Exception:
+        view.message = None
 
-# ======================= Dice Duel (1v1) =======================
 
 class DiceDuelRequestView(discord.ui.View):
     def __init__(self, challenger: discord.Member, opponent: discord.Member, stake: int):
-        super().__init__(timeout=120)  # 2 minutes to respond
+        super().__init__(timeout=120)  # 2 minutes
         self.challenger = challenger
         self.opponent = opponent
         self.stake = stake
         self.message: discord.Message | None = None
-        self.resolved: bool = False
+        self.resolved = False
 
     async def _finish(
         self,
         content: str | None = None,
-        embed: discord.Embed | None = None,
+        embed: discord.Embed | None = None
     ):
-        """Disable buttons and update the message one last time."""
         self.resolved = True
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
+
+        # disable buttons
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
 
         if self.message:
             try:
@@ -2300,25 +2298,21 @@ class DiceDuelRequestView(discord.ui.View):
             except Exception:
                 pass
 
-    # -------- Buttons --------
+        self.stop()
 
     @discord.ui.button(label="Accept duel", style=discord.ButtonStyle.success, emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.resolved:
-            return await interaction.response.send_message(
-                "This duel is already resolved.", ephemeral=True
-            )
-
-        # only the challenged opponent can accept
         if interaction.user.id != self.opponent.id:
             return await interaction.response.send_message(
                 "Only the challenged player can accept this duel.",
-                ephemeral=True,
+                ephemeral=True
             )
 
-        # re-check balances
+        await interaction.response.defer(ephemeral=True)
+
         chal_id = str(self.challenger.id)
         opp_id = str(self.opponent.id)
+
         ensure_user(chal_id)
         ensure_user(opp_id)
 
@@ -2326,145 +2320,104 @@ class DiceDuelRequestView(discord.ui.View):
         opp_bal = get_balance(opp_id)
 
         if chal_bal < self.stake or opp_bal < self.stake:
-            msg_bits = []
+            bits = []
             if chal_bal < self.stake:
-                msg_bits.append(f"{self.challenger.mention} has only **{chal_bal}**.")
+                bits.append(f"{self.challenger.mention} has only **{chal_bal}**.")
             if opp_bal < self.stake:
-                msg_bits.append(f"{self.opponent.mention} has only **{opp_bal}**.")
-            await interaction.response.defer(ephemeral=True, thinking=False)
+                bits.append(f"{self.opponent.mention} has only **{opp_bal}**.")
             await self._finish(
                 "❌ Duel cancelled. Someone no longer has enough coins.\n"
-                + "\n".join(msg_bits)
+                + "\n".join(bits)
             )
             return
 
-        # lock state
-        self.resolved = True
-
-        # --- animation: 2s intervals ---
-        msg = self.message or interaction.message
-        guild = interaction.guild
-
-        desc_players = f"{self.challenger.mention} vs {self.opponent.mention}\n\n"
-        anim_embed = discord.Embed(
-            title="🎲 Dice Duel — Rolling",
-            description=desc_players + "Both grip their dice...",
-            colour=discord.Colour.gold(),
-            timestamp=now_local(),
-        )
-
-        # respond by editing the original
-        if interaction.response.is_done():
-            await msg.edit(embed=anim_embed, view=self)
-        else:
-            await interaction.response.edit_message(embed=anim_embed, view=self)
-        await asyncio.sleep(2)
-
-        anim_embed.description = desc_players + "They lock eyes across the table..."
-        await msg.edit(embed=anim_embed, view=self)
-        await asyncio.sleep(2)
-
-        anim_embed.description = desc_players + "🎲 Shaking… shaking… shaking…"
-        await msg.edit(embed=anim_embed, view=self)
-        await asyncio.sleep(2)
-
-        # --- take stakes (no DMs) ---
-        pot = 0
-        change_balance(chal_id, -self.stake, "bet", meta="dice_duel")
-        change_balance(opp_id, -self.stake, "bet", meta="dice_duel")
+        # take coins
         pot = self.stake * 2
+        change_balance(chal_id, -self.stake, "bet", meta=f"dice_duel:vs:{opp_id}")
+        change_balance(opp_id, -self.stake, "bet", meta=f"dice_duel:vs:{chal_id}")
 
-        # --- roll dice ---
-        chal_roll = random.randint(1, 6)
-        opp_roll = random.randint(1, 6)
-
-        # if tie: simple reroll once; if still tie, refund both
-        if chal_roll == opp_roll:
-            chal_roll2 = random.randint(1, 6)
-            opp_roll2 = random.randint(1, 6)
-            chal_roll, opp_roll = chal_roll2, opp_roll2
-
-            if chal_roll == opp_roll:
-                # full refund
-                change_balance(chal_id, self.stake, "refund", meta="dice_duel_tie")
-                change_balance(opp_id, self.stake, "refund", meta="dice_duel_tie")
-
-                tie_embed = discord.Embed(
-                    title="🎲 Dice Duel — Perfect Tie",
-                    description=(
-                        f"{self.challenger.mention} rolled **{chal_roll}**\n"
-                        f"{self.opponent.mention} rolled **{opp_roll}**\n\n"
-                        "Nobody wins, nobody loses. Stakes refunded."
+        # little rolling animation in-channel
+        anim_lines = [
+            f"{self.challenger.mention} vs {self.opponent.mention}",
+            "",
+            "🎲 Rolling the dice...",
+        ]
+        if self.message:
+            try:
+                await self.message.edit(
+                    content=None,
+                    embed=discord.Embed(
+                        title="🎲 Dice Duel",
+                        description="\n".join(anim_lines),
+                        colour=discord.Colour.gold(),
+                        timestamp=now_local()
                     ),
-                    colour=discord.Colour.gold(),
-                    timestamp=now_local(),
+                    view=self
                 )
-                await self._finish(embed=tie_embed)
-                return
+            except Exception:
+                pass
 
-        # determine winner
-        if chal_roll > opp_roll:
-            winner = self.challenger
-            loser = self.opponent
-            winner_id = chal_id
+        await asyncio.sleep(2)
+
+        import random
+        c1, c2 = random.randint(1, 6), random.randint(1, 6)
+        o1, o2 = random.randint(1, 6), random.randint(1, 6)
+        chal_total = c1 + c2
+        opp_total = o1 + o2
+
+        lines: list[str] = []
+        lines.append(f"{self.challenger.mention} rolls **{c1} + {c2} = {chal_total}**")
+        lines.append(f"{self.opponent.mention} rolls **{o1} + {o2} = {opp_total}**")
+        lines.append("")
+
+        if chal_total > opp_total:
+            change_balance(chal_id, pot, "payout", meta=f"dice_duel_win:vs:{opp_id}")
+            lines.append(f"🏆 {self.challenger.mention} wins **{pot}** coins!")
+        elif opp_total > chal_total:
+            change_balance(opp_id, pot, "payout", meta=f"dice_duel_win:vs:{chal_id}")
+            lines.append(f"🏆 {self.opponent.mention} wins **{pot}** coins!")
         else:
-            winner = self.opponent
-            loser = self.challenger
-            winner_id = opp_id
-
-        change_balance(winner_id, pot, "payout", meta="dice_duel_win")
+            change_balance(chal_id, self.stake, "payout", meta="dice_duel_refund")
+            change_balance(opp_id, self.stake, "payout", meta="dice_duel_refund")
+            lines.append("🤝 It’s a tie! Both players are refunded.")
 
         result_embed = discord.Embed(
-            title="🎲 Dice Duel — Result",
-            description=(
-                f"{self.challenger.mention} rolled **{chal_roll}**\n"
-                f"{self.opponent.mention} rolled **{opp_roll}**\n\n"
-                f"🏆 **{winner.mention} wins** the pot of **{pot}** coins!\n"
-                f"Better luck next time, {loser.mention}."
-            ),
+            title="🎲 Dice Duel Result",
+            description="\n".join(lines),
             colour=discord.Colour.gold(),
-            timestamp=now_local(),
+            timestamp=now_local()
         )
 
-        # disable buttons and show result
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
         await self._finish(embed=result_embed)
+        await interaction.followup.send("Duel resolved.", ephemeral=True)
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="🛑")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.resolved:
+        if interaction.user.id not in (self.opponent.id, self.challenger.id):
             return await interaction.response.send_message(
-                "This duel is already resolved.", ephemeral=True
+                "Only the challenger or the challenged player can cancel this duel.",
+                ephemeral=True
             )
 
-        if interaction.user.id != self.opponent.id:
-            return await interaction.response.send_message(
-                "Only the challenged player can decline this duel.",
-                ephemeral=True,
-            )
-
-        await interaction.response.defer(ephemeral=True, thinking=False)
-        await self._finish(
-            f"❌ Dice duel declined by {self.opponent.mention}."
-        )
+        await interaction.response.defer(ephemeral=True)
+        await self._finish(f"❌ Dice duel cancelled by {interaction.user.mention}.")
+        await interaction.followup.send("Duel cancelled.", ephemeral=True)
 
     async def on_timeout(self):
         if self.resolved or not self.message:
             return
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
+
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
         try:
             await self.message.edit(
                 content="⏰ Dice duel request expired (no response).",
-                view=self,
+                view=self
             )
         except Exception:
             pass
-
 
 @bot.tree.command(name="eh_dice", description="Show the available EliHaus dice games")
 async def eh_dice(interaction: discord.Interaction):
