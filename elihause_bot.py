@@ -2446,45 +2446,45 @@ class DiceDuelRequestView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        # Small dice-rolling animation (separate message)
+        # --- fun animation + banter while we "roll" ---
         duel_vs = f"{self.challenger.mention} vs {self.opponent.mention}"
+
+        # simple dot animation embed
         anim_embed = discord.Embed(
             title="🎲 EliHaus Dice Duel",
             description=f"{duel_vs}\n\n`· · ·`",
             colour=discord.Colour.gold(),
             timestamp=now_local()
         )
-        anim_msg = await interaction.channel.send(embed=anim_embed)
-
-        for frame in ["`● · ·`", "`● ● ·`", "`● ● ●`"]:
-            await asyncio.sleep(0.6)
-            anim_embed.description = f"{duel_vs}\n\n{frame}"
-            await anim_msg.edit(embed=anim_embed)
-
-        # re-check balances
-        chal_id = str(self.challenger.id)
-
-        # Little roast while the dice are "rolling"
-        banter_text = dice_banter_line(
-            self.challenger.display_name,
-            self.opponent.display_name,
-        )
-        duel_header = f"{self.challenger.mention} vs {self.opponent.mention}"
-        banter_embed = discord.Embed(
-            title="🎲 EliHaus Dice Duel",
-            description=f"{duel_header}\n\n{banter_text}",
-            colour=discord.Colour.dark_purple(),
-            timestamp=now_local()
-        )
         try:
+            anim_msg = await interaction.channel.send(embed=anim_embed)
+
+            for frame in ["`● · ·`", "`● ● ·`", "`● ● ●`"]:
+                await asyncio.sleep(0.6)
+                anim_embed.description = f"{duel_vs}\n\n{frame}"
+                await anim_msg.edit(embed=anim_embed)
+        except Exception:
+            anim_msg = None  # animation is flavour only
+
+        # roast line embed
+        try:
+            banter_text = dice_banter_line(
+                self.challenger.display_name,
+                self.opponent.display_name,
+            )
+            banter_embed = discord.Embed(
+                title="🎲 EliHaus Dice Duel",
+                description=f"{duel_vs}\n\n{banter_text}",
+                colour=discord.Colour.dark_purple(),
+                timestamp=now_local()
+            )
             await interaction.channel.send(embed=banter_embed)
         except Exception:
-            # Banter is flavour only; don't break the duel if sending fails.
             pass
 
-
+        # --- re-check balances ---
+        chal_id = str(self.challenger.id)
         opp_id = str(self.opponent.id)
-
         ensure_user(chal_id)
         ensure_user(opp_id)
 
@@ -2492,76 +2492,94 @@ class DiceDuelRequestView(discord.ui.View):
         opp_bal = get_balance(opp_id)
 
         if chal_bal < self.stake or opp_bal < self.stake:
-            bits = []
+            msg_bits = []
             if chal_bal < self.stake:
-                bits.append(f"{self.challenger.mention} has only **{chal_bal}**.")
+                msg_bits.append(f"{self.challenger.mention} has only **{chal_bal}**.")
             if opp_bal < self.stake:
-                bits.append(f"{self.opponent.mention} has only **{opp_bal}**.")
+                msg_bits.append(f"{self.opponent.mention} has only **{opp_bal}**.")
             await self._finish(
                 "❌ Duel cancelled. Someone no longer has enough coins.\n"
-                + "\n".join(bits)
+                + "\n".join(msg_bits)
             )
             return
 
-        # take coins
+        # --- take stakes ---
         pot = self.stake * 2
         change_balance(chal_id, -self.stake, "bet", meta=f"dice_duel:vs:{opp_id}")
         change_balance(opp_id, -self.stake, "bet", meta=f"dice_duel:vs:{chal_id}")
 
-        # little rolling animation in-channel
-        anim_lines = [
-            f"{self.challenger.mention} vs {self.opponent.mention}",
-            "",
-            "🎲 Rolling the dice...",
-        ]
-        if self.message:
-            try:
-                await self.message.edit(
-                    content=None,
-                    embed=discord.Embed(
-                        title="🎲 Dice Duel",
-                        description="\n".join(anim_lines),
-                        colour=discord.Colour.gold(),
-                        timestamp=now_local()
-                    ),
-                    view=self
-                )
-            except Exception:
-                pass
-
-        await asyncio.sleep(2)
-
-        import random
+        # --- roll dice ---
         c1, c2 = random.randint(1, 6), random.randint(1, 6)
         o1, o2 = random.randint(1, 6), random.randint(1, 6)
         chal_total = c1 + c2
         opp_total = o1 + o2
 
-        lines: list[str] = []
-        lines.append(f"{self.challenger.mention} rolls **{c1} + {c2} = {chal_total}**")
-        lines.append(f"{self.opponent.mention} rolls **{o1} + {o2} = {opp_total}**")
-        lines.append("")
+        lines = [
+            f"**Stake:** {self.stake} coins each (pot **{pot}**)",
+            "",
+            f"{self.challenger.mention}: 🎲 `{c1} + {c2} = {chal_total}`",
+            f"{self.opponent.mention}: 🎲 `{o1} + {o2} = {opp_total}`",
+            "",
+        ]
+
+        winner_id: int | None = None
+        winner_mention: str | None = None
 
         if chal_total > opp_total:
             change_balance(chal_id, pot, "payout", meta=f"dice_duel_win:vs:{opp_id}")
             lines.append(f"🏆 {self.challenger.mention} wins **{pot}** coins!")
+            winner_id = self.challenger.id
+            winner_mention = self.challenger.mention
         elif opp_total > chal_total:
             change_balance(opp_id, pot, "payout", meta=f"dice_duel_win:vs:{chal_id}")
             lines.append(f"🏆 {self.opponent.mention} wins **{pot}** coins!")
+            winner_id = self.opponent.id
+            winner_mention = self.opponent.mention
         else:
+            # tie → refund
             change_balance(chal_id, self.stake, "payout", meta="dice_duel_refund")
             change_balance(opp_id, self.stake, "payout", meta="dice_duel_refund")
             lines.append("🤝 It’s a tie! Both players are refunded.")
 
+        # --- edit original duel message with summary ---
         result_embed = discord.Embed(
             title="🎲 Dice Duel Result",
             description="\n".join(lines),
             colour=discord.Colour.gold(),
             timestamp=now_local()
         )
-
         await self._finish(embed=result_embed)
-        await interaction.followup.send("Duel resolved.", ephemeral=True)
+
+        # --- separate winner embed as a fresh message ---
+        if winner_id is not None and winner_mention is not None:
+            winner_embed = discord.Embed(
+                title="🏆 Dice Duel Winner",
+                description=f"{winner_mention} wins **{pot}** coins!",
+                colour=discord.Colour.green(),
+                timestamp=now_local()
+            )
+
+            # Use DoubleOrNothingView if you have it; otherwise just send the embed.
+            try:
+                view = DoubleOrNothingView(
+                    winner_id=winner_id,
+                    winner_mention=winner_mention,
+                    amount=pot,
+                    game_label="Dice Duel"
+                )
+            except NameError:
+                view = None
+
+            if view is not None:
+                await interaction.followup.send(embed=winner_embed, view=view)
+            else:
+                await interaction.followup.send(embed=winner_embed)
+        else:
+            # Tie: just info, no winner embed
+            await interaction.followup.send(
+                "Duel resolved (tie, coins refunded).",
+                ephemeral=True
+            )
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="🛑")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
