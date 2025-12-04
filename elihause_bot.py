@@ -2559,6 +2559,7 @@ class DiceDuelRequestView(discord.ui.View):
                 timestamp=now_local()
             )
 
+            # Try to attach Double or Nothing if the view exists
             try:
                 view = DoubleOrNothingView(
                     winner_id=winner_id,
@@ -2569,17 +2570,11 @@ class DiceDuelRequestView(discord.ui.View):
             except NameError:
                 view = None
 
-            # 👉 Send as a normal channel message so it appears at the bottom
+            # Send as a normal channel message so it appears at the bottom
             if view is not None:
                 await interaction.channel.send(embed=winner_embed, view=view)
             else:
                 await interaction.channel.send(embed=winner_embed)
-        else:
-            await interaction.followup.send(
-                "Duel resolved (tie, coins refunded).",
-                ephemeral=True
-            )
-
 
         else:
             # Tie: just info, no winner embed
