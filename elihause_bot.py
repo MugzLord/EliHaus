@@ -1692,11 +1692,6 @@ class DicePartyView(discord.ui.View):
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
 
-        try:
-            await interaction.response.edit_message(embed=embed, view=self)
-        except discord.InteractionResponded:
-            await interaction.followup.send(embed=embed, ephemeral=False)
-
             # If there is exactly one winner, offer Double or Nothing
             if len(winners) == 1:
                 winner_id = winners[0]
@@ -2578,7 +2573,7 @@ class DiceDuelRequestView(discord.ui.View):
 
         else:
             # Tie: just info, no winner embed
-            await interaction.followup.send(
+            await interaction.channel.send(
                 "Duel resolved (tie, coins refunded).",
                 ephemeral=True
             )
@@ -2593,7 +2588,7 @@ class DiceDuelRequestView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True)
         await self._finish(f"❌ Dice duel cancelled by {interaction.user.mention}.")
-        await interaction.followup.send("Duel cancelled.", ephemeral=True)
+        await interaction.channel.send("Duel cancelled.", ephemeral=True)
 
     async def on_timeout(self):
         if self.resolved or not self.message:
@@ -3300,7 +3295,7 @@ async def eh_leaderboard(
             e.description = "\n".join(lines)
         e.set_footer(text=footer)
 
-        await interaction.followup.send(embed=e, ephemeral=not public)
+        await interaction.channel.send(embed=e, ephemeral=not public)
 
     except Exception as e:
         # surface the exact error to you ephemerally
