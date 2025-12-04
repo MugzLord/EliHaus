@@ -1338,6 +1338,28 @@ def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
 # Track which channels already have an open dice party
 DICE_PARTY_CHANNELS: set[int] = set()
 
+# Light roast lines for dice games.
+# {A} and {B} will be replaced with player names.
+DICE_BANTER_TEMPLATES = [
+    "{A} is warming the dice while {B} is googling 'how to be lucky'.",
+    "Dealer whispers: if confidence paid out, {A} would already be bankrupt against {B}.",
+    "{A} is rolling like their Wi-Fi – unstable and full of excuses.",
+    "{B} swears they’re ‘not bothered’, which is exactly what someone losing would say.",
+    "The table’s split: half think {A} will win, the other half think {B} will blame lag.",
+    "{A} is here for coins, {B} is here for content.",
+    "If attitude counted as points, {B} would be in debt by now.",
+    "{A} rolled earlier in practice and the dice called HR.",
+    "The dealer’s side-eye at {B} is doing more damage than the dice.",
+    "{A} says this is ‘just for fun’. Their wallet disagrees."
+]
+
+
+def dice_banter_line(a_name: str, b_name: str) -> str:
+    """Pick one roast line and plug in two names."""
+    template = random.choice(DICE_BANTER_TEMPLATES)
+    return template.replace("{A}", a_name).replace("{B}", b_name)
+
+
 # ======================= Dice Party =======================
 class DoubleOrNothingView(discord.ui.View):
     def __init__(self, winner_id: int, winner_mention: str, amount: int, game_label: str):
@@ -1588,21 +1610,48 @@ class DicePartyView(discord.ui.View):
             await asyncio.sleep(2)
 
             # --- DEDUCT STAKES (NO DMs) ---
-            pot = 0
-            for uid_int in self.players:
-                uid = str(uid_int)
-                change_balance(
-                    uid,
-                    -self.stake,
-                    "bet",
-                    meta=f"dice_party:{self.game_id}",
-                )
-                pot += self.stake
+        # Deduct stake from all valid players
+        pot = 0
+        for uid_int in self.players:
+            uid = str(uid_int)
+            change_balance(
+                uid,
+                -self.stake,
+                "bet",
+                meta=f"dice_party:{self.game_id}"
+            )
+            pot += self.stake
 
-            # --- ROLL THE DICE ---
-            rolls: dict[int, int] = {}
-            for uid_int in self.players:
-                rolls[uid_int] = random.randint(1, 6)
+        # Quick roast while the dice are "rolling"
+        if len(self.players) >= 2:
+            guild = interaction.guild
+            if guild is not None:
+                # Pick any two players to feature in the banter
+                p1_id, p2_id = random.sample(self.players, k=2)
+                m1 = guild.get_member(p1_id)
+                m2 = guild.get_member(p2_id)
+
+                name1 = m1.display_name if m1 else f"Player {p1_id}"
+                name2 = m2.display_name if m2 else f"Player {p2_id}"
+
+                banter_text = dice_banter_line(name1, name2)
+                banter_embed = discord.Embed(
+                    title="🎲 EliHaus Dice Party",
+                    description=f"Dice are rolling...\n\n{banter_text}",
+                    colour=discord.Colour.dark_purple(),
+                    timestamp=now_local()
+                )
+                try:
+                    await interaction.channel.send(embed=banter_embed)
+                except Exception:
+                    # Flavour only; ignore failures.
+                    pass
+
+        # Roll dice
+        rolls: dict[int, int] = {}
+        for uid_int in self.players:
+            rolls[uid_int] = random.randint(1, 6)
+
 
             max_roll = max(rolls.values())
             winners = [uid for uid, r in rolls.items() if r == max_roll]
@@ -2428,6 +2477,25 @@ class DiceDuelRequestView(discord.ui.View):
 
         # re-check balances
         chal_id = str(self.challenger.id)
+
+        # Little roast while the dice are "rolling"
+        banter_text = dice_banter_line(
+            self.challenger.display_name,
+            self.opponent.display_name,
+        )
+        duel_header = f"{self.challenger.mention} vs {self.opponent.mention}"
+        banter_embed = discord.Embed(
+            title="🎲 EliHaus Dice Duel",
+            description=f"{duel_header}\n\n{banter_text}",
+            colour=discord.Colour.dark_purple(),
+            timestamp=now_local()
+        )
+        try:
+            await interaction.channel.send(embed=banter_embed)
+        except Exception:
+            # Banter is flavour only; don't break the duel if sending fails.
+            pass
+
 
         opp_id = str(self.opponent.id)
 
