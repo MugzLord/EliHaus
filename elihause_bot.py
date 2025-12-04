@@ -1598,7 +1598,8 @@ class DicePartyView(discord.ui.View):
             )
             pot += self.stake
 
-        # Quick roast while the dice are "rolling"
+     
+        # Quick roast + rolling animation while the dice are "rolling"
         if len(self.players) >= 2:
             guild = interaction.guild
             if guild is not None and len(self.players) >= 2:
@@ -1610,14 +1611,21 @@ class DicePartyView(discord.ui.View):
                 name2 = m2.display_name if m2 else f"Player {p2_id}"
 
                 banter_text = dice_banter_line(name1, name2)
-                banter_embed = discord.Embed(
+
+                base_desc = f"Dice are rolling...\n\n{banter_text}"
+                anim_embed = discord.Embed(
                     title="🎲 EliHaus Dice Party",
-                    description=f"Dice are rolling...\n\n{banter_text}",
+                    description=base_desc + "\n\n`· · ·`",
                     colour=discord.Colour.dark_purple(),
                     timestamp=now_local()
                 )
                 try:
-                    await interaction.channel.send(embed=banter_embed)
+                    anim_msg = await interaction.channel.send(embed=anim_embed)
+
+                    for frame in ["`● · ·`", "`● ● ·`", "`● ● ●`"]:
+                        await asyncio.sleep(0.6)
+                        anim_embed.description = base_desc + f"\n\n{frame}"
+                        await anim_msg.edit(embed=anim_embed)
                 except Exception:
                     # Flavour only; ignore failures.
                     pass
