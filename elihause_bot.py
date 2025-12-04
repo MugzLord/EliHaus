@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from zoneinfo import ZoneInfo  # proper DST (e.g., Europe/London)
-import io, time
+import io, time, asyncio
 
 # ---------------- Config ----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -1338,8 +1338,90 @@ def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
 # Track which channels already have an open dice party
 DICE_PARTY_CHANNELS: set[int] = set()
 
-
 # ======================= Dice Party =======================
+class DoubleOrNothingView(discord.ui.View):
+    def __init__(self, winner_id: int, winner_mention: str, amount: int, game_label: str):
+        super().__init__(timeout=60)
+        self.winner_id = winner_id
+        self.winner_mention = winner_mention
+        self.amount = amount
+        self.game_label = game_label
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.winner_id:
+            await interaction.response.send_message(
+                "Only the winner can press this button, behave.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Double or Nothing", style=discord.ButtonStyle.danger, emoji="🔥")
+    async def double_or_nothing(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+        # Disable button after first click
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        uid = str(self.winner_id)
+        ensure_user(uid)
+        bal = get_balance(uid)
+
+        stake = max(1, self.amount // 2)
+
+        if bal < stake:
+            embed = discord.Embed(
+                title=f"🎰 Double or Nothing — {self.game_label}",
+                description=(
+                    f"{self.winner_mention}, you don’t have enough coins left to risk "
+                    f"**{stake}** right now."
+                ),
+                colour=discord.Colour.red(),
+                timestamp=now_local()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        # Take the stake as a bet
+        change_balance(uid, -stake, "bet", meta=f"double_or_nothing:{self.game_label}")
+
+        player_roll = random.randint(1, 6)
+        house_roll = random.randint(1, 6)
+
+        if player_roll > house_roll:
+            # Pay back 2× stake (net +stake)
+            change_balance(uid, stake * 2, "payout", meta=f"double_or_nothing_win:{self.game_label}")
+            outcome = (
+                f"🎉 You rolled **{player_roll}**, house rolled **{house_roll}**.\n\n"
+                f"You win **{stake}** extra coins."
+            )
+        elif player_roll < house_roll:
+            outcome = (
+                f"😬 You rolled **{player_roll}**, house rolled **{house_roll}**.\n\n"
+                f"You lose the **{stake}** coins you risked."
+            )
+        else:
+            # Tie: refund stake
+            change_balance(uid, stake, "payout", meta=f"double_or_nothing_refund:{self.game_label}")
+            outcome = (
+                f"🤝 You rolled **{player_roll}**, house rolled **{house_roll}**.\n\n"
+                f"It’s a tie — your stake is refunded."
+            )
+
+        embed = discord.Embed(
+            title=f"🎰 Double or Nothing — {self.game_label}",
+            description=f"{self.winner_mention}\n\n{outcome}",
+            colour=discord.Colour.orange(),
+            timestamp=now_local()
+        )
+        await interaction.followup.send(embed=embed)
+        self.stop()
+
 
 class DicePartyView(discord.ui.View):
     def __init__(self, host_id: int, stake: int, channel_id: int, max_players: int = 10):
@@ -1579,6 +1661,24 @@ class DicePartyView(discord.ui.View):
                     child.disabled = True
 
             await interaction.edit_original_response(embed=result_embed, view=self)
+
+            # If there is exactly one winner, offer Double or Nothing
+            if len(winners) == 1:
+                winner_id = winners[0]
+                guild = interaction.guild
+                w_member = guild.get_member(winner_id) if guild else None
+                winner_mention = w_member.mention if w_member else f"<@{winner_id}>"
+    
+                view = DoubleOrNothingView(
+                    winner_id=winner_id,
+                    winner_mention=winner_mention,
+                    amount=pot,
+                    game_label="Dice Party"
+                )
+                await interaction.followup.send(
+                    content=f"{winner_mention}, fancy a **Double or Nothing** roll?",
+                    view=view
+                )
 
         except Exception:
             # make sure the channel is freed even if something blows up
@@ -2302,15 +2402,33 @@ class DiceDuelRequestView(discord.ui.View):
 
     @discord.ui.button(label="Accept duel", style=discord.ButtonStyle.success, emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # only the challenged user can accept
         if interaction.user.id != self.opponent.id:
             return await interaction.response.send_message(
                 "Only the challenged player can accept this duel.",
                 ephemeral=True
             )
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
+        # Small dice-rolling animation (separate message)
+        duel_vs = f"{self.challenger.mention} vs {self.opponent.mention}"
+        anim_embed = discord.Embed(
+            title="🎲 EliHaus Dice Duel",
+            description=f"{duel_vs}\n\n`· · ·`",
+            colour=discord.Colour.gold(),
+            timestamp=now_local()
+        )
+        anim_msg = await interaction.channel.send(embed=anim_embed)
+
+        for frame in ["`● · ·`", "`● ● ·`", "`● ● ●`"]:
+            await asyncio.sleep(0.6)
+            anim_embed.description = f"{duel_vs}\n\n{frame}"
+            await anim_msg.edit(embed=anim_embed)
+
+        # re-check balances
         chal_id = str(self.challenger.id)
+
         opp_id = str(self.opponent.id)
 
         ensure_user(chal_id)
