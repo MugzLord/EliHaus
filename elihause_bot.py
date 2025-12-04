@@ -2571,9 +2571,17 @@ class DiceDuelRequestView(discord.ui.View):
                 view = None
 
             if view is not None:
-                await interaction.followup.send(embed=winner_embed, view=view)
+                await interaction.followup.send(
+                    embed=winner_embed,
+                    view=view,
+                    ephemeral=False,  # force public message
+                )
             else:
-                await interaction.followup.send(embed=winner_embed)
+                await interaction.followup.send(
+                    embed=winner_embed,
+                    ephemeral=False,  # force public message
+                )
+
         else:
             # Tie: just info, no winner embed
             await interaction.followup.send(
