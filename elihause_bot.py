@@ -65,8 +65,23 @@ TICKETS_CATEGORY_ID = int(os.getenv("TICKETS_CATEGORY_ID", "0"))
 TICKETS_CATEGORY_NAME = os.getenv("TICKETS_CATEGORY_NAME", "🎟️ wl-claims")
 TICKETS_STAFF_ROLE_ID = int(os.getenv("TICKETS_STAFF_ROLE_ID", "0"))
 
+LAB_GAME_CHANNEL_IDS_ENV = os.getenv("LAB_GAME_CHANNEL_IDS", "").strip()
+LAB_GAME_CHANNEL_IDS: list[int] = []
+if LAB_GAME_CHANNEL_IDS_ENV:
+    for part in LAB_GAME_CHANNEL_IDS_ENV.split(","):
+        part = part.strip()
+        if part:
+            try:
+                LAB_GAME_CHANNEL_IDS.append(int(part))
+            except ValueError:
+                print(f"Invalid channel ID in LAB_GAME_CHANNEL_IDS: {part}")
+
+
+def is_lab_channel(channel_id: int) -> bool:
+    return channel_id in LAB_GAME_CHANNEL_IDS
+
 # ---------------- DB ----------------
-DB_PATH = os.getenv("ELIHAUS_DB", "elihause.db")
+DB_PATH = os.getenv("ELI_DB_PATH", "elihaus.db")
 
 def db():
     return sqlite3.connect(DB_PATH, isolation_level=None)
@@ -1313,27 +1328,66 @@ def ensure_user(uid: str):
         c.execute("""INSERT OR IGNORE INTO users(discord_id,balance,last_daily,last_weekly,joined_at)
                      VALUES(?,?,?,?,?)""", (uid, 0, None, None, iso(now_local())))
 
-def get_balance(uid: str) -> int:
-    ensure_user(uid)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
-        row = c.fetchone()
-        return row[0] if row else 0
+def get_real_balance(user_id: int) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT balance FROM wallets WHERE user_id = ?", (str(user_id),))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
 
-ALLOWED_TX_KINDS = {"claim", "bet", "payout", "redeem", "lotto", "starter", "wl_deposit"}
 
-def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
-    if kind not in ALLOWED_TX_KINDS:
-        raise ValueError(f"Balance change blocked for kind='{kind}'.")
-    ensure_user(uid)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (delta, uid))
-        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                  (uid, kind, delta, meta, iso(now_local())))
-        c.execute("SELECT balance FROM users WHERE discord_id=?", (uid,))
-        return c.fetchone()[0]
+def change_real_balance(user_id: int, delta: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO wallets (user_id, balance)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
+    """, (str(user_id), int(delta)))
+    conn.commit()
+    conn.close()
+
+
+def get_lab_balance(user_id: int) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT balance FROM lab_wallets WHERE user_id = ?", (str(user_id),))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def change_lab_balance(user_id: int, delta: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # table is already created by Auntie, but we ensure it anyway
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lab_wallets (
+            user_id TEXT PRIMARY KEY,
+            balance INTEGER NOT NULL
+        )
+    """)
+    cur.execute("""
+        INSERT INTO lab_wallets (user_id, balance)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
+    """, (str(user_id), int(delta)))
+    conn.commit()
+    conn.close()
+    
+def get_balance_for_channel(user_id: int, channel_id: int) -> int:
+    if is_lab_channel(channel_id):
+        return get_lab_balance(user_id)
+    else:
+        return get_real_balance(user_id)
+
+
+def change_balance_for_channel(user_id: int, channel_id: int, delta: int) -> None:
+    if is_lab_channel(channel_id):
+        return change_lab_balance(user_id, delta)
+    else:
+        return change_real_balance(user_id, delta)
 
 # Track which channels already have an open dice party
 DICE_PARTY_CHANNELS: set[int] = set()
