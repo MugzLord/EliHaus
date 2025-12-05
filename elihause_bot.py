@@ -81,10 +81,29 @@ def is_lab_channel(channel_id: int) -> bool:
     return channel_id in LAB_GAME_CHANNEL_IDS
 
 # ---------------- DB ----------------
-DB_PATH = os.getenv("ELI_DB_PATH", "elihaus.db")
+# Prefer ELI_DB_PATH, fall back to old ELIHAUS_DB if you ever used it,
+# otherwise use a local file "elihaus.db" next to this script.
+RAW_DB_PATH = (
+    os.getenv("ELI_DB_PATH")              # new preferred
+    or os.getenv("ELIHAUS_DB")            # legacy fallback
+    or "elihaus.db"                       # default in /app
+)
+
+# If someone accidentally set a folder like "/data", turn it into "/data/elihaus.db"
+if RAW_DB_PATH.endswith("/") or not RAW_DB_PATH.endswith(".db"):
+    RAW_DB_PATH = RAW_DB_PATH.rstrip("/") + "/elihaus.db"
+
+# Make sure the directory for the DB exists (otherwise sqlite can't create the file)
+db_dir = os.path.dirname(RAW_DB_PATH)
+if db_dir:
+    os.makedirs(db_dir, exist_ok=True)
+
+DB_PATH = RAW_DB_PATH
 
 def db():
+    # isolation_level=None keeps autocommit behaviour you already had
     return sqlite3.connect(DB_PATH, isolation_level=None)
+
 
 def init_db():
     with db() as conn:
