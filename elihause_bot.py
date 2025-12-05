@@ -1817,6 +1817,7 @@ class DicePartyView(discord.ui.View):
                     ephemeral=True,
                 )
 
+
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="🛑")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.started:
