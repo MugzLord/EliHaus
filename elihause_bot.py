@@ -3392,7 +3392,6 @@ async def eh_leaderboard(
             f"⚠️ Leaderboard error: `{type(e).__name__}: {e}`",
             ephemeral=True
         )
-
 # =========================
 # 🎰 Emoji Slots (Shared Pot) — FULL ADD-ON
 # =========================
