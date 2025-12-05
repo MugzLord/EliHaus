@@ -1884,7 +1884,8 @@ async def eh_dice_party(
     host = interaction.user
     uid_host = str(host.id)
     ensure_user(uid_host)
-    bal_host = await eh_balance(uid_host)
+    bal_host = get_balance(uid_host)       # <-- correct, no await
+
     if bal_host < stake:
         return await interaction.response.send_message(
             f"You need at least **{stake}** coins to host a party. "
