@@ -914,7 +914,7 @@ class RedBetModal(discord.ui.Modal, title="Bet: RED"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            amt = int(str(self.stake).strip())
+            amt = int(self.stake.value.strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
 
@@ -947,7 +947,7 @@ class BlackBetModal(discord.ui.Modal, title="Bet: BLACK"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            amt = int(str(self.stake).strip())
+            amt = int(self.stake.value.strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
 
@@ -979,7 +979,7 @@ class GreenBetModal(discord.ui.Modal, title="Bet: GREEN"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            amt = int(str(self.stake).strip())
+            amt = int(self.stake.value.strip())
         except Exception:
             return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
 
@@ -1013,7 +1013,7 @@ class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
     async def on_submit(self, interaction: discord.Interaction):
         try:
             n   = int(str(self.number).strip())
-            amt = int(str(self.stake).strip())
+            amt = int(self.stake.value.strip())
         except Exception:
             return await interaction.response.send_message("Enter valid number and stake.", ephemeral=True)
 
