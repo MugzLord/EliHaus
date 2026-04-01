@@ -16,7 +16,6 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from zoneinfo import ZoneInfo
-from PIL import Image, ImageDraw, ImageFont
 
 # ---------------- Config ----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -35,7 +34,6 @@ DAILY_AMOUNT = 1_800
 WEEKLY_AMOUNT = 6_000
 STARTER_AMOUNT = 5_000
 TICKET_COST = 10_000
-WL_COINS_PER_GIFT = 15000  # Used for prize conversion (1 Gift = 15k Coins)
 
 # Roulette Config
 ROUND_SECONDS_DEFAULT = 120
@@ -43,24 +41,13 @@ PAYOUT_RED_BLACK = 2.0
 PAYOUT_GREEN = 14.0
 PAYOUT_NUMBER = 36.0
 ROUL_MIN_BET = 100
-ROUL_MAX_BET = 1000000 
+ROUL_MAX_BET = 999_999_999_999_999 # Effectively no limit
 
 # Roles & Channels
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
-SHOP_YAELI_URL = os.getenv("SHOP_YAELI_URL", "https://www.imvu.com/next/shop/")
-SHOP_NAME = "Shop YaEli"
 
 # Paths
-BASE_DIR = Path(__file__).parent
-ASSETS_DIR = BASE_DIR / "assets"
 DB_PATH = os.getenv("ELI_DB_PATH") or "elihaus.db"
-
-# Assets Mapping
-CHIP_ASSETS = {
-    "RED":   str(ASSETS_DIR / "chip_red.png"),
-    "BLACK": str(ASSETS_DIR / "chip_black.png"),
-    "GREEN": str(ASSETS_DIR / "chip_green.png"),
-}
 
 RED_NUMBERS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 
@@ -92,13 +79,10 @@ init_db()
 
 def user_is_admin(itx: discord.Interaction) -> bool:
     """Helper to check for Administrator permission or specific Admin role."""
-    # Check for Discord Native Administrator Permission
     if itx.user.guild_permissions.administrator:
         return True
-    # Check for Manage Server Permission
     if itx.user.guild_permissions.manage_guild:
         return True
-    # Check for specific configured role ID
     if ADMIN_ROLE_ID and any(r.id == ADMIN_ROLE_ID for r in itx.user.roles):
         return True
     return False
@@ -140,39 +124,20 @@ def get_state(key: str) -> str | None:
         return r[0] if r else None
 
 def get_lotto_config() -> dict:
-    base = {"day": "Saturday", "time": "20:00", "prize": 10, "winners": 1, "shop_name": SHOP_NAME, "shop_url": SHOP_YAELI_URL}
     raw = get_state("lotto_config")
     if raw:
-        try: base.update(json.loads(raw))
-        except: pass
-    return base
+        return json.loads(raw)
+    return {
+        "day": "Saturday", 
+        "time": "20:00", 
+        "prize": 10, 
+        "winners": 1, 
+        "shop_name": "EliHaus Shop", 
+        "shop_url": ""
+    }
 
 def set_lotto_config(cfg: dict):
     set_state("lotto_config", json.dumps(cfg))
-
-# ---------------- Visuals ----------------
-
-def render_chip_badge(color: str, number: int) -> io.BytesIO | None:
-    key = color.upper()
-    path = CHIP_ASSETS.get(key)
-    if not path or not os.path.exists(path): return None
-    try:
-        chip = Image.open(path).convert("RGBA")
-        SCALE = 4
-        W, H = chip.size
-        chip = chip.resize((W*SCALE, H*SCALE), Image.LANCZOS)
-        draw = ImageDraw.Draw(chip)
-        font = None
-        for fp in ["DejaVuSans-Bold.ttf", "arial.ttf"]:
-            try: font = ImageFont.truetype(fp, size=int(chip.width * 0.42)); break
-            except: continue
-        if not font: font = ImageFont.load_default()
-        text = str(int(number))
-        cx, cy = chip.width // 2, chip.height // 2
-        draw.text((cx, cy), text, font=font, fill=(255, 255, 255, 255), anchor="mm",
-                  stroke_width=max(2, chip.width // 60), stroke_fill=(0, 0, 0, 255))
-    except: return None
-    out = io.BytesIO(); chip.save(out, format="PNG"); out.seek(0); return out
 
 # ---------------- Claim System ----------------
 
@@ -188,7 +153,7 @@ class LottoClaimModal(discord.ui.Modal, title="Claim Prize as WL Gifts"):
         embed = discord.Embed(title="🎁 Lotto Prize Claim (WL)", color=discord.Color.blue())
         embed.description = f"**Winner:** {itx.user.mention}\n**IMVU:** {self.imvu.value}\n**Jackpot:** {self.prize_count} gifts"
         await itx.channel.send(content=f"🔔 **Staff Alert:** {itx.user.mention} requested **Gifts**!", embed=embed)
-        await itx.response.send_message("✅ Request sent to staff!", ephemeral=True)
+        await itx.response.send_message("✅ Your details have been sent to staff for fulfillment!", ephemeral=True)
 
 class LottoClaimView(discord.ui.View):
     def __init__(self, winner_id, prize_count):
@@ -201,14 +166,7 @@ class LottoClaimView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Claim as Coins", style=discord.ButtonStyle.success, emoji="💰")
-    async def claim_coins(self, itx: discord.Interaction, button: discord.ui.Button):
-        coin_value = self.prize_count * WL_COINS_PER_GIFT
-        new_bal = change_balance(str(itx.user.id), coin_value, "lotto_payout", f"Converted {self.prize_count} gifts")
-        self.clear_items()
-        await itx.response.edit_message(content=f"✅ Claimed **{coin_value:,}** coins!", view=self)
-
-    @discord.ui.button(label="Claim as WL Gifts", style=discord.ButtonStyle.primary, emoji="🎁")
+    @discord.ui.button(label="Claim WL Gifts", style=discord.ButtonStyle.primary, emoji="🎁")
     async def claim_wl(self, itx: discord.Interaction, button: discord.ui.Button):
         await itx.response.send_modal(LottoClaimModal(self.prize_count))
 
@@ -298,6 +256,9 @@ class BetModal(discord.ui.Modal):
         uid = str(itx.user.id)
         if get_balance(uid) < amt: return await itx.response.send_message("You're too broke for that bet!", ephemeral=True)
         
+        if amt < ROUL_MIN_BET:
+            return await itx.response.send_message(f"Minimum bet is {ROUL_MIN_BET:,} coins!", ephemeral=True)
+
         change_balance(uid, -amt, "bet", f"roulette:{self.rid}")
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("INSERT INTO bets(rid, channel_id, discord_id, choice, stake, ts) VALUES(?,?,?,?,?,?)",
@@ -309,7 +270,7 @@ class LottoConfigModal(discord.ui.Modal, title="Configure Weekly Lotto"):
     time = discord.ui.TextInput(label="Draw Time (HH:MM)", placeholder="20:00", max_length=5)
     prize = discord.ui.TextInput(label="Jackpot Amount (WL Gifts)", placeholder="10", max_length=5)
     winners = discord.ui.TextInput(label="Number of Winners", placeholder="1", max_length=2)
-    shop = discord.ui.TextInput(label="Shop Name", placeholder="Shop YaEli", max_length=50)
+    shop = discord.ui.TextInput(label="Shop Name", placeholder="EliHaus Shop", max_length=50)
 
     def __init__(self, current_cfg):
         super().__init__()
@@ -317,13 +278,20 @@ class LottoConfigModal(discord.ui.Modal, title="Configure Weekly Lotto"):
         self.time.default = current_cfg.get("time", "20:00")
         self.prize.default = str(current_cfg.get("prize", 10))
         self.winners.default = str(current_cfg.get("winners", 1))
-        self.shop.default = current_cfg.get("shop_name", "Shop YaEli")
+        self.shop.default = current_cfg.get("shop_name", "EliHaus Shop")
 
     async def on_submit(self, itx: discord.Interaction):
         try:
             p = int(self.prize.value)
             w = int(self.winners.value)
-            cfg = {"day": self.day.value, "time": self.time.value, "prize": p, "winners": max(1, w), "shop_name": self.shop.value, "shop_url": SHOP_YAELI_URL}
+            cfg = {
+                "day": self.day.value, 
+                "time": self.time.value, 
+                "prize": p, 
+                "winners": max(1, w), 
+                "shop_name": self.shop.value, 
+                "shop_url": ""
+            }
             set_lotto_config(cfg)
             await itx.response.send_message("✅ Lotto updated!", ephemeral=True)
         except:
@@ -406,7 +374,7 @@ async def eh_drawlotto(itx: discord.Interaction):
     embed = discord.Embed(title="🎉 LOTTO WINNERS!", color=discord.Color.gold())
     embed.description = "\n".join([f"🏆 <@{w}>" for w in winners]) + f"\n\nEach wins **{cfg['prize']} Gifts**!"
     await itx.channel.send(embed=embed)
-    for w in winners: await itx.channel.send(f"Hey <@{w}>! Pick your prize choice below:", view=LottoClaimView(w, cfg["prize"]))
+    for w in winners: await itx.channel.send(f"Hey <@{w}>! Click below to claim your prize:", view=LottoClaimView(w, cfg["prize"]))
 
 @bot.tree.command(name="eh_openround", description="(Admin) Open roulette betting")
 async def eh_openround(itx: discord.Interaction, seconds: int = 120):
@@ -428,6 +396,7 @@ async def eh_resolve(itx: discord.Interaction):
     await itx.response.defer(ephemeral=True)
     roll = random.randint(0, 36)
     color = "GREEN" if roll == 0 else ("RED" if roll in RED_NUMBERS else "BLACK")
+    color_emoji = "🟩" if color == "GREEN" else ("🟥" if color == "RED" else "⬛")
     winners = []
     with sqlite3.connect(DB_PATH) as conn:
         bets = conn.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,)).fetchall()
@@ -439,13 +408,13 @@ async def eh_resolve(itx: discord.Interaction):
                 change_balance(uid, payout, "payout", f"roulette win:{rid}")
                 winners.append(f"<@{uid}>: +{payout:,}")
     set_state(f"active_round:{itx.channel_id}", None)
-    badge = render_chip_badge(color, roll)
-    embed = discord.Embed(title=f"🎰 Result: {color} #{roll}", color=discord.Color.green() if color=="GREEN" else discord.Color.red())
-    embed.description = "\n".join(winners) if winners else "Everyone lost! 💀"
-    if badge:
-        file = discord.File(badge, filename="res.png"); embed.set_image(url="attachment://res.png")
-        await itx.channel.send(embed=embed, file=file)
-    else: await itx.channel.send(embed=embed)
+    
+    embed = discord.Embed(
+        title=f"🎰 Roulette Result: {color_emoji} {color} #{roll}", 
+        color=discord.Color.green() if color=="GREEN" else (discord.Color.red() if color=="RED" else discord.Color.dark_grey())
+    )
+    embed.description = "**Winners:**\n" + ("\n".join(winners) if winners else "Everyone lost! 💀")
+    await itx.channel.send(embed=embed)
     await itx.followup.send("Resolved.")
 
 @bot.tree.command(name="eh_leaderboard", description="Show top players")
