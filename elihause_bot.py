@@ -1,4218 +1,465 @@
-import os, sqlite3, random, json, traceback
+import os
+import sqlite3
+import random
+import json
+import traceback
+import io
+import time
+import asyncio
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+from urllib.parse import urlparse, parse_qs
 
 import discord
 from discord.ext import commands
 from discord import app_commands
-from zoneinfo import ZoneInfo  # proper DST (e.g., Europe/London)
-import io, time, asyncio
+from zoneinfo import ZoneInfo
+from PIL import Image, ImageDraw, ImageFont
 
 # ---------------- Config ----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
-    raise RuntimeError("Set DISCORD_TOKEN")
+    raise RuntimeError("Set DISCORD_TOKEN in environment variables.")
 
 GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0"))
-
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/London")
 try:
     TZ = ZoneInfo(TIMEZONE_NAME)
 except Exception:
     TZ = timezone.utc
 
-WL_COINS_PER_GIFT = int(os.getenv("WL_COINS_PER_GIFT", "15000"))  # default 10k coins = 1 WL
-MIN_WL_GIFTS = int(os.getenv("MIN_WL_GIFTS", "1"))
-MAX_WL_GIFTS = int(os.getenv("MAX_WL_GIFTS", "40"))
-ROULETTE_STATE = {"resolved": False}
-
-STICKY_AFTER_MSGS = 15  # bump after this many chat messages
-STICKY_COUNT: dict[int, int] = {}  # channel_id -> counter since last bump
-
-INTENTS = discord.Intents.default()
-INTENTS.message_content = True
-INTENTS.members = True
-
-bot = commands.Bot(command_prefix="!", intents=INTENTS)
-
-ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
-
-from collections import defaultdict
-
-MESSAGE_COUNTER = defaultdict(int)   # channel_id -> count since last bump
-ACTIVE_PANEL_MSG: dict[int, int] = {}  # channel_id -> betting panel message_id
-# Only this user can use /eh_deposit
-DEPOSITOR_ID = int(os.getenv("DEPOSITOR_ID", "0"))  # set your Discord User ID in env
-
-from pathlib import Path
-BASE_DIR = Path(__file__).parent
-ASSETS_DIR = BASE_DIR / "assets"
-
-# Economy
+# Economy Constants
 DAILY_AMOUNT = 1_800
 WEEKLY_AMOUNT = 6_000
 STARTER_AMOUNT = 5_000
+TICKET_COST = 10_000
+WL_COINS_PER_GIFT = 15000  # Used for prize conversion (1 Gift = 15k Coins)
 
-# Roulette (admin-led)
+# Roulette Config
 ROUND_SECONDS_DEFAULT = 120
 PAYOUT_RED_BLACK = 2.0
 PAYOUT_GREEN = 14.0
-PAYOUT_NUMBER = 36.0  # straight number pays 35:1 (returns 36x)
-MAX_STAKE = 50_000
-ONE_BET_PER_ROUND = True
+PAYOUT_NUMBER = 36.0
+ROUL_MIN_BET = 100
+ROUL_MAX_BET = 1000000 
 
-# Tickets category for WL claims
-TICKETS_CATEGORY_ID = int(os.getenv("TICKETS_CATEGORY_ID", "0"))
-TICKETS_CATEGORY_NAME = os.getenv("TICKETS_CATEGORY_NAME", "🎟️ wl-claims")
-TICKETS_STAFF_ROLE_ID = int(os.getenv("TICKETS_STAFF_ROLE_ID", "0"))
+# Roles & Channels
+ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
+SHOP_YAELI_URL = os.getenv("SHOP_YAELI_URL", "https://www.imvu.com/next/shop/")
+SHOP_NAME = "Shop YaEli"
 
-LAB_GAME_CHANNEL_IDS_ENV = os.getenv("LAB_GAME_CHANNEL_IDS", "").strip()
-LAB_GAME_CHANNEL_IDS: list[int] = []
-if LAB_GAME_CHANNEL_IDS_ENV:
-    for part in LAB_GAME_CHANNEL_IDS_ENV.split(","):
-        part = part.strip()
-        if part:
-            try:
-                LAB_GAME_CHANNEL_IDS.append(int(part))
-            except ValueError:
-                print(f"Invalid channel ID in LAB_GAME_CHANNEL_IDS: {part}")
+# Paths
+BASE_DIR = Path(__file__).parent
+ASSETS_DIR = BASE_DIR / "assets"
+DB_PATH = os.getenv("ELI_DB_PATH") or "elihaus.db"
 
+# Assets Mapping
+CHIP_ASSETS = {
+    "RED":   str(ASSETS_DIR / "chip_red.png"),
+    "BLACK": str(ASSETS_DIR / "chip_black.png"),
+    "GREEN": str(ASSETS_DIR / "chip_green.png"),
+}
 
-def is_lab_channel(channel_id: int) -> bool:
-    return channel_id in LAB_GAME_CHANNEL_IDS
+RED_NUMBERS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 
-# ---------------- DB ----------------
-# Prefer ELI_DB_PATH, fall back to old ELIHAUS_DB if you ever used it,
-# otherwise use a local file "elihaus.db" next to this script.
-RAW_DB_PATH = (
-    os.getenv("ELI_DB_PATH")              # new preferred
-    or os.getenv("ELIHAUS_DB")            # legacy fallback
-    or "elihaus.db"                       # default in /app
-)
-
-# If someone accidentally set a folder like "/data", turn it into "/data/elihaus.db"
-if RAW_DB_PATH.endswith("/") or not RAW_DB_PATH.endswith(".db"):
-    RAW_DB_PATH = RAW_DB_PATH.rstrip("/") + "/elihaus.db"
-
-# Make sure the directory for the DB exists (otherwise sqlite can't create the file)
-db_dir = os.path.dirname(RAW_DB_PATH)
-if db_dir:
-    os.makedirs(db_dir, exist_ok=True)
-
-DB_PATH = RAW_DB_PATH
-
-def db():
-    # isolation_level=None keeps autocommit behaviour you already had
-    return sqlite3.connect(DB_PATH, isolation_level=None)
-
+# ---------------- Initialization ----------------
+INTENTS = discord.Intents.default()
+INTENTS.message_content = True
+INTENTS.members = True
+bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 def init_db():
-    with db() as conn:
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute("""CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY,
-            discord_id TEXT UNIQUE,
-            balance INTEGER DEFAULT 0,
-            last_daily TEXT,
-            last_weekly TEXT,
-            joined_at TEXT,
-            tutorial_done INTEGER DEFAULT 0
-        )""")
+            discord_id TEXT PRIMARY KEY, balance INTEGER DEFAULT 0,
+            last_daily TEXT, last_weekly TEXT, joined_at TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS tx(
-            id INTEGER PRIMARY KEY,
-            discord_id TEXT,
-            kind TEXT,
-            amount INTEGER,
-            meta TEXT,
-            ts TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS state(
-            key TEXT PRIMARY KEY,
-            val TEXT
-        )""")
+            id INTEGER PRIMARY KEY, discord_id TEXT, kind TEXT, amount INTEGER, meta TEXT, ts TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, val TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS rounds(
-            rid TEXT PRIMARY KEY,
-            channel_id TEXT,
-            status TEXT,       -- OPEN|RESOLVED|CANCELLED
-            opened_by TEXT,
-            opened_at TEXT,
-            expires_at TEXT,
-            outcome TEXT,
-            seed TEXT,
-            resolved_at TEXT,
-            message_id TEXT
-        )""")
+            rid TEXT PRIMARY KEY, channel_id TEXT, status TEXT, opened_by TEXT, 
+            opened_at TEXT, expires_at TEXT, outcome TEXT, seed TEXT, resolved_at TEXT, message_id TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS bets(
-            id INTEGER PRIMARY KEY,
-            rid TEXT,
-            channel_id TEXT,
-            discord_id TEXT,
-            choice TEXT,
-            stake INTEGER,
-            ts TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS tickets(
-            id INTEGER PRIMARY KEY,
-            week_id TEXT,
-            discord_id TEXT,
-            ts TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS lotto_draws(
-            id INTEGER PRIMARY KEY,
-            week_id TEXT,
-            run_at TEXT,
-            winner_id TEXT,
-            seed TEXT,
-            status TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS prizes(
-            id INTEGER PRIMARY KEY,
-            winner_id TEXT,
-            kind TEXT,
-            amount INTEGER,
-            meta TEXT,
-            status TEXT,
-            created_ts TEXT,
-            updated_ts TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS prize_queue(
-            id INTEGER PRIMARY KEY,
-            prize_id INTEGER,
-            winner_id TEXT,
-            imvu_name TEXT,
-            imvu_profile TEXT,
-            note TEXT,
-            status TEXT,         -- 'waiting_claim','ready','fulfilled','failed'
-            created_ts TEXT,
-            updated_ts TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS withdraw_requests(
-            id INTEGER PRIMARY KEY,
-            discord_id TEXT,
-            coins INTEGER,
-            gifts INTEGER,
-            imvu_name TEXT,
-            imvu_profile TEXT,  -- wishlist or profile URL
-            note TEXT,
-            status TEXT,        -- 'pending','approved','rejected'
-            ticket_channel_id TEXT,
-            message_id TEXT,    -- review message id inside ticket
-            reviewer_id TEXT,   -- admin who approved/rejected
-            review_note TEXT,
-            created_ts TEXT,
-            updated_ts TEXT
-        )""")
-
+            id INTEGER PRIMARY KEY, rid TEXT, channel_id TEXT, discord_id TEXT, choice TEXT, stake INTEGER, ts TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY, week_id TEXT, discord_id TEXT, ts TEXT)""")
 init_db()
 
+# ---------------- Helpers ----------------
 
-# ---- Slots helpers (state) ----
-def _slots_pot_key(channel_id: int) -> str:
-    return f"slots_pot:{int(channel_id)}"
+def user_is_admin(itx: discord.Interaction) -> bool:
+    """Helper to check for Administrator permission or specific Admin role."""
+    # Check for Discord Native Administrator Permission
+    if itx.user.guild_permissions.administrator:
+        return True
+    # Check for Manage Server Permission
+    if itx.user.guild_permissions.manage_guild:
+        return True
+    # Check for specific configured role ID
+    if ADMIN_ROLE_ID and any(r.id == ADMIN_ROLE_ID for r in itx.user.roles):
+        return True
+    return False
 
-def _slots_msg_key(channel_id: int) -> str:
-    return f"slots_msg:{int(channel_id)}"   # used when you store the panel message id
+def get_balance(uid: str) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE discord_id=?", (str(uid),))
+        row = c.fetchone()
+        return row[0] if row else 0
 
-def get_slots_pot(channel_id: int) -> int:
-    v = get_state(_slots_pot_key(channel_id))
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return SLOTS_SEED   # default when nothing stored yet
+def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("""INSERT INTO users(discord_id, balance, joined_at) VALUES(?,?,?)
+                     ON CONFLICT(discord_id) DO UPDATE SET balance = balance + ?""", 
+                  (str(uid), delta, iso(now_local()), delta))
+        c.execute("INSERT INTO tx(discord_id, kind, amount, meta, ts) VALUES(?,?,?,?,?)",
+                  (str(uid), kind, delta, meta, iso(now_local())))
+        c.execute("SELECT balance FROM users WHERE discord_id=?", (str(uid),))
+        return c.fetchone()[0]
 
-def set_slots_pot(channel_id: int, value: int) -> None:
-    set_state(_slots_pot_key(channel_id), int(value))
+def ensure_user(uid: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR IGNORE INTO users(discord_id, balance, joined_at) VALUES(?,0,?)", 
+                     (str(uid), iso(now_local())))
 
-def now_local():
-    return datetime.now(TZ)
-
-def iso(dt: datetime) -> str:
-    return dt.astimezone(TZ).isoformat()
+def now_local(): return datetime.now(TZ)
+def iso(dt: datetime): return dt.astimezone(TZ).isoformat()
 
 def set_state(key: str, val: str | None):
-    with db() as conn:
-        c = conn.cursor()
-        if val is None:
-            c.execute("DELETE FROM state WHERE key=?", (key,))
-        else:
-            c.execute("""INSERT INTO state(key,val) VALUES(?,?)
-                         ON CONFLICT(key) DO UPDATE SET val=excluded.val""", (key, val))
+    with sqlite3.connect(DB_PATH) as conn:
+        if val is None: conn.execute("DELETE FROM state WHERE key=?", (key,))
+        else: conn.execute("INSERT INTO state(key,val) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET val=excluded.val", (key, val))
 
 def get_state(key: str) -> str | None:
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT val FROM state WHERE key=?", (key,))
-        r = c.fetchone()
+    with sqlite3.connect(DB_PATH) as conn:
+        r = conn.execute("SELECT val FROM state WHERE key=?", (key,)).fetchone()
         return r[0] if r else None
 
-def round_key(channel_id: int) -> str:
-    return f"round:{channel_id}"
+def get_lotto_config() -> dict:
+    base = {"day": "Saturday", "time": "20:00", "prize": 10, "winners": 1, "shop_name": SHOP_NAME, "shop_url": SHOP_YAELI_URL}
+    raw = get_state("lotto_config")
+    if raw:
+        try: base.update(json.loads(raw))
+        except: pass
+    return base
 
-def week_id(dt: datetime | None = None) -> str:
-    dt = dt or now_local()
-    y, w, _ = dt.isocalendar()
-    return f"{y}-{w:02d}"
+def set_lotto_config(cfg: dict):
+    set_state("lotto_config", json.dumps(cfg))
 
-def _is_admin_member(guild: discord.Guild, member: discord.Member) -> bool:
-    if member.guild_permissions.manage_guild or guild.owner_id == member.id:
-        return True
-    if 'ADMIN_ROLE_ID' in globals() and ADMIN_ROLE_ID:
-        role = guild.get_role(ADMIN_ROLE_ID)
-        if role and role in member.roles:
-            return True
-    return False
+# ---------------- Visuals ----------------
 
-LONDON_TZ = ZoneInfo("Europe/London")
-
-def now_london() -> datetime:
-    return datetime.now(LONDON_TZ)
-
-DAY_TO_INT = {
-    "monday": 0,
-    "tuesday": 1,
-    "wednesday": 2,
-    "thursday": 3,
-    "friday": 4,
-    "saturday": 5,
-    "sunday": 6,
-}
-
-def next_draw_dt(ref: datetime | None = None) -> datetime:
-    """
-    Next configured lotto draw (day + time) in London time.
-    Uses values from get_lotto_config().
-    """
-    cfg = get_lotto_config()
-    ref = ref or now_london()
-
-    # day of week
-    target_day = cfg["day"].strip().lower()
-    target_wd = DAY_TO_INT.get(target_day, 5)  # default Saturday
-
-    # time (HH:MM)
+def render_chip_badge(color: str, number: int) -> io.BytesIO | None:
+    key = color.upper()
+    path = CHIP_ASSETS.get(key)
+    if not path or not os.path.exists(path): return None
     try:
-        h_str, m_str = cfg["time"].split(":")
-        hh = max(0, min(23, int(h_str)))
-        mm = max(0, min(59, int(m_str)))
-    except Exception:
-        hh, mm = 20, 0  # fallback 20:00
-
-    days_ahead = (target_wd - ref.weekday()) % 7
-    candidate = (ref + timedelta(days=days_ahead)).replace(
-        hour=hh, minute=mm, second=0, microsecond=0
-    )
-    if candidate <= ref:
-        candidate += timedelta(days=7)
-    return candidate
-
-
-def human_left(dt: datetime, ref: datetime | None = None) -> str:
-    ref = ref or now_local()
-    secs = max(0, int((dt - ref).total_seconds()))
-    d, rem = divmod(secs, 86400)
-    h, rem = divmod(rem, 3600)
-    m, _ = divmod(rem, 60)
-    parts = []
-    if d:
-        parts.append(f"{d}d")
-    if h:
-        parts.append(f"{h}h")
-    if m and not d:
-        parts.append(f"{m}m")
-    return " ".join(parts) or "less than 1m"
-
-# --- Roulette result embed builder ---
-ROULETTE_THUMB_URL = os.getenv("ROULETTE_THUMB_URL", "")  # optional small logo for vibe
-
-def _result_color(outcome: str) -> discord.Color:
-    if outcome == "red":
-        return discord.Color.red()
-    if outcome == "black":
-        return discord.Color.dark_grey()
-    return discord.Color.green()
-
-#added for winners embed
-def _result_emoji(outcome: str) -> str:
-    return {"red": "🟥", "black": "⬛", "green": "🟩"}.get(outcome, "🎯")
-
-def build_roulette_result_embed(
-    rlabel: str,
-    outcome: str,
-    roll: int,
-    total_bets: int,
-    total_pool: int,
-    winners_mentions: list[str],
-    seed_display: str,
-) -> discord.Embed:
-    label = f"{_result_emoji(outcome)} {outcome.upper()} • #{roll}"
-    e = discord.Embed(
-        title=f"🎰 EliHaus Roulette — Round {rlabel}",
-        description=f"**RESULT:** {label}",
-        color=_result_color(outcome),
-        timestamp=now_local(),
-    )
-    e.add_field(name="Total Bets", value=str(total_bets))
-    e.add_field(name="Pool", value=str(total_pool))
-    top = "—" if not winners_mentions else "\n".join(winners_mentions[:5])
-    e.add_field(name="Winners (top)", value=top, inline=False)
-    e.set_footer(text=seed_display)
-    return e
-
-# === interaction reply helpers (paste once; keep above commands) ===
-async def safe_ack(interaction: discord.Interaction, ephemeral: bool = True):
-    """Defer quickly so the command never times out."""
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=ephemeral, thinking=True)
-    except Exception:
-        pass
-
-async def safe_followup(interaction: discord.Interaction, content: str, ephemeral: bool = True):
-    """Send a reply whether or not we already deferred."""
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=ephemeral)
-        else:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-    except Exception:
-        pass
-# ---------- Roulette badge rendering ----------
-from io import BytesIO
-
-# where your 3 base chips live
-CHIP_ASSETS = {
-    "RED":    str(ASSETS_DIR / "chip_red.png"),
-    "BLACK":  str(ASSETS_DIR / "chip_black.png"),
-    "GREEN":  str(ASSETS_DIR / "chip_green.png"),
-}
-
-def roulette_color_from_number(n: int) -> str:
-    red = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-    if n == 0:
-        return "GREEN"
-    return "RED" if n in red else "BLACK"
-
-# requires: from PIL import Image, ImageDraw, ImageFont
-# and import io
-
-def render_chip_badge(result_color: str, result_number: int) -> io.BytesIO | None:
-    # normalise key and resolve asset
-    key = str(result_color).strip().upper()
-    base_path = CHIP_ASSETS.get(key)
-    if not base_path:
-        print(f"[chips] no asset mapping for color '{key}'")
-        return None
-
-    try:  # <-- THIS is the 'first try' I was referring to
-        chip = Image.open(base_path).convert("RGBA")
-    except Exception as e:
-        print(f"[chips] failed to open asset '{base_path}': {e}")
-        return None
-
-    # upscale chip so text is crisp
-    SCALE = 5
-    W, H = chip.size
-    chip = chip.resize((W*SCALE, H*SCALE), Image.LANCZOS)
-
-    draw = ImageDraw.Draw(chip)
-
-    # font selection (second try is for fonts only)
-    font = None
-    for fp in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "DejaVuSans-Bold.ttf",
-        "Arial.ttf",
-        "arial.ttf",
-    ):
-        try:
-            font = ImageFont.truetype(fp, size=int(chip.width * 0.42))
-            break
-        except Exception:
-            pass
-    if font is None:
-        font = ImageFont.load_default()
-
-    # text + outline
-    text = str(int(result_number))
-    cx, cy = chip.width // 2, chip.height // 2
-    draw.text(
-        (cx, cy),
-        text,
-        font=font,
-        fill=(255, 255, 255, 255),
-        anchor="mm",
-        stroke_width=max(2, chip.width // 60),
-        stroke_fill=(0, 0, 0, 255),
-    )
-
-    # export to BytesIO for discord.File
-    out = io.BytesIO()
-    chip.save(out, format="PNG")
-    out.seek(0)
-    return out
-
-
-
-    # open base chip
-    img = Image.open(base_path).convert("RGBA")
-    W, H = img.size
-    draw = ImageDraw.Draw(img)
-
-    # choose a font; DejaVuSans is commonly available in Linux containers
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", int(H * 0.44))
-    except Exception:
-        font = ImageFont.load_default()
-
-    text = str(int(number))
-    # center the number
-    tw, th = draw.textlength(text, font=font), font.size
-    x = (W - tw) / 2
-    y = (H - th) / 2 - H * 0.02
-
-    # draw with slight stroke so it pops
-    draw.text((x, y), text, font=font, fill=(245, 241, 235, 255), stroke_width=int(H * 0.035), stroke_fill=(0, 0, 0, 140))
-
-    buf = BytesIO()
-    img.save(buf, "PNG")
-    buf.seek(0)
-    return buf
-
-# ---------------- Admin check helpers ----------------
-def user_is_admin(member: discord.Member) -> bool:
-    if getattr(member.guild_permissions, "manage_guild", False) or member.id == getattr(member.guild, "owner_id", 0):
-        return True
-    if ADMIN_ROLE_ID and hasattr(member, "roles"):
-        return any(getattr(r, "id", 0) == ADMIN_ROLE_ID for r in member.roles)
-    return False
-
-
-async def _edit_round_message(bot, channel, rid: int, embed, view=None):
-    """Edits the ONE official roulette message for this round. If missing, sends and records it."""
-    # fetch message_id for this round
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT message_id FROM rounds WHERE rid=?", (rid,))
-        row = c.fetchone()
-    msg_id = int(row[0]) if row and row[0] else None
-
-    # resolve channel object
-    ch = channel
-    if isinstance(channel, int):
-        ch = bot.get_channel(channel) or await bot.fetch_channel(channel)
-
-    # try edit the original message
-    if msg_id:
-        try:
-            msg = await ch.fetch_message(msg_id)
-            await msg.edit(embed=embed, view=view)
-            return
-        except Exception:
-            pass  # message was deleted or not found
-
-    # fallback: send a new one and save its id
-    new_msg = await ch.send(embed=embed, view=view)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(new_msg.id), rid))
-
-# ---------------- Tickets category helper ----------------
-async def _get_or_create_tickets_category(guild: discord.Guild) -> discord.CategoryChannel | None:
-    if TICKETS_CATEGORY_ID:
-        cat = guild.get_channel(TICKETS_CATEGORY_ID)
-        if isinstance(cat, discord.CategoryChannel):
-            return cat
-    for ch in guild.categories:
-        if ch.name == TICKETS_CATEGORY_NAME:
-            return ch
-    try:
-        return await guild.create_category(TICKETS_CATEGORY_NAME, reason="EliHaus WL claims")
-    except Exception:
-        return None
-
-# ---------------- Prize state keys ----------------
-def _prize_msg_key(prize_id: int) -> str:
-    return f"prize_msg:{prize_id}"
-
-def _prize_ticket_key(prize_id: int) -> str:
-    return f"prize_ticket:{prize_id}"
-
-# ------------- Views & Modals -------------
-# --------- Roulette buttons (colored) -----
-class RouletteBetView(discord.ui.View):
-    def __init__(self, rid: int, timeout: float | None = None):
-        super().__init__(timeout=timeout)
-        self.rid = rid
-
-    # 🔴 RED
-    @discord.ui.button(label="Bet RED", style=discord.ButtonStyle.danger, emoji="🎯", custom_id="eh_roul_red")
-    async def bet_red(self, itx: discord.Interaction, _: discord.ui.Button):
-        uid = str(itx.user.id)
-
-        # 👉 1 bet per round
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
-            if c.fetchone():
-                await itx.response.send_message("⚠️ You already placed a bet this spin. Wait for the next wheel.", ephemeral=True)
-                return
-
-        try:
-            await itx.response.send_modal(RedBetModal(self.rid))
-        except Exception as e:
-            if not itx.response.is_done():
-                await itx.response.send_message(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
-            else:
-                await itx.followup.send(f"❌ Failed to open Red bet modal: `{e}`", ephemeral=True)
-
-    # ⚫ BLACK
-    @discord.ui.button(label="Bet BLACK", style=discord.ButtonStyle.primary, emoji="🎯", custom_id="eh_roul_black")
-    async def bet_black(self, itx: discord.Interaction, _: discord.ui.Button):
-        uid = str(itx.user.id)
-
-        # 👉 1 bet per round
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
-            if c.fetchone():
-                await itx.response.send_message("⚠️ You already locked in a bet this round.", ephemeral=True)
-                return
-
-        try:
-            await itx.response.send_modal(BlackBetModal(self.rid))
-        except Exception as e:
-            if not itx.response.is_done():
-                await itx.response.send_message(f"❌ Failed to open Black bet modal: `{e}`", ephemeral=True)
-            else:
-                await itx.followup.send(f"❌ Failed to open Black bet modal: `{e}`", ephemeral=True)
-
-    # 💚 GREEN
-    @discord.ui.button(label="Bet GREEN", style=discord.ButtonStyle.success, emoji="🎯", custom_id="eh_roul_green")
-    async def bet_green(self, itx: discord.Interaction, _: discord.ui.Button):
-        uid = str(itx.user.id)
-
-        # 👉 1 bet per round
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
-            if c.fetchone():
-                await itx.response.send_message("⚠️ Bet already placed. Try next spin, boss.", ephemeral=True)
-                return
-
-        try:
-            await itx.response.send_modal(GreenBetModal(self.rid))
-        except Exception as e:
-            if not itx.response.is_done():
-                await itx.response.send_message(f"❌ Failed to open Green bet modal: `{e}`", ephemeral=True)
-            else:
-                await itx.followup.send(f"❌ Failed to open Green bet modal: `{e}`", ephemeral=True)
-
-    # 🔢 NUMBER
-    @discord.ui.button(label="Bet NUMBER", style=discord.ButtonStyle.secondary, emoji="🎯", custom_id="eh_roul_number")
-    async def bet_number(self, itx: discord.Interaction, _: discord.ui.Button):
-        uid = str(itx.user.id)
-
-        # 👉 1 bet per round
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
-            if c.fetchone():
-                await itx.response.send_message("⚠️ You’ve already got a ticket on this wheel.", ephemeral=True)
-                return
-
-        try:
-            await itx.response.send_modal(NumberBetModal(self.rid))
-        except Exception as e:
-            if not itx.response.is_done():
-                await itx.response.send_message(f"❌ Failed to open Number bet modal: `{e}`", ephemeral=True)
-            else:
-                await itx.followup.send(f"❌ Failed to open Number bet modal: `{e}`", ephemeral=True)
-
-    # ❓ My Bet
-    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary, emoji="📍", custom_id="eh_roul_mybet")
-    async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
-        await itx.response.defer(ephemeral=True, thinking=True)
-        uid = str(itx.user.id)
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
-            row = c.fetchone()
-        bal = get_balance(uid)
-        if not row:
-            return await itx.followup.send(f"You have **no bet** this round.\nBalance: **{bal}**", ephemeral=True)
-        choice, stake = row
-        await itx.followup.send(f"🧾 Your bet: **{choice}** → **{stake}** coins.\nBalance: **{bal}**", ephemeral=True)
-
-
-class DisabledClaimView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        btn = discord.ui.Button(label="Claim WL Gifts", style=discord.ButtonStyle.secondary, disabled=True)
-        self.add_item(btn)
-
-class ClaimView(discord.ui.View):
-    """Also hosts round-label helpers; we call them via ClaimView.* to avoid NameError."""
-    def __init__(self, prize_id: int, timeout: int = 600):
-        super().__init__(timeout=timeout)
-        self.prize_id = prize_id
-
-    # ---- Winner ID lookup for this prize ----
-    def _winner_id_from_prize(self, pid: int) -> str:
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT winner_id FROM prizes WHERE id=?", (pid,))
-            row = c.fetchone()
-            return row[0] if row else ""
-
-    # ---- Pretty round labels (per channel) ----
-    @staticmethod
-    def _round_counter_key(channel_id: int) -> str:
-        return f"rcount:{channel_id}"
-
-    @staticmethod
-    def _round_label_key(rid: str) -> str:
-        return f"rlabel:{rid}"
-
-    @staticmethod
-    def next_round_number(channel_id: int) -> int:
-        cur = int(get_state(ClaimView._round_counter_key(channel_id)) or 0)
-        cur += 1
-        set_state(ClaimView._round_counter_key(channel_id), str(cur))
-        return cur
-
-    @staticmethod
-    def set_round_label(rid: str, label: str):
-        set_state(ClaimView._round_label_key(rid), label)
-
-    @staticmethod
-    def get_round_label(rid: str) -> str:
-        return get_state(ClaimView._round_label_key(rid)) or rid
-
-    @staticmethod
-    def short_seed(s: str, n: int = 6) -> str:
-        return f"{s[:n]}…{s[-n:]}" if s and len(s) > 2 * n else (s or "")
-
-    # ---- Claim button ----
-    @discord.ui.button(label="Claim WL Gifts", style=discord.ButtonStyle.primary)
-    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        set_state(_prize_msg_key(self.prize_id), str(interaction.message.id))
-
-        if str(interaction.user.id) != self._winner_id_from_prize(self.prize_id):
-            return await interaction.response.send_message("Only the winner can claim this prize.", ephemeral=True)
-
-        try:
-            await interaction.message.edit(view=DisabledClaimView())
-        except Exception:
-            pass
-
-        await interaction.response.send_modal(ClaimModal(self.prize_id))
-
-class ClaimModal(discord.ui.Modal, title="Claim WL Gifts"):
-    handle_or_url = discord.ui.TextInput(
-        label="IMVU Username OR Profile URL",
-        placeholder="e.g. YaEli   OR   https://www.imvu.com/…",
-        required=True,
-        max_length=200
-    )
-    note = discord.ui.TextInput(
-        label="Notes (optional)",
-        required=False,
-        style=discord.TextStyle.paragraph,
-        max_length=200,
-        placeholder="Anything staff should know"
-    )
-
-    def __init__(self, prize_id: int):
+        chip = Image.open(path).convert("RGBA")
+        SCALE = 4
+        W, H = chip.size
+        chip = chip.resize((W*SCALE, H*SCALE), Image.LANCZOS)
+        draw = ImageDraw.Draw(chip)
+        font = None
+        for fp in ["DejaVuSans-Bold.ttf", "arial.ttf"]:
+            try: font = ImageFont.truetype(fp, size=int(chip.width * 0.42)); break
+            except: continue
+        if not font: font = ImageFont.load_default()
+        text = str(int(number))
+        cx, cy = chip.width // 2, chip.height // 2
+        draw.text((cx, cy), text, font=font, fill=(255, 255, 255, 255), anchor="mm",
+                  stroke_width=max(2, chip.width // 60), stroke_fill=(0, 0, 0, 255))
+    except: return None
+    out = io.BytesIO(); chip.save(out, format="PNG"); out.seek(0); return out
+
+# ---------------- Claim System ----------------
+
+class LottoClaimModal(discord.ui.Modal, title="Claim Prize as WL Gifts"):
+    imvu = discord.ui.TextInput(label="IMVU Username", placeholder="e.g. YaEli", required=True)
+    note = discord.ui.TextInput(label="Extra Notes", style=discord.TextStyle.paragraph, required=False, max_length=100)
+
+    def __init__(self, prize_count):
         super().__init__()
-        self.prize_id = prize_id
-
-    def _extract_username(self, text: str):
-        """Returns (username, profile_url, wishlist_url)"""
-        raw = (text or "").strip()
-        if not raw:
-            return None, None, None
-        if raw.startswith(("http://", "https://")):
-            url = raw
-            import urllib.parse as _u
-            # we tried to parse a pasted URL above and set: url, p = urlparse(raw), etc.
-            try:
-                p = urlparse(raw)
-                q = parse_qs(p.query)
-                uname = (
-                    (q.get("nick", [None])[0])
-                    or (q.get("avatar_name", [None])[0])
-                    or (q.get("user", [None])[0])
-                    or (p.path.strip("/").split("/")[-1] or None)
-                )
-                # normalise username token
-                if uname:
-                    uname = re.sub(r"[^A-Za-z0-9_-]", "", uname)
-            except Exception:
-                uname = None
-            
-            # build canonical links
-            if uname:
-                profile_url  = f"https://www.imvu.com/catalog/web_profile.php?nick={uname}"
-                wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?nick={uname}"
-            else:
-                # fallback: they typed a URL we couldn't parse, or some random text
-                uname = raw
-                if re.fullmatch(r"[A-Za-z0-9_-]{2,32}", uname):
-                    profile_url  = f"https://www.imvu.com/catalog/web_profile.php?nick={uname}"
-                    wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?nick={uname}"
-                else:
-                    profile_url  = raw   # keep whatever they pasted
-                    wishlist_url = None
-            
-            return uname, profile_url, wishlist_url
-
-
-    async def on_submit(self, interaction: discord.Interaction):
-        uid = str(interaction.user.id)
-
-        existing_ticket_id = get_state(_prize_ticket_key(self.prize_id))
-        if existing_ticket_id:
-            ch = interaction.guild.get_channel(int(existing_ticket_id))
-            if ch:
-                return await interaction.response.send_message(f"You already opened a ticket: {ch.mention}", ephemeral=True)
-
-        uname, profile_url, wishlist_url = self._extract_username(str(self.handle_or_url))
-        if not uname:
-            return await interaction.response.send_message("Please enter a valid IMVU username or profile link.", ephemeral=True)
-
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""INSERT INTO prize_queue(prize_id,winner_id,imvu_name,imvu_profile,note,status,created_ts,updated_ts)
-                         VALUES(?,?,?,?,?,?,?,?)""",
-                      (self.prize_id, uid, uname, wishlist_url or profile_url or "", str(self.note or ""),
-                       "ready", iso(now_local()), iso(now_local())))
-            c.execute("UPDATE prizes SET status='claimed', updated_ts=? WHERE id=?", (iso(now_local()), self.prize_id))
-
-        cat = await _get_or_create_tickets_category(interaction.guild)
-        if not cat:
-            return await interaction.response.send_message("Could not create a ticket channel. Please ping an admin.", ephemeral=True)
-
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
-        }
-        if TICKETS_STAFF_ROLE_ID:
-            role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
-
-        ticket_name = f"wl-{interaction.user.name[:16].lower()}-{self.prize_id}"
-        ticket = await interaction.guild.create_text_channel(ticket_name, category=cat, overwrites=overwrites, reason="EliHaus WL claim ticket")
-        set_state(_prize_ticket_key(self.prize_id), str(ticket.id))
-
-        staff_tag = f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"
-        profile_line = f"[{uname}]({profile_url})" if profile_url else uname
-        wishlist_line = f"[Open Wishlist]({wishlist_url})" if wishlist_url else "—"
-
-        # --- announce + staff tag in the TICKET channel
-        await ticket.send(
-            f"{staff_tag} New WL claim for {interaction.user.mention}\n"
-            f"**IMVU:** {profile_line}\n"
-            f"**Wishlist:** {wishlist_line}\n"
-            f"**Notes:** {self.note or '—'}"
-        )
-
-        
-        # --- approval embed + buttons (send to the TICKET, not interaction.channel)
-        embed = discord.Embed(
-            title="Withdraw Request • Pending Approval",
-            description=(
-                f"**Requester:** {interaction.user.mention}\n"
-                f"**Coins to convert:** `{self.amount}`\n"
-                f"**IMVU:** {profile_line}\n"
-                f"**Wishlist:** {wishlist_line}"
-            ),
-            colour=discord.Colour.gold()
-        )
-        embed.set_footer(text="Use the buttons below to Approve or Reject")
-        
-        view = WithdrawApprovalView(
-            requester_id=interaction.user.id,
-            amount=self.amount,
-            imvu_url=self.profile_url or "",
-            note=self.note or ""
-        )
-        
-        try:
-            await ticket.send(embed=embed, view=view)
-        except Exception as e:
-            await interaction.response.send_message(
-                f"Bot couldn’t post in the ticket. Please allow **Send Messages / Embed Links** for the bot here.\nError: `{e}`",
-                ephemeral=True
-            )
-            return
-        
-        # --- acknowledge the modal exactly once
-        try:
-            await interaction.response.send_message(f"✅ Ticket created: {ticket.mention}", ephemeral=True)
-        except discord.InteractionResponded:
-            await interaction.followup.send(f"✅ Ticket created: {ticket.mention}", ephemeral=True)
-
-
-# ===== Roulette Betting UI — Colour + Number Modals (mobile-friendly) =====
-# Uses: db(), now_local(), iso(), get_balance(uid), ONE_BET_PER_ROUND, MAX_STAKE,
-#       RED_NUMBERS (set), PAYOUT_RED_BLACK, PAYOUT_GREEN
-
-# If missing, define the red set once near your config:
-# RED_NUMBERS   = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-# BLACK_NUMBERS = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
-
-def _round_open_and_timeleft(rid: str) -> int:
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT status, expires_at FROM rounds WHERE rid=?", (rid,))
-        row = c.fetchone()
-    if not row or row[0] != "OPEN":
-        return 0
-    try:
-        exp = datetime.fromisoformat(row[1])
-    except Exception:
-        exp = now_local()
-    return max(0, int((exp - now_local()).total_seconds()))
-
-def _has_existing_bet(rid: str, uid: str) -> tuple[bool, tuple[str,int] | None]:
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (rid, uid))
-        r = c.fetchone()
-    return (r is not None, (r[0], r[1]) if r else None)
-
-def _deduct(uid: str, amount: int):
-    # Use the central helper so all logging & checks stay consistent
-    change_balance(uid, -amount, "bet", "roulette")
-
-def _insert_bet(rid: str, channel_id: int, uid: str, choice: str, stake: int):
-    # take the coins first
-    _deduct(uid, stake)
-
-    with db() as conn:
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO bets(rid,channel_id,discord_id,choice,stake,ts) VALUES(?,?,?,?,?,?)",
-            (rid, str(channel_id), uid, choice, stake, iso(now_local()))
-        )
-
-
-# ===== Roulette bet limits =====
-ROUL_MIN_BET = int(os.getenv("ROUL_MIN_BET", "100"))
-ROUL_MAX_BET = int(os.getenv("ROUL_MAX_BET", "1000000000"))
-
-# ===== Bet modals (use ROUL_MIN_BET / ROUL_MAX_BET) =====
-
-class RedBetModal(discord.ui.Modal, title="Bet: RED"):
-    stake = discord.ui.TextInput(
-        label="Stake (coins)", placeholder="enter amount", required=True, max_length=10
-    )
-    def __init__(self, rid: int):
-        super().__init__(timeout=180)
-        self.rid = rid
-        self.stake.placeholder = f"Min {ROUL_MIN_BET}, Max {ROUL_MAX_BET}"
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            amt = int(self.stake.value.strip())
-        except Exception:
-            return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
-
-        if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
-            return await interaction.response.send_message(
-                f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
-            )
-
-        uid = str(interaction.user.id)
-        bal = get_balance(uid)
-        if bal < amt:
-            return await interaction.response.send_message(
-                f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
-            )
-
-        # 🔻 DEDUCT + INSERT BET
-        _insert_bet(str(self.rid), interaction.channel.id, uid, "RED", amt)
-
-        return await interaction.response.send_message(
-            f"🟥 Bet placed: **RED** — **{amt}** coins.", ephemeral=True
-        )
-
-
-class BlackBetModal(discord.ui.Modal, title="Bet: BLACK"):
-    stake = discord.ui.TextInput(label="Stake (coins)", placeholder="enter amount", required=True, max_length=10)
-    def __init__(self, rid: int):
-        super().__init__(timeout=180)
-        self.rid = rid
-        self.stake.placeholder = f"Min {ROUL_MIN_BET}, Max {ROUL_MAX_BET}"
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            amt = int(self.stake.value.strip())
-        except Exception:
-            return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
-
-        if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
-            return await interaction.response.send_message(
-                f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
-            )
-
-        uid = str(interaction.user.id)
-        bal = get_balance(uid)
-        if bal < amt:
-            return await interaction.response.send_message(
-                f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
-            )
-
-        # 🔻 DEDUCT + INSERT BET
-        _insert_bet(str(self.rid), interaction.channel.id, uid, "BLACK", amt)
-
-        return await interaction.response.send_message(
-            f"⬛ Bet placed: **BLACK** — **{amt}** coins.", ephemeral=True
-        )
-
-class GreenBetModal(discord.ui.Modal, title="Bet: GREEN"):
-    stake = discord.ui.TextInput(label="Stake (coins)", placeholder="enter amount", required=True, max_length=10)
-    def __init__(self, rid: int):
-        super().__init__(timeout=180)
-        self.rid = rid
-        self.stake.placeholder = f"Min {ROUL_MIN_BET}, Max {ROUL_MAX_BET}"
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            amt = int(self.stake.value.strip())
-        except Exception:
-            return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
-
-        if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
-            return await interaction.response.send_message(
-                f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
-            )
-
-        uid = str(interaction.user.id)
-        bal = get_balance(uid)
-        if bal < amt:
-            return await interaction.response.send_message(
-                f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
-            )
-
-        # 🔻 DEDUCT + INSERT BET
-        _insert_bet(str(self.rid), interaction.channel.id, uid, "GREEN", amt)
-
-        return await interaction.response.send_message(
-            f"🟩 Bet placed: **GREEN** — **{amt}** coins.", ephemeral=True
-        )
-
-class NumberBetModal(discord.ui.Modal, title="Bet: NUMBER"):
-    number = discord.ui.TextInput(label="Number (0–36)", placeholder="e.g., 17", required=True, max_length=2)
-    stake  = discord.ui.TextInput(label="Stake (coins)", placeholder="enter amount", required=True, max_length=10)
-    def __init__(self, rid: int):
-        super().__init__(timeout=180)
-        self.rid = rid
-        self.stake.placeholder = f"Min {ROUL_MIN_BET}, Max {ROUL_MAX_BET}"
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            n   = int(str(self.number).strip())
-            amt = int(self.stake.value.strip())
-        except Exception:
-            return await interaction.response.send_message("Enter valid number and stake.", ephemeral=True)
-
-        if not (0 <= n <= 36):
-            return await interaction.response.send_message("Number must be between 0 and 36.", ephemeral=True)
-
-        if not (ROUL_MIN_BET <= amt <= ROUL_MAX_BET):
-            return await interaction.response.send_message(
-                f"Stake must be between {ROUL_MIN_BET} and {ROUL_MAX_BET}.", ephemeral=True
-            )
-
-        uid = str(interaction.user.id)
-        bal = get_balance(uid)
-        if bal < amt:
-            return await interaction.response.send_message(
-                f"Insufficient coins. Need **{amt}**, you have **{bal}**.", ephemeral=True
-            )
-
-        # 🔻 DEDUCT + INSERT BET
-        _insert_bet(str(self.rid), interaction.channel.id, uid, f"NUM:{n}", amt)
-
-        return await interaction.response.send_message(
-            f"🎲 Bet placed: **#{n}** — **{amt}** coins.", ephemeral=True
-        )
-
-    @discord.ui.button(label="My Bet", style=discord.ButtonStyle.secondary,emoji="❓", custom_id="eh_roul_mybet")
-    async def my_bet(self, itx: discord.Interaction, _: discord.ui.Button):
-        await itx.response.defer(ephemeral=True, thinking=True)   # add this line
-    
-        uid = str(itx.user.id)
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT choice, stake FROM bets WHERE rid=? AND discord_id=? LIMIT 1", (self.rid, uid))
-            row = c.fetchone()
-    
-        bal = get_balance(uid)
-    
-        if not row:
-            await itx.followup.send(f"You have **no bet** this round.\nBalance: **{bal}**", ephemeral=True)
-            return
-    
-        choice, stake = row
-        await itx.followup.send(f"🎲 Your bet: **{choice}** — **{stake}** coins.\nBalance: **{bal}**", ephemeral=True)
-
-class AdminApproveWithdrawModal(discord.ui.Modal, title="Approve WL Withdraw"):
-    coins = discord.ui.TextInput(
-        label="Confirm coins to deduct",
-        placeholder="e.g. 20000",
-        required=True,
-        max_length=12
-    )
-    note = discord.ui.TextInput(
-        label="Internal note (optional)",
-        required=False,
-        style=discord.TextStyle.paragraph,
-        max_length=200
-    )
-
-    def __init__(self, request_id: int):
-        super().__init__(timeout=180)
-        self.request_id = request_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message("You don’t have permission to approve.", ephemeral=True)
-
-        # load request
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""SELECT discord_id, coins, gifts, status, ticket_channel_id, message_id, imvu_name, imvu_profile
-                         FROM withdraw_requests WHERE id=?""", (self.request_id,))
-            row = c.fetchone()
-        if not row:
-            return await interaction.response.send_message("Request not found.", ephemeral=True)
-
-        uid, coins_req, gifts_req, status, tchid, mid, uname, prof = row
-        if status != "pending":
-            return await interaction.response.send_message(f"Request is already **{status}**.", ephemeral=True)
-
-        # parse confirmed coins
-        try:
-            coins_final = int(str(self.coins).strip().replace("_",""))
-        except Exception:
-            return await interaction.response.send_message("Enter a valid coin amount.", ephemeral=True)
-        if coins_final <= 0 or coins_final % WL_COINS_PER_GIFT != 0:
-            return await interaction.response.send_message(
-                f"Amount must be a positive multiple of **{WL_COINS_PER_GIFT}**.", ephemeral=True
-            )
-        gifts_final = coins_final // WL_COINS_PER_GIFT
-        if gifts_final < MIN_WL_GIFTS or gifts_final > MAX_WL_GIFTS:
-            return await interaction.response.send_message(
-                f"Gift count must be between **{MIN_WL_GIFTS}** and **{MAX_WL_GIFTS}**.", ephemeral=True
-            )
-
-        # balance check at approval time
-        bal = get_balance(uid)
-        if bal < coins_final:
-            return await interaction.response.send_message(
-                f"User balance changed. Needs **{coins_final}**, has **{bal}**. Adjust and try again.", ephemeral=True
-            )
-
-        # deduct & create prize + queue
-        with db() as conn:
-            c = conn.cursor()
-            # deduct
-            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (coins_final, uid))
-            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                      (uid, "adjust", -coins_final, f"withdraw_to_wl:{gifts_final} gifts", iso(now_local())))
-            # prize + queue
-            c.execute("""INSERT INTO prizes(winner_id,kind,amount,meta,status,created_ts,updated_ts)
-                         VALUES(?,?,?,?,?,?,?)""",
-                      (uid, "wl", gifts_final, json.dumps({"shop": SHOP_NAME, "source": "user_withdraw"}), "pending",
-                       iso(now_local()), iso(now_local())))
-            prize_id = c.lastrowid
-            c.execute("""INSERT INTO prize_queue(prize_id,winner_id,imvu_name,imvu_profile,note,status,created_ts,updated_ts)
-                         VALUES(?,?,?,?,?,?,?,?)""",
-                      (prize_id, uid, uname, prof or "", str(self.note or ""), "ready", iso(now_local()), iso(now_local())))
-            # mark request
-            c.execute("""UPDATE withdraw_requests SET status='approved', reviewer_id=?, review_note=?, coins=?, gifts=?, updated_ts=?
-                         WHERE id=?""",
-                      (str(interaction.user.id), str(self.note or ""), coins_final, gifts_final, iso(now_local()), self.request_id))
-
-        # update the ticket message (disable buttons)
-        try:
-            channel = interaction.guild.get_channel(int(tchid)) if tchid else None
-            if channel and mid:
-                msg = await channel.fetch_message(int(mid))
-                if msg.embeds:
-                    e = msg.embeds[0]
-                else:
-                    e = discord.Embed(color=discord.Color.gold())
-                e.add_field(name="Status", value=f"✅ **Approved** by {interaction.user.mention}\n"
-                                                 f"Coins: {coins_final} → WL: {gifts_final}", inline=False)
-                await msg.edit(embed=e, view=DisabledReviewView())
-        except Exception:
-            pass
-
-        await interaction.response.send_message("Approved and deducted. Prize queued for fulfilment. ✅", ephemeral=True)
-
-class AdminRejectWithdrawModal(discord.ui.Modal, title="Reject WL Withdraw"):
-    reason = discord.ui.TextInput(label="Reason (shown to user)", required=True, max_length=200)
-
-    def __init__(self, request_id: int):
-        super().__init__(timeout=180)
-        self.request_id = request_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message("You don’t have permission to reject.", ephemeral=True)
-
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""SELECT ticket_channel_id, message_id, status FROM withdraw_requests WHERE id=?""",
-                      (self.request_id,))
-            row = c.fetchone()
-        if not row:
-            return await interaction.response.send_message("Request not found.", ephemeral=True)
-        tchid, mid, status = row
-        if status != "pending":
-            return await interaction.response.send_message(f"Request is already **{status}**.", ephemeral=True)
-
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""UPDATE withdraw_requests SET status='rejected', reviewer_id=?, review_note=?, updated_ts=?
-                         WHERE id=?""",
-                      (str(interaction.user.id), str(self.reason), iso(now_local()), self.request_id))
-
-        try:
-            channel = interaction.guild.get_channel(int(tchid)) if tchid else None
-            if channel and mid:
-                msg = await channel.fetch_message(int(mid))
-                if msg.embeds:
-                    e = msg.embeds[0]
-                else:
-                    e = discord.Embed(color=discord.Color.gold())
-                e.add_field(name="Status", value=f"❌ **Rejected** by {interaction.user.mention}\n"
-                                                 f"Reason: {str(self.reason)}", inline=False)
-                await msg.edit(embed=e, view=DisabledReviewView())
-        except Exception:
-            pass
-
-        await interaction.response.send_message("Rejected and left balance unchanged. ❌", ephemeral=True)
-
-class DisabledReviewView(discord.ui.View):
-    def __init__(self):
+        self.prize_count = prize_count
+
+    async def on_submit(self, itx: discord.Interaction):
+        embed = discord.Embed(title="🎁 Lotto Prize Claim (WL)", color=discord.Color.blue())
+        embed.description = f"**Winner:** {itx.user.mention}\n**IMVU:** {self.imvu.value}\n**Jackpot:** {self.prize_count} gifts"
+        await itx.channel.send(content=f"🔔 **Staff Alert:** {itx.user.mention} requested **Gifts**!", embed=embed)
+        await itx.response.send_message("✅ Request sent to staff!", ephemeral=True)
+
+class LottoClaimView(discord.ui.View):
+    def __init__(self, winner_id, prize_count):
         super().__init__(timeout=None)
-        for label, style in [("Approved", discord.ButtonStyle.success),
-                             ("Rejected", discord.ButtonStyle.danger)]:
-            self.add_item(discord.ui.Button(label=label, style=style, disabled=True))
+        self.winner_id = int(winner_id); self.prize_count = prize_count
 
-class AdminWithdrawReviewView(discord.ui.View):
-    def __init__(self, request_id: int):
-        super().__init__(timeout=None)
-        self.request_id = request_id
-
-    @discord.ui.button(label="Approve & Deduct", style=discord.ButtonStyle.success, emoji="✅")
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-        await interaction.response.send_modal(AdminApproveWithdrawModal(self.request_id))
-
-    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="🛑")
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-        await interaction.response.send_modal(AdminRejectWithdrawModal(self.request_id))
-
-# ---------------- Roulette core ----------------
-def open_round(channel_id: int, seconds: int, opener_id: str) -> tuple[str, datetime]:
-    rid = f"{channel_id}-{int(now_local().timestamp())}"
-    expires = now_local() + timedelta(seconds=max(5, seconds))
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO rounds(rid,channel_id,status,opened_by,opened_at,expires_at) VALUES(?,?,?,?,?,?)",
-                  (rid, str(channel_id), "OPEN", opener_id, iso(now_local()), iso(expires)))
-    set_state(round_key(channel_id), rid)
-    return rid, expires
-
-def get_open_round(channel_id: int):
-    rk = round_key(channel_id)
-    rid = get_state(rk)
-    if not rid:
-        return None
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT status, expires_at FROM rounds WHERE rid=? LIMIT 1", (rid,))
-        row = c.fetchone()
-    if not row:
-        set_state(rk, None)
-        return None
-    status, exp = row
-    try:
-        exp_dt = datetime.fromisoformat(exp)
-    except Exception:
-        exp_dt = now_local()
-    if status != "OPEN" or now_local() > exp_dt:
-        set_state(rk, None)
-        return None
-    return rid, exp_dt
-    
-def get_open_or_last_round(channel_id: int):
-    """Return the current open round, or the latest OPEN row even if the timer already elapsed."""
-    rk = round_key(channel_id)
-    rid = get_state(rk)
-    if rid:
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT status, expires_at FROM rounds WHERE rid=? LIMIT 1", (rid,))
-            row = c.fetchone()
-        if row and row[0] == "OPEN":
-            try:
-                return rid, datetime.fromisoformat(row[1])
-            except Exception:
-                return rid, now_local()
-
-    # Fallback: latest OPEN round in DB for this channel
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""SELECT rid, expires_at
-                     FROM rounds
-                     WHERE channel_id=? AND status='OPEN'
-                     ORDER BY opened_at DESC LIMIT 1""", (str(channel_id),))
-        row = c.fetchone()
-    if row:
-        try:
-            return row[0], datetime.fromisoformat(row[1])
-        except Exception:
-            return row[0], now_local()
-    return None
-async def _bump_round_message(channel, rid: str):
-    # read latest totals + the old message id
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT message_id, expires_at FROM rounds WHERE rid=?", (rid,))
-        row = c.fetchone()
-        if not row or not row[0]:
-            return
-        old_id, exp_iso = row
-        c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
-        cnt, pool = c.fetchone()
-        c.execute("""SELECT discord_id, choice, stake
-                     FROM bets WHERE rid=?
-                     ORDER BY ts DESC LIMIT 10""", (rid,))
-        last_rows = c.fetchall()
-
-    try:
-        exp_dt = datetime.fromisoformat(exp_iso)
-    except Exception:
-        exp_dt = now_local()
-    remain = max(0, int((exp_dt - now_local()).total_seconds()))
-    if remain <= 0:
-        return  # don't bump if already ended
-
-    # rebuild the embed (same style as your main one)
-    e = discord.Embed(
-        title=f"🎯 Roulette — Round {ClaimView.get_round_label(rid)}",
-        description="Click a button to bet. A modal will ask your amount.",
-        color=discord.Color.gold()
-    )
-    e.add_field(name="Pool", value=str(pool), inline=True)
-    e.add_field(name="Time", value=f"{remain}s left", inline=True)
-    e.add_field(name="Bets", value=str(cnt), inline=True)
-
-    lines = []
-    guild = getattr(channel, "guild", None)
-    for uid, ch, st in last_rows:
-        m = guild.get_member(int(uid)) if guild else None
-        name = m.mention if m else f"<@{uid}>"
-        lines.append(f"{name} · {st} on {ch.upper()}")
-    e.add_field(name="Players (latest)", value=("\n".join(lines) if lines else "—"), inline=False)
-
-    # send a fresh message with fresh buttons so users can keep betting
-    view = RouletteBetView(rid, timeout=remain + 30)
-    new_msg = await channel.send(embed=e, view=view)
-
-    # update DB to the new message id
-    with db() as conn:
-        conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(new_msg.id), rid))
-
-    # try to delete the old one to reduce clutter (requires 'Manage Messages')
-    try:
-        old_msg = await channel.fetch_message(int(old_id))
-        await old_msg.delete()
-    except Exception:
-        pass
-
-# ---------------- Slash Commands (eh_*) ----------------
-def ensure_user(uid: str):
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""INSERT OR IGNORE INTO users(discord_id,balance,last_daily,last_weekly,joined_at)
-                     VALUES(?,?,?,?,?)""", (uid, 0, None, None, iso(now_local())))
-
-def get_real_balance(user_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM wallets WHERE user_id = ?", (str(user_id),))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-
-def change_real_balance(user_id: int, delta: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO wallets (user_id, balance)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
-    """, (str(user_id), int(delta)))
-    conn.commit()
-    conn.close()
-
-
-def get_lab_balance(user_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM lab_wallets WHERE user_id = ?", (str(user_id),))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-
-def change_lab_balance(user_id: int, delta: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    # table is already created by Auntie, but we ensure it anyway
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lab_wallets (
-            user_id TEXT PRIMARY KEY,
-            balance INTEGER NOT NULL
-        )
-    """)
-    cur.execute("""
-        INSERT INTO lab_wallets (user_id, balance)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
-    """, (str(user_id), int(delta)))
-    conn.commit()
-    conn.close()
-    
-def get_balance_for_channel(user_id: int, channel_id: int) -> int:
-    if is_lab_channel(channel_id):
-        return get_lab_balance(user_id)
-    else:
-        return get_real_balance(user_id)
-
-
-def change_balance_for_channel(user_id: int, channel_id: int, delta: int) -> None:
-    if is_lab_channel(channel_id):
-        return change_lab_balance(user_id, delta)
-    else:
-        return change_real_balance(user_id, delta)
-
-# Track which channels already have an open dice party
-DICE_PARTY_CHANNELS: set[int] = set()
-
-# Light roast lines for dice games.
-# {A} and {B} will be replaced with player names.
-DICE_BANTER_TEMPLATES = [
-    "{A} is warming the dice while {B} is googling 'how to be lucky'.",
-    "Dealer whispers: if confidence paid out, {A} would already be bankrupt against {B}.",
-    "{A} is rolling like their Wi-Fi – unstable and full of excuses.",
-    "{B} swears they’re ‘not bothered’, which is exactly what someone losing would say.",
-    "The table’s split: half think {A} will win, the other half think {B} will blame lag.",
-    "{A} is here for coins, {B} is here for content.",
-    "If attitude counted as points, {B} would be in debt by now.",
-    "{A} rolled earlier in practice and the dice called HR.",
-    "The dealer’s side-eye at {B} is doing more damage than the dice.",
-    "{A} says this is ‘just for fun’. Their wallet disagrees."
-]
-
-
-def dice_banter_line(a_name: str, b_name: str) -> str:
-    """Pick one roast line and plug in two names."""
-    template = random.choice(DICE_BANTER_TEMPLATES)
-    return template.replace("{A}", a_name).replace("{B}", b_name)
-
-
-# ======================= Dice Party =======================
-class DoubleOrNothingView(discord.ui.View):
-    def __init__(self, winner_id: int, winner_mention: str, amount: int, game_label: str):
-        super().__init__(timeout=60)
-        self.winner_id = winner_id
-        self.winner_mention = winner_mention
-        self.amount = amount
-        self.game_label = game_label
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.winner_id:
-            await interaction.response.send_message(
-                "Only the winner can press this button, behave.", ephemeral=True
-            )
+    async def interaction_check(self, itx: discord.Interaction):
+        if itx.user.id != self.winner_id:
+            await itx.response.send_message("Not your prize, babe.", ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="Double or Nothing", style=discord.ButtonStyle.danger, emoji="🔥")
-    async def double_or_nothing(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-
-        # Disable button after first click
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-        try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
-
-        uid = str(self.winner_id)
-        ensure_user(uid)
-        bal = get_balance(uid)
-
-        stake = max(1, self.amount // 2)
-
-        if bal < stake:
-            embed = discord.Embed(
-                title=f"🎰 Double or Nothing — {self.game_label}",
-                description=(
-                    f"{self.winner_mention}, you don’t have enough coins left to risk "
-                    f"**{stake}** right now."
-                ),
-                colour=discord.Colour.red(),
-                timestamp=now_local()
-            )
-            await interaction.followup.send(embed=embed)
-            return
-
-        # Take the stake as a bet
-        change_balance(uid, -stake, "bet", meta=f"double_or_nothing:{self.game_label}")
-
-        player_roll = random.randint(1, 6)
-        house_roll = random.randint(1, 6)
-
-        if player_roll > house_roll:
-            # Pay back 2× stake (net +stake)
-            change_balance(uid, stake * 2, "payout", meta=f"double_or_nothing_win:{self.game_label}")
-            outcome = (
-                f"🎉 You rolled **{player_roll}**, house rolled **{house_roll}**.\n\n"
-                f"You win **{stake}** extra coins."
-            )
-        elif player_roll < house_roll:
-            outcome = (
-                f"😬 You rolled **{player_roll}**, house rolled **{house_roll}**.\n\n"
-                f"You lose the **{stake}** coins you risked."
-            )
-        else:
-            # Tie: refund stake
-            change_balance(uid, stake, "payout", meta=f"double_or_nothing_refund:{self.game_label}")
-            outcome = (
-                f"🤝 You rolled **{player_roll}**, house rolled **{house_roll}**.\n\n"
-                f"It’s a tie — your stake is refunded."
-            )
-
-        embed = discord.Embed(
-            title=f"🎰 Double or Nothing — {self.game_label}",
-            description=f"{self.winner_mention}\n\n{outcome}",
-            colour=discord.Colour.orange(),
-            timestamp=now_local()
-        )
-        await interaction.followup.send(embed=embed)
-        self.stop()
-
-
-class DicePartyView(discord.ui.View):
-    def __init__(self, host_id: int, stake: int, channel_id: int, max_players: int = 10):
-        super().__init__(timeout=None)
-        self.host_id = host_id
-        self.stake = stake
-        self.channel_id = channel_id
-        self.max_players = max(2, min(max_players, 20))
-        # store user IDs
-        self.players: list[int] = [host_id]
-        self.game_id = f"{channel_id}-{int(now_local().timestamp())}"
-        self.started = False
-
-    def _is_admin(self, member: discord.Member) -> bool:
-        return (
-            getattr(member.guild_permissions, "manage_guild", False)
-            or member.id == getattr(member.guild, "owner_id", 0)
-        )
-
-    def _can_control(self, member: discord.Member) -> bool:
-        return member.id == self.host_id or self._is_admin(member)
-
-    def _player_list_text(self, guild: discord.Guild | None) -> str:
-        if not guild:
-            return "\n".join(f"<@{uid}>" for uid in self.players)
-
-        lines: list[str] = []
-        for uid in self.players:
-            m = guild.get_member(uid)
-            lines.append(m.mention if m else f"<@{uid}>")
-        return "\n".join(lines) if lines else "—"
-
-    async def _update_message(self, interaction: discord.Interaction):
-        msg = interaction.message
-        if not msg:
-            return
-
-        guild = interaction.guild
-        players_list = self._player_list_text(guild)
-
-        e = msg.embeds[0] if msg.embeds else discord.Embed(
-            colour=discord.Colour.gold(),
-            timestamp=now_local(),
-        )
-        e.title = "🎲 EliHaus Dice Party"
-        e.description = (
-            f"Stake: **{self.stake}** coins per player\n"
-            f"Players: **{len(self.players)}/{self.max_players}**\n\n"
-            "Click **Join** to enter. Host presses **Start** to roll."
-        )
-        e.clear_fields()
-        e.add_field(name="Players", value=players_list, inline=False)
-
-        try:
-            await msg.edit(embed=e, view=self)
-        except Exception:
-            # never let a UI edit kill the view
-            pass
-
-    # --- Buttons ---
-
-    @discord.ui.button(label="Join", style=discord.ButtonStyle.primary, emoji="🙋")
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.started:
-            return await interaction.response.send_message(
-                "This party has already started.", ephemeral=True
-            )
-
-        user = interaction.user
-        if user.bot:
-            return await interaction.response.send_message(
-                "Bots can’t join, sorry.", ephemeral=True
-            )
-
-        if user.id in self.players:
-            return await interaction.response.send_message(
-                "You’re already in this dice party.", ephemeral=True
-            )
-
-        if len(self.players) >= self.max_players:
-            return await interaction.response.send_message(
-                f"Party is full (**{self.max_players}** players).", ephemeral=True
-            )
-
-        uid = str(user.id)
-        ensure_user(uid)
-        bal = get_balance(uid)
-        if bal < self.stake:
-            return await interaction.response.send_message(
-                f"You need at least **{self.stake}** coins to join. "
-                f"You currently have **{bal}**.",
-                ephemeral=True
-            )
-
-        self.players.append(user.id)
-
-        await interaction.response.defer(ephemeral=True, thinking=False)
-        await self._update_message(interaction)
-
-    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="🚀")
-    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.started:
-            return await interaction.response.send_message(
-                "This party has already been played.", ephemeral=True
-            )
-
-        if not self._can_control(interaction.user):
-            return await interaction.response.send_message(
-                "Only the host or an admin can start this party.", ephemeral=True
-            )
-
-        if len(self.players) < 2:
-            return await interaction.response.send_message(
-                "Need at least **2** players to start.", ephemeral=True
-            )
-
-        # mark as started and free the channel now
-        self.started = True
-        DICE_PARTY_CHANNELS.discard(self.channel_id)
-
-        try:
-            # ---- re-check balances and filter players ----
-            valid_players: list[int] = []
-            for uid_int in self.players:
-                uid = str(uid_int)
-                bal = get_balance(uid)
-                if bal >= self.stake:
-                    valid_players.append(uid_int)
-
-            self.players = valid_players
-
-            if len(self.players) < 2:
-                return await interaction.response.send_message(
-                    "After balance check there are fewer than 2 eligible players. "
-                    "Party cancelled.",
-                    ephemeral=True,
-                )
-
-            # ---- deduct stakes ----
-            pot = 0
-            for uid_int in self.players:
-                uid = str(uid_int)
-                change_balance(
-                    uid,
-                    -self.stake,
-                    "bet",
-                    meta=f"dice_party:{self.game_id}",
-                )
-                pot += self.stake
-
-            # ---- rolling animation + banter ----
-            if len(self.players) >= 2:
-                guild = interaction.guild
-                if guild is not None:
-                    p1_id, p2_id = random.sample(self.players, k=2)
-                    m1 = guild.get_member(p1_id)
-                    m2 = guild.get_member(p2_id)
-
-                    name1 = m1.display_name if m1 else f"Player {p1_id}"
-                    name2 = m2.display_name if m2 else f"Player {p2_id}"
-
-                    banter_text = dice_banter_line(name1, name2)
-
-                    base_desc = f"Dice are rolling...\n\n{banter_text}"
-                    anim_embed = discord.Embed(
-                        title="🎲 EliHaus Dice Party",
-                        description=base_desc + "\n\n`· · ·`",
-                        colour=discord.Colour.dark_purple(),
-                        timestamp=now_local(),
-                    )
-
-                    try:
-                        anim_msg = await interaction.channel.send(embed=anim_embed)
-                        for frame in ["`● · ·`", "`● ● ·`", "`● ● ●`"]:
-                            await asyncio.sleep(0.6)
-                            anim_embed.description = base_desc + f"\n\n{frame}"
-                            await anim_msg.edit(embed=anim_embed)
-                    except Exception:
-                        # flavour only
-                        pass
-
-            # ---- roll dice for everyone ----
-            rolls: dict[int, int] = {}
-            for uid_int in self.players:
-                rolls[uid_int] = random.randint(1, 6)
-
-            max_roll = max(rolls.values())
-            winners = [uid for uid, r in rolls.items() if r == max_roll]
-
-            # ---- split pot between winners ----
-            share = pot // len(winners)
-            leftover = pot - share * len(winners)
-
-            for i, uid_int in enumerate(winners):
-                payout = share + (leftover if i == 0 else 0)
-                uid = str(uid_int)
-                change_balance(
-                    uid,
-                    payout,
-                    "payout",
-                    meta=f"dice_party_win:{self.game_id}",
-                )
-
-            # ---- build result embed ----
-            guild = interaction.guild
-            lines: list[str] = []
-            for uid_int, r in rolls.items():
-                m = guild.get_member(uid_int) if guild else None
-                name = m.mention if m else f"<@{uid_int}>"
-                mark = "🏆" if uid_int in winners else " "
-                lines.append(f"{mark} {name} rolled **{r}**")
-
-            desc = "\n".join(lines)
-
-            if len(winners) == 1:
-                w_member = guild.get_member(winners[0]) if guild else None
-                w_name = w_member.mention if w_member else f"<@{winners[0]}>"
-                result_line = f"\n\n🏆 **{w_name} wins** the pot of **{pot}** coins!"
-            else:
-                winner_mentions = []
-                for uid_int in winners:
-                    m = guild.get_member(uid_int) if guild else None
-                    winner_mentions.append(m.mention if m else f"<@{uid_int}>")
-                result_line = (
-                    f"\n\n🤝 Tie on **{max_roll}**. "
-                    f"{', '.join(winner_mentions)} share the pot (**{pot}** total)."
-                )
-
-            embed = discord.Embed(
-                title="🎲 EliHaus Dice Party — Result",
-                description=desc + result_line,
-                colour=discord.Colour.gold(),
-                timestamp=now_local(),
-            )
-            embed.add_field(
-                name="Stake per player", value=str(self.stake), inline=True
-            )
-            embed.add_field(
-                name="Players", value=str(len(self.players)), inline=True
-            )
-            embed.add_field(name="Pot", value=str(pot), inline=True)
-            embed.set_footer(text="EliHaus Dice Party")
-
-            # disable buttons on the original message
-            for child in self.children:
-                if isinstance(child, discord.ui.Button):
-                    child.disabled = True
-
-            # send result as a NEW message at the bottom
-            await interaction.channel.send(embed=embed)
-
-            # ---- Double or Nothing for a single winner ----
-            if len(winners) == 1:
-                w_id = winners[0]
-                w_member = guild.get_member(w_id) if guild else None
-                winner_mention = (
-                    w_member.mention if w_member else f"<@{w_id}>"
-                )
-
-                winner_embed = discord.Embed(
-                    title="🏆 Dice Party Winner",
-                    description=f"{winner_mention} wins the pot of **{pot}** coins!",
-                    colour=discord.Colour.green(),
-                    timestamp=now_local(),
-                )
-
-                try:
-                    view = DoubleOrNothingView(
-                        winner_id=w_id,
-                        winner_mention=winner_mention,
-                        amount=pot,
-                        game_label="Dice Party",
-                    )
-                except NameError:
-                    view = None
-
-                if view is not None:
-                    await interaction.channel.send(embed=winner_embed, view=view)
-                else:
-                    await interaction.channel.send(embed=winner_embed)
-
-        except Exception:
-            # make sure the channel is freed even if something blows up
-            self.started = True
-            DICE_PARTY_CHANNELS.discard(self.channel_id)
-
-            # only one error response path
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ Something went wrong starting this dice party.\n"
-                    "If coins moved, ping an admin.",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ Something went wrong starting this dice party.\n"
-                    "If coins moved, ping an admin.",
-                    ephemeral=True,
-                )
-
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="🛑")
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.started:
-            return await interaction.response.send_message(
-                "This party has already been played; you can’t cancel it now.",
-                ephemeral=True
-            )
-
-        if not self._can_control(interaction.user):
-            return await interaction.response.send_message(
-                "Only the host or an admin can cancel this party.",
-                ephemeral=True
-            )
-
-        self.started = True
-        DICE_PARTY_CHANNELS.discard(self.channel_id)
-
-        # Disable buttons
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
-        try:
-            msg = interaction.message
-            e = msg.embeds[0] if msg.embeds else discord.Embed(
-                colour=discord.Colour.dark_grey(),
-                timestamp=now_local(),
-            )
-            e.title = "🎲 EliHaus Dice Party — Cancelled"
-            e.description = "The host cancelled this dice party. No coins were taken."
-            e.clear_fields()
-            await msg.edit(embed=e, view=self)
-        except Exception:
-            pass
-
-        await interaction.response.send_message("Dice party cancelled.", ephemeral=True)
-
-
-@bot.tree.command(
-    name="eh_dice_party",
-    description="Start a multi-player dice party (everyone stakes coins; highest roll wins)"
-)
-@app_commands.describe(
-    stake="Coins each player must stake",
-    max_players="Max number of players (including you, default 10, max 20)"
-)
-async def eh_dice_party(
-    interaction: discord.Interaction,
-    stake: int,
-    max_players: int = 10
-):
-    if stake <= 0:
-        return await interaction.response.send_message(
-            "Stake must be a positive number of coins.",
-            ephemeral=True
-        )
-
-    ch_id = interaction.channel.id
-    if ch_id in DICE_PARTY_CHANNELS:
-        return await interaction.response.send_message(
-            "There’s already an open dice party in this channel. Finish or cancel it first.",
-            ephemeral=True
-        )
-
-    host = interaction.user
-    uid_host = str(host.id)
-    ensure_user(uid_host)
-    bal_host = get_balance(uid_host)       # <-- correct, no await
-
-    if bal_host < stake:
-        return await interaction.response.send_message(
-            f"You need at least **{stake}** coins to host a party. "
-            f"You currently have **{bal_host}**.",
-            ephemeral=True
-        )
-
-    DICE_PARTY_CHANNELS.add(ch_id)
-
-    view = DicePartyView(
-        host_id=host.id,
-        stake=stake,
-        channel_id=ch_id,
-        max_players=max_players
-    )
-
-    # Initial lobby embed
-    e = discord.Embed(
-        title="🎲 EliHaus Dice Party",
-        description=(
-            f"Stake: **{stake}** coins per player\n"
-            f"Players: **1/{view.max_players}**\n\n"
-            "Click **Join** to enter. Host presses **Start** to roll."
-        ),
-        colour=discord.Colour.gold(),
-        timestamp=now_local()
-    )
-    e.add_field(name="Players", value=host.mention, inline=False)
-    e.set_footer(text="Everyone stakes; highest roll wins the pot.")
-
-    await interaction.response.send_message(embed=e, view=view)
-
-    host = interaction.user  # above
-    view = DicePartyView(host=host, stake=stake, max_players=max_players)
-
-    uid_host = str(host.id)
-    ensure_user(uid_host)
-    bal_host = await eh_balance(uid_host)
-    if bal_host < stake:
-        return await interaction.response.send_message(
-            f"You need at least **{stake}** coins to host a party. "
-            f"You currently have **{bal_host}**.",
-            ephemeral=True
-        )
-
-    DICE_PARTY_CHANNELS.add(ch_id)
-
-    view = DicePartyView(
-        host=host,              # this should be the Member object (e.g. interaction.user)
-        stake=stake,
-        max_players=max_players,
-    )
-
-    # Initial lobby embed
-    e = discord.Embed(
-        title="🎲 EliHaus Dice Party",
-        description=(
-            f"Stake: **{stake}** coins per player\n"
-            f"Players: **1/{view.max_players}**\n\n"
-            "Click **Join** to enter. Host presses **Start** to roll."
-        ),
-        colour=discord.Colour.gold(),
-        timestamp=now_local()
-    )
-    e.add_field(name="Players", value=host.mention, inline=False)
-    e.set_footer(text="Everyone stakes; highest roll wins the pot.")
-
-    await interaction.response.send_message(embed=e, view=view)
-
-
-# ---- Help (slash) ----
-@bot.tree.command(name="withdraw_wl", description="Convert your coins to WL gifts (opens a ticket; admin approves)")
-async def withdraw_wl(interaction: discord.Interaction):
-    await interaction.response.send_modal(WithdrawWLModal())
-
-@bot.tree.command(name="eh_help", description="Show EliHaus commands")
-async def eh_help(interaction: discord.Interaction):
-    is_admin = user_is_admin(interaction.user)
-
-    public_lines = [
-        "🟡 **Core coins**",
-        "`/eh_join` – join EliHaus (starter coins)",
-        "`/eh_daily` – claim daily coins",
-        "`/eh_weekly` – claim weekly coins",
-        "`/eh_balance` – check balance",
-
-        "",
-        "🎰 **Games**",
-        "`/eh_buyticket` – buy lotto tickets",
-        "`/eh_lotto` – see lotto status",
-        "`/eh_dice_duel` – 1v1 dice duel (stake coins vs someone)",
-        "`/eh_dice_party` – group dice game (everyone stakes; highest roll wins)",
-        "`/slots_panel` – jump link to the Slots panel",
-
-        "",
-        "🎁 **Prizes / WL**",
-        "`/eh_withdraw` – request WL gifts using your coins",
-        "`/eh_leaderboard` – view top balances / roulette net",
-    ]
-
-    admin_lines = [
-        "🎛️ **Admin only**",
-        "`/eh_openround` – open roulette round",
-        "`/eh_lotto_config` – configure weekly lotto draw (day / time / prize / shop)",
-        "`/eh_drawlotto` – draw weekly lotto winner",
-        "`/slots_open` – open Slots panel in this channel",
-        "`/eh_deposit` – owner-only manual coin deposit",
-        # keep /eh_sync available but not advertised unless you want it:
-        # "`/eh_sync` – re-sync slash commands (debug)",
-    ]
-
-# ========= Roulette single-card helpers =========
-import asyncio
-
-async def _edit_round_message(bot, channel, rid: int, embed: discord.Embed, view: discord.ui.View | None):
-    """
-    Edit the ONE official roulette message for this round (rid).
-    Falls back to sending a new one only if the original was deleted,
-    and then records the new message_id in the 'rounds' table.
-    """
-    # fetch saved message_id
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT message_id FROM rounds WHERE rid=?", (rid,))
-        row = c.fetchone()
-    msg_id = int(row[0]) if row and row[0] else None
-
-    # resolve channel object if an id was passed
-    ch = channel
-    if isinstance(channel, int):
-        ch = bot.get_channel(channel) or await bot.fetch_channel(channel)
-
-    if msg_id:
-        try:
-            msg = await ch.fetch_message(msg_id)
-            await msg.edit(embed=embed, view=view)
-            return
-        except Exception:
-            pass  # original message missing or cannot be edited
-
-    # fallback: send new, then save id
-    new_msg = await ch.send(embed=embed, view=view)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(new_msg.id), rid))
-
-
-def _round_stats(rid: int) -> tuple[int, int]:
-    """
-    Returns (bets_count, pool_sum) for a round from 'bets' table.
-    Safe even if there are no bets.
-    """
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*), COALESCE(SUM(stake), 0) FROM bets WHERE rid=?", (rid,))
-        row = c.fetchone() or (0, 0)
-    count = int(row[0] or 0)
-    pool = int(row[1] or 0)
-    return count, pool
-
-import asyncio
-ROUND_TICK_SECONDS = 5
-ROUND_TASKS: dict[str, asyncio.Task] = {}
-
-def _choice_label(choice: str) -> str:
-    """Pretty label for a stored choice."""
-    ch = str(choice).upper()
-    if ch.startswith("NUM:"):
-        return f"#{ch.split(':', 1)[1]}"
-    if ch in ("RED", "BLACK", "GREEN"):
-        # same 🎯 icon everywhere for consistency
-        return {"RED": "🟥", "BLACK": "⬛", "GREEN": "🟩"}[ch]
-    return ch
-
-def _latest_bets_lines(channel, rid: int, limit: int = 6) -> str:
-    """Return 'mention: LABEL — amount' lines for the latest bets in this round."""
-    rows: list[tuple[str, str, int]] = []
-    with db() as conn:
-        c = conn.cursor()
-        # Works on SQLite even without an explicit timestamp (uses ROWID order)
-        c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=? ORDER BY ROWID DESC LIMIT ?", (rid, limit))
-        rows = c.fetchall() or []
-
-    lines = []
-    guild = getattr(channel, "guild", None)
-    for uid, choice, stake in rows:
-        who = f"<@{uid}>"
-        if guild:
-            m = guild.get_member(int(uid))
-            if m:
-                who = m.mention
-        lines.append(f"{who}: {_choice_label(choice)} — **{int(stake)}**")
-    return "\n".join(lines) if lines else "—"
-
-
-        
-# ---- robust countdown that always resolves ----
-import asyncio
-from datetime import datetime, timezone
-
-async def tick_round(channel, rid: int, exp_iso: str):
-    """
-    Edits the ONE round panel with a countdown and auto-resolves when time is up.
-    Never crashes the task; always removes buttons at the end.
-    """
-    # parse expiry safely
-    try:
-        exp = datetime.fromisoformat(exp_iso)
-        if exp.tzinfo is None:
-            # make it local if your app uses TZ, else fall back to UTC
-            exp = (now_local() if 'now_local' in globals() else datetime.now(timezone.utc)).astimezone().tzinfo \
-                  and exp.replace(tzinfo=(now_local().tzinfo if 'now_local' in globals() else timezone.utc)) \
-                  or exp.replace(tzinfo=timezone.utc)
-    except Exception:
-        # if parsing fails, end immediately
-        exp = (now_local() if 'now_local' in globals() else datetime.now(timezone.utc))
-
-    while True:
-        try:
-            now = now_local() if 'now_local' in globals() else datetime.now(timezone.utc)
-            left = max(0, int((exp - now).total_seconds()))
-
-            # stats
-            with db() as conn:
-                c = conn.cursor()
-                c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
-                cnt, pool = c.fetchone() or (0, 0)
-
-            # betting panel (gold)
-            open_embed = discord.Embed(
-                title=f"🎰 Roulette — Round {ClaimView.get_round_label(rid)}",
-                description="Click to bet.",
-                color=discord.Color.gold()
-            )
-            open_embed.add_field(name="Pool", value=str(pool), inline=True)
-            open_embed.add_field(name="Time", value=f"{left}s left", inline=True)
-            open_embed.add_field(name="Bets", value=str(cnt), inline=True)
-            players_txt = _latest_bets_lines(channel, rid, limit=10)
-            open_embed.add_field(name="Players (latest)", value=players_txt, inline=False)
-
-            view = RouletteBetView(rid, timeout=left + 30)
-            await _edit_round_message(bot, channel, rid, open_embed, view=view)
-
-            if left <= 0:
-                break
-
-            await asyncio.sleep(5)
-        except Exception:
-            # never let a bug kill the countdown
-            await asyncio.sleep(5)
-
-          # ----- compute outcome (result_color/result_number already set or roll now) -----
-    try:
-        result_color, result_number = resolve_spin_result(rid)
-    except Exception:
-        import random
-        n = random.randint(0, 36)
-        result_number = n
-        result_color = "GREEN" if n == 0 else ("RED" if _outcome_from_spin(n) == "red" else "BLACK")
-    
-    outcome = result_color.lower()
-    
-    # Totals + winners (sum payouts if same user has multiple winning bets)
-    total_bets = 0
-    total_pool = 0
-    winners_map: dict[str, int] = {}
-    
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,))
-        rows = c.fetchall() or []
-        for uid, choice, stake in rows:
-            total_bets += 1
-            total_pool += int(stake)
-    
-            ch = str(choice).upper()
-            win = 0
-            if ch in ("RED","BLACK") and ch.lower() == outcome:
-                win = int(stake * PAYOUT_RED_BLACK)
-            elif ch == "GREEN" and outcome == "green":
-                win = int(stake * PAYOUT_GREEN)
-            elif ch.startswith("NUM:"):
-                num = int(ch.split(":",1)[1])
-                if num == int(result_number):
-                    win = int(stake * PAYOUT_NUMBER)
-    
-            if win > 0:
-                winners_map[uid] = winners_map.get(uid, 0) + win
-                # credit users (optional if you already do this elsewhere)
-                c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (win, uid))
-                c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                          (uid, "payout", win, f"roulette:{rid}|{outcome}:{result_number}", iso(now_local())))
-    
-    winners_list = list(winners_map.items())
-    winners_txt = _format_winners_lines(getattr(channel, "guild", None), winners_list, limit=5)
-    
-    # Colored result embed
-    pill = {"RED":"🔴 **RED**","BLACK":"⬛ **BLACK**","GREEN":"🟩 **GREEN**"}[str(result_color).upper()]
-    col_map = {"RED":(220,38,38), "BLACK":(24,24,27), "GREEN":(16,185,129)}
-    r,g,b = col_map.get(str(result_color).upper(), (24,24,27))
-    
-    result_embed = discord.Embed(
-        title=f"🎰 EliHaus Roulette — Round {ClaimView.get_round_label(rid)}",
-        colour=discord.Colour.from_rgb(r,g,b)
-    )
-    result_embed.add_field(name="RESULT", value=f"{pill} · **#{int(result_number)}**", inline=False)
-    result_embed.add_field(name="Total Bets", value=str(total_bets), inline=True)
-    result_embed.add_field(name="Pool", value=str(total_pool), inline=True)
-    result_embed.add_field(name="Winners (top)", value=winners_txt, inline=False)
-
-    # 2) render the numbered chip and SEND a new result message
-    badge = render_chip_badge(str(result_color).upper(), int(result_number))  # uses assets/chip_*.png
-    
-    # ------------------------------------------------------------
-    # remove buttons and show result (close panel, then send result)
-    # ------------------------------------------------------------
-    try:
-        # 1) close the original betting panel (remove buttons)
-        await _edit_round_message(
-            bot, channel, rid,
-            discord.Embed(
-                title=f"🎰 Roulette — Round {ClaimView.get_round_label(rid)}",
-                description="Round closed.",
-                colour=discord.Colour.dark_grey()
-            ),
-            view=None
-        )
-    
-        # 2) render the numbered chip and SEND a new result message
-        badge = render_chip_badge(str(result_color).upper(), int(result_number))  # uses assets/chip_*.png
-        if badge:
-            fname = f"chip_{str(result_color).lower()}_{int(result_number)}.png"
-            file = discord.File(badge, filename=fname)
-            result_embed.set_image(url=f"attachment://{fname}")
-            await channel.send(embed=result_embed, file=file)
-        else:
-            # fallback if Pillow/assets missing
-            await channel.send(embed=result_embed)
-    
-    except Exception:
-        # even if something above fails, make sure buttons are gone
-        try:
-            await _edit_round_message(
-                bot, channel, rid,
-                discord.Embed(
-                    title=f"🎰 EliHaus Roulette — Round {ClaimView.get_round_label(rid)}",
-                    description="Round closed.",
-                    colour=discord.Colour.dark_grey()
-                ),
-                view=None
-            )
-        except Exception:
-            pass
-
-
-@bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
-async def eh_join(interaction: discord.Interaction):
-    await safe_ack(interaction, ephemeral=True)  # prevents "The application did not respond"
-
-    try:
-        uid = str(interaction.user.id)
-        ensure_user(uid)
-
-        # already claimed starter?
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM tx WHERE discord_id=? AND kind='starter' LIMIT 1", (uid,))
-            has_starter = c.fetchone() is not None
-
-        if has_starter:
-            return await safe_followup(
-                interaction,
-                "You’ve already joined EliHaus. Use `/eh_daily` and `/eh_weekly` to build coins.",
-                True,
-            )
-
-        new_bal = change_balance(uid, STARTER_AMOUNT, "starter", "joinhaus starter")
-
-        return await safe_followup(
-            interaction,
-            f"Welcome to **EliHaus**. Starter pack: **{STARTER_AMOUNT}** coins. Balance: **{new_bal}**",
-            True,
-        )
-
-    except Exception as e:
-        return await safe_followup(interaction, f"❌ Error: `{e}`", True)
-
-@bot.tree.command(name="eh_daily", description="Claim your daily coins")
-async def eh_daily(interaction: discord.Interaction):
-    uid = str(interaction.user.id)
-    ensure_user(uid)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT last_daily FROM users WHERE discord_id=?", (uid,))
-        row = c.fetchone()
-        last = datetime.fromisoformat(row[0]).astimezone(TZ) if row and row[0] else None
-        now = now_local()
-        if last and (now - last) < timedelta(hours=24):
-            left = timedelta(hours=24) - (now - last)
-            hrs = int(left.total_seconds() // 3600)
-            mins = int((left.total_seconds() % 3600) // 60)
-            return await interaction.response.send_message(f"You’ve already claimed. Try again in **{hrs}h {mins}m**.", ephemeral=True)
-        new_bal = change_balance(uid, DAILY_AMOUNT, "claim", "daily")
-        c.execute("UPDATE users SET last_daily=? WHERE discord_id=?", (iso(now), uid))
-    await interaction.response.send_message(f"Daily claimed: **{DAILY_AMOUNT}** coins. New balance: **{new_bal}**", ephemeral=True)
-
-@bot.tree.command(name="eh_weekly", description="Claim your weekly coins")
-async def eh_weekly(interaction: discord.Interaction):
-    uid = str(interaction.user.id)
-    ensure_user(uid)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT last_weekly FROM users WHERE discord_id=?", (uid,))
-        row = c.fetchone()
-        nowt = now_local()
-        last = datetime.fromisoformat(row[0]).astimezone(TZ) if row and row[0] else None
-        if last and (last.isocalendar()[:2] == nowt.isocalendar()[:2]):
-            return await interaction.response.send_message("You’ve already claimed your weekly this week.", ephemeral=True)
-        new_bal = change_balance(uid, WEEKLY_AMOUNT, "claim", "weekly")
-        c.execute("UPDATE users SET last_weekly=? WHERE discord_id=?", (iso(nowt), uid))
-    await interaction.response.send_message(f"Weekly claimed: **{WEEKLY_AMOUNT}** coins. New balance: **{new_bal}**", ephemeral=True)
-
-
-# ---------- Bet notification helper (used by all games) ----------
-
-async def notify_bet_deduction(
-    guild: discord.Guild | None,
-    user_id: int,
-    amount: int,
-    game_name: str,
-):
-    """
-    DM the player how much was deducted for this bet
-    and show their new total balance.
-    """
-    uid = str(user_id)
-    new_bal = get_balance(uid)
-
-    if not guild:
-        return
-
-    member = guild.get_member(user_id)
-    if not member:
-        return
-
-    try:
-        await member.send(
-            f"🎰 EliHaus {game_name}\n"
-            f"Bet deducted: **{amount}** coins.\n"
-            f"Your new balance: **{new_bal}** coins."
-        )
-    except Exception:
-        # DMs closed / blocked etc. – ignore silently
-        pass
-
-
-@bot.tree.command(name="eh_balance", description="Check your coin balance (or someone else's)")
-@app_commands.describe(user="(optional) member to check")
-async def eh_balance(interaction: discord.Interaction, user: discord.Member | None = None):
-    target = user or interaction.user
-    uid = str(target.id)          
-    ensure_user(uid)             
-
-    try:
-        bal = get_balance(uid)
-    except Exception as e:
-        import traceback; print("eh_balance error:\n", traceback.format_exc())
-        return await interaction.response.send_message("❌ Couldn't fetch balance.", ephemeral=True)
-
-    # self check = ephemeral
-    if user is None:
-        await interaction.response.send_message(f"💰 Your balance: **{bal}** coins.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"💰 {target.mention} balance: **{bal}** coins.")
-   
-    # create a private ticket for this user + staff
-    overwrites = {
-        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
-    }
-    if TICKETS_STAFF_ROLE_ID:
-        role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
-        if role:
-            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
-
-    ticket_name = f"wl-deposit-{interaction.user.name[:16].lower()}-{int(now_local().timestamp())}"
-    ticket = await interaction.guild.create_text_channel(ticket_name, category=cat, overwrites=overwrites, reason="EliHaus WL deposit")
-
-    # post details in the ticket
-    staff_tag = f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"
-    e = discord.Embed(
-        title="💳 WL Conversion Request",
-        description=f"{interaction.user.mention} deposited **{amount}** coins to convert to wishlist gifts.",
-        color=discord.Color.gold(),
-        timestamp=now_local()
-    )
-    e.add_field(name="IMVU", value=imvu, inline=False)
-    e.add_field(name="Notes", value=(note or "—"), inline=False)
-    e.add_field(name="New Balance", value=str(new_bal), inline=True)
-
-    await ticket.send(content=staff_tag, embed=e)
-
-    # confirm to the user
-    await interaction.response.send_message(
-        f"✅ Deposited **{amount}** coins. Ticket created: {ticket.mention}\n"
-        f"Balance: **{bal} ➜ {new_bal}**",
-        ephemeral=True
-    )
-    
-def _result_color(outcome: str) -> discord.Colour:
-    m = {"red": (220, 38, 38), "black": (24, 24, 27), "green": (16, 185, 129)}
-    r, g, b = m.get(str(outcome).lower(), (24, 24, 27))
-    return discord.Colour.from_rgb(r, g, b)
-def build_roulette_result_embed(*, rlabel: str, outcome: str, roll: int,
-                                total_bets: int, total_pool: int,
-                                winners_mentions: list[str], seed_display: str) -> discord.Embed:
-    pill = {"red": "🔴 **RED**", "black": "⬛ **BLACK**", "green": "🟩 **GREEN**"}.get(outcome.lower(), "⬛ **BLACK**")
-    e = discord.Embed(title=f"🎰 EliHaus Roulette — Round {rlabel}",
-                      colour=_result_color(outcome))
-    e.add_field(name="RESULT", value=f"{pill} · **#{roll}**", inline=False)
-    e.add_field(name="Total Bets", value=str(total_bets), inline=True)
-    e.add_field(name="Pool", value=str(total_pool), inline=True)
-    e.add_field(name="Winners (top)", value=("• " + "\n• ".join(winners_mentions)) if winners_mentions else "—", inline=False)
-    e.set_footer(text=f"Seed: {seed_display}")
-    return e
-
-#dice====
-#dice====
-@bot.tree.command(
-    name="eh_dice_duel",
-    description="Peer-to-peer dice duel (both stake coins)"
-)
-@app_commands.describe(
-    opponent="Person you want to challenge",
-    stake="Coins each player bets"
-)
-async def eh_dice_duel(
-    interaction: discord.Interaction,
-    opponent: discord.Member,
-    stake: int
-):
-    """Slash command to start a 1v1 dice duel."""
-    challenger = interaction.user
-
-    if opponent.bot:
-        return await interaction.response.send_message(
-            "You can’t duel a bot, babe.",
-            ephemeral=True
-        )
-
-    if opponent.id == challenger.id:
-        return await interaction.response.send_message(
-            "You can’t duel yourself. Go play Slots instead.",
-            ephemeral=True
-        )
-
-    if stake <= 0:
-        return await interaction.response.send_message(
-            "Stake must be a positive number of coins.",
-            ephemeral=True
-        )
-
-    chal_id = str(challenger.id)
-    opp_id = str(opponent.id)
-
-    ensure_user(chal_id)
-    ensure_user(opp_id)
-
-    chal_bal = get_balance(chal_id)
-    opp_bal = get_balance(opp_id)
-
-    if chal_bal < stake:
-        return await interaction.response.send_message(
-            f"You only have **{chal_bal}** coins. You need **{stake}**.",
-            ephemeral=True
-        )
-
-    if opp_bal < stake:
-        return await interaction.response.send_message(
-            f"{opponent.mention} doesn’t have enough coins for that stake.",
-            ephemeral=True
-        )
-
-    view = DiceDuelRequestView(challenger, opponent, stake)
-
-    embed = discord.Embed(
-        title="🎲 Dice Duel Challenge",
-        description=(
-            f"{challenger.mention} has challenged {opponent.mention} to a dice duel!\n\n"
-            f"**Stake:** {stake} coins each (pot **{stake * 2}**)\n\n"
-            f"{opponent.mention}, click **Accept duel** or **Decline** below."
-        ),
-        colour=discord.Colour.gold(),
-        timestamp=now_local()
-    )
-
-    await interaction.response.send_message(embed=embed, view=view)
-
-    # store message on view for timeout / edits
-    try:
-        view.message = await interaction.original_response()
-    except Exception:
-        view.message = None
-
-
-class DiceDuelRequestView(discord.ui.View):
-    def __init__(self, challenger: discord.Member, opponent: discord.Member, stake: int):
-        super().__init__(timeout=120)  # 2 minutes
+    @discord.ui.button(label="Claim as Coins", style=discord.ButtonStyle.success, emoji="💰")
+    async def claim_coins(self, itx: discord.Interaction, button: discord.ui.Button):
+        coin_value = self.prize_count * WL_COINS_PER_GIFT
+        new_bal = change_balance(str(itx.user.id), coin_value, "lotto_payout", f"Converted {self.prize_count} gifts")
+        self.clear_items()
+        await itx.response.edit_message(content=f"✅ Claimed **{coin_value:,}** coins!", view=self)
+
+    @discord.ui.button(label="Claim as WL Gifts", style=discord.ButtonStyle.primary, emoji="🎁")
+    async def claim_wl(self, itx: discord.Interaction, button: discord.ui.Button):
+        await itx.response.send_modal(LottoClaimModal(self.prize_count))
+
+# ---------------- PVP Dice Duel View ----------------
+
+class DiceDuelView(discord.ui.View):
+    def __init__(self, challenger, opponent, stake):
+        super().__init__(timeout=60)
         self.challenger = challenger
         self.opponent = opponent
         self.stake = stake
-        self.message: discord.Message | None = None
-        self.resolved = False
 
-    async def _finish(
-        self,
-        content: str | None = None,
-        embed: discord.Embed | None = None
-    ):
-        self.resolved = True
-
-        # disable buttons
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = True
-
-        if self.message:
-            try:
-                await self.message.edit(content=content, embed=embed, view=self)
-            except Exception:
-                pass
+    @discord.ui.button(label="Accept Duel", style=discord.ButtonStyle.success, emoji="⚔️")
+    async def accept(self, itx: discord.Interaction, button: discord.ui.Button):
+        if itx.user.id != self.opponent.id:
+            return await itx.response.send_message("You weren't challenged, stay back!", ephemeral=True)
+        
+        if get_balance(str(self.challenger.id)) < self.stake or get_balance(str(self.opponent.id)) < self.stake:
+            return await itx.response.send_message("One of you is too broke to duel now.", ephemeral=True)
 
         self.stop()
+        change_balance(str(self.challenger.id), -self.stake, "duel_stake", f"vs {self.opponent.id}")
+        change_balance(str(self.opponent.id), -self.stake, "duel_stake", f"vs {self.challenger.id}")
 
-    @discord.ui.button(label="Accept duel", style=discord.ButtonStyle.success, emoji="✅")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # only the challenged user can accept
-        if interaction.user.id != self.opponent.id:
-            return await interaction.response.send_message(
-                "Only the challenged player can accept this duel.",
-                ephemeral=True
-            )
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        # --- fun animation + banter while we "roll" ---
-        duel_vs = f"{self.challenger.mention} vs {self.opponent.mention}"
-
-        # simple dot animation embed
-        anim_embed = discord.Embed(
-            title="🎲 EliHaus Dice Duel",
-            description=f"{duel_vs}\n\n`· · ·`",
-            colour=discord.Colour.gold(),
-            timestamp=now_local()
-        )
-        try:
-            anim_msg = await interaction.channel.send(embed=anim_embed)
-
-            for frame in ["`● · ·`", "`● ● ·`", "`● ● ●`"]:
-                await asyncio.sleep(0.6)
-                anim_embed.description = f"{duel_vs}\n\n{frame}"
-                await anim_msg.edit(embed=anim_embed)
-        except Exception:
-            anim_msg = None  # animation is flavour only
-
-        # roast line embed
-        try:
-            banter_text = dice_banter_line(
-                self.challenger.display_name,
-                self.opponent.display_name,
-            )
-            banter_embed = discord.Embed(
-                title="🎲 EliHaus Dice Duel",
-                description=f"{duel_vs}\n\n{banter_text}",
-                colour=discord.Colour.dark_purple(),
-                timestamp=now_local()
-            )
-            await interaction.channel.send(embed=banter_embed)
-        except Exception:
-            pass
-
-        # --- re-check balances ---
-        chal_id = str(self.challenger.id)
-        opp_id = str(self.opponent.id)
-        ensure_user(chal_id)
-        ensure_user(opp_id)
-
-        chal_bal = get_balance(chal_id)
-        opp_bal = get_balance(opp_id)
-
-        if chal_bal < self.stake or opp_bal < self.stake:
-            msg_bits = []
-            if chal_bal < self.stake:
-                msg_bits.append(f"{self.challenger.mention} has only **{chal_bal}**.")
-            if opp_bal < self.stake:
-                msg_bits.append(f"{self.opponent.mention} has only **{opp_bal}**.")
-            await self._finish(
-                "❌ Duel cancelled. Someone no longer has enough coins.\n"
-                + "\n".join(msg_bits)
-            )
-            return
-
-        # --- take stakes ---
-        pot = self.stake * 2
-        change_balance(chal_id, -self.stake, "bet", meta=f"dice_duel:vs:{opp_id}")
-        change_balance(opp_id, -self.stake, "bet", meta=f"dice_duel:vs:{chal_id}")
-
-        # --- roll dice ---
-        c1, c2 = random.randint(1, 6), random.randint(1, 6)
-        o1, o2 = random.randint(1, 6), random.randint(1, 6)
-        chal_total = c1 + c2
-        opp_total = o1 + o2
-
-        lines = [
-            f"**Stake:** {self.stake} coins each (pot **{pot}**)",
-            "",
-            f"{self.challenger.mention}: 🎲 `{c1} + {c2} = {chal_total}`",
-            f"{self.opponent.mention}: 🎲 `{o1} + {o2} = {opp_total}`",
-            "",
-        ]
-
-        winner_id: int | None = None
-        winner_mention: str | None = None
-
-        if chal_total > opp_total:
-            change_balance(chal_id, pot, "payout", meta=f"dice_duel_win:vs:{opp_id}")
-            lines.append(f"🏆 {self.challenger.mention} wins **{pot}** coins!")
-            winner_id = self.challenger.id
-            winner_mention = self.challenger.mention
-        elif opp_total > chal_total:
-            change_balance(opp_id, pot, "payout", meta=f"dice_duel_win:vs:{chal_id}")
-            lines.append(f"🏆 {self.opponent.mention} wins **{pot}** coins!")
-            winner_id = self.opponent.id
-            winner_mention = self.opponent.mention
-        else:
-            # tie → refund
-            change_balance(chal_id, self.stake, "payout", meta="dice_duel_refund")
-            change_balance(opp_id, self.stake, "payout", meta="dice_duel_refund")
-            lines.append("🤝 It’s a tie! Both players are refunded.")
-
-        # --- edit original duel message with summary ---
-        result_embed = discord.Embed(
-            title="🎲 Dice Duel Result",
-            description="\n".join(lines),
-            colour=discord.Colour.gold(),
-            timestamp=now_local()
-        )
-        await self._finish(embed=result_embed)
-
-        # --- separate winner embed as a fresh message ---
-        if winner_id is not None and winner_mention is not None:
-            winner_embed = discord.Embed(
-                title="🏆 Dice Duel Winner",
-                description=f"{winner_mention} wins **{pot}** coins!",
-                colour=discord.Colour.green(),
-                timestamp=now_local()
-            )
-
-            # Try to attach Double or Nothing if the view exists
-            try:
-                view = DoubleOrNothingView(
-                    winner_id=winner_id,
-                    winner_mention=winner_mention,
-                    amount=pot,
-                    game_label="Dice Duel"
-                )
-            except NameError:
-                view = None
-
-            # Send as a normal channel message so it appears at the bottom
-            if view is not None:
-                await interaction.channel.send(embed=winner_embed, view=view)
-            else:
-                await interaction.channel.send(embed=winner_embed)
-
-        else:
-            # Tie: just info, no winner embed
-            await interaction.channel.send(
-                "Duel resolved (tie, coins refunded).",
-                ephemeral=True
-            )
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="🛑")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in (self.opponent.id, self.challenger.id):
-            return await interaction.response.send_message(
-                "Only the challenger or the challenged player can cancel this duel.",
-                ephemeral=True
-            )
-
-        await interaction.response.defer(ephemeral=True)
-        await self._finish(f"❌ Dice duel cancelled by {interaction.user.mention}.")
-        await interaction.channel.send("Duel cancelled.", ephemeral=True)
-
-    async def on_timeout(self):
-        if self.resolved or not self.message:
-            return
-
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = True
-
-        try:
-            await self.message.edit(
-                content="⏰ Dice duel request expired (no response).",
-                view=self
-            )
-        except Exception:
-            pass
-
-@bot.tree.command(name="eh_dice", description="Show the available EliHaus dice games")
-async def eh_dice(interaction: discord.Interaction):
-    e = discord.Embed(
-        title="🎲 EliHaus Dice Games",
-        colour=discord.Colour.gold(),
-        description=(
-            "`/eh_dice_duel` – 1v1 dice duel:\n"
-            "• You choose a stake and ping an opponent.\n"
-            "• Both players pay the stake, highest total wins the pot.\n"
-            "• Ties refund both players.\n\n"
-            "`/eh_dice_party` – group dice party:\n"
-            "• Host sets a stake and lets multiple people join.\n"
-            "• Everyone pays the stake, highest total wins the whole pot.\n"
-            "• Ties split the pot between top rollers."
-        )
-    )
-    e.set_footer(text="All dice games use your coin balance. Gamble responsibly, babes.")
-    await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-@bot.tree.command(name="eh_openround", description="(Admin) Open a roulette round")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(seconds="Betting window (10–600s)")
-async def eh_openround(interaction: discord.Interaction, seconds: int = ROUND_SECONDS_DEFAULT):
-    await safe_ack(interaction, ephemeral=True)  
-
-    try:
-        # --- existing perm checks ---
-        if not user_is_admin(interaction.user):
-            return await safe_followup(interaction, "You don’t have permission.", True)
-
-        seconds = max(10, min(seconds, 600))
-        if get_open_round(interaction.channel.id):
-            return await safe_followup(interaction, "There’s already an open round in this channel.", True)
-
-        rid, exp = open_round(interaction.channel.id, seconds, str(interaction.user.id))
-
-        # build the opening panel
-        rnum = ClaimView.next_round_number(interaction.channel.id)
-        rlabel = f"#{rnum}"
-        ClaimView.set_round_label(rid, rlabel)
-
-        embed = discord.Embed(
-            title=f"🎰 Roulette — Round {ClaimView.get_round_label(rid)}",
-            description="Click to bet.",
-            color=discord.Color.gold()
-        )
-        embed.add_field(name="Pool", value="0", inline=True)
-        embed.add_field(name="Time", value=f"{seconds}s left", inline=True)
-        embed.add_field(name="Bets", value="0", inline=True)
-
-        view = RouletteBetView(rid, timeout=seconds + 30)
-        msg = await interaction.channel.send(embed=embed, view=view)
-        with db() as conn:
-            conn.execute("UPDATE rounds SET message_id=? WHERE rid=?", (str(msg.id), rid))
-
-        # launch ticker as a background task (never block the command)
-        try:
-            ROUND_TASKS[rid] = bot.loop.create_task(tick_round(interaction.channel, rid, iso(exp)))
-        except Exception:
-            pass
-
-        return await safe_followup(interaction, f"✅ Opened roulette round {rlabel}.", True)
-
-    except Exception as e:
-        # show error to caller so it never silently “doesn’t respond”
-        return await safe_followup(interaction, f"❌ Error opening round: `{e}`", True)
-
-  
-@bot.tree.command(name="eh_table", description="Show current roulette round status in this channel")
-async def eh_table(interaction: discord.Interaction):
-    o = get_open_round(interaction.channel.id)
-    if not o:
-        return await interaction.response.send_message("No open round in this channel.", ephemeral=True)
-    rid, exp = o
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*), COALESCE(SUM(stake),0) FROM bets WHERE rid=?", (rid,))
-        cnt, pool = c.fetchone()
-    remain = max(0, int((exp - now_local()).total_seconds()))
-    await interaction.response.send_message(
-        f"Round **{ClaimView.get_round_label(rid)}** — Bets: **{cnt}** | Pool: **{pool}** | Time left: **{remain}s**",
-        ephemeral=True
-    )
-
-@bot.event
-
-async def _roulette_send_result(
-    bot, channel, *, rid: int,
-    result_color: str,           # "RED" | "BLACK" | "GREEN"
-    result_number: int,
-    winners_top: list[tuple[str,int]],  # [(discord_id, payout), ...]
-    pool_sum: int,
-    image_path: str | None = None  # e.g. "assets/roulette/result_red.png"
-):
-    color_map = {"RED": (220,38,38), "BLACK": (24,24,27), "GREEN": (16,185,129)}
-    pill_text = {"RED":"🔴 **RED**","BLACK":"⬛ **BLACK**","GREEN":"🟩 **GREEN**"}
-
-    ck = str(result_color).upper()
-    rgb = color_map.get(ck, (24,24,27))
-    pill = pill_text.get(ck, "⬛ **BLACK**")
-
-    # winners list (top 5)
-    def _format_winners(guild: discord.Guild, winners: list[tuple[str,int]], limit: int = 5) -> str:
-        if not winners: return "—"
-        winners = sorted(winners, key=lambda x: x[1], reverse=True)[:limit]
-        lines = []
-        for uid, amount in winners:
-            m = guild.get_member(int(uid))
-            who = m.mention if m else f"<@{uid}>"
-            lines.append(f"{who} — **{amount}**")
-        return "\n".join(lines)
-
-    e = discord.Embed(
-        title=f"🎰 EliHaus Roulette — Round #{rid}",
-        colour=discord.Colour.from_rgb(*rgb),
-    )
-    e.add_field(name="RESULT", value=f"{pill} · **#{int(result_number)}**", inline=False)
-    e.add_field(name="Pool", value=str(pool_sum), inline=True)
-    e.add_field(name="Winners (top)", value=_format_winners(channel.guild, winners_top), inline=False)
-    e.set_footer(text=f"ROUL-{rid} • {now_local().strftime('%b %d, %H:%M')}")
-
-    # If you want a mockup image, attach it as a separate public message (editing a pin with a new file is awkward).
-    if image_path:
-        try:
-            file = discord.File(image_path)
-            await channel.send(embed=e, file=file)
-        except Exception:
-            # if the file is missing, still update the pinned panel without image
-            edit_round_message(bot, channel, rid, e, view=None)
-            return
-
-    # Update your pinned/live round panel (no image here)
-    edit_round_message(bot, channel, rid, e, view=None)
-
-@bot.tree.command(name="eh_resolve", description="(Admin) Resolve the current roulette round")
-@app_commands.default_permissions(manage_guild=True)
-async def eh_resolve(interaction: discord.Interaction):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+        c_roll = random.randint(1, 100)
+        o_roll = random.randint(1, 100)
         
-    o = get_open_or_last_round(interaction.channel.id)
-    if not o:
-        return await interaction.response.send_message("No round found to resolve in this channel.", ephemeral=True)
-    rid, _exp = o
+        embed = discord.Embed(title="⚔️ Dice Duel Results", color=discord.Color.gold())
+        embed.add_field(name=self.challenger.display_name, value=f"🎲 **{c_roll}**", inline=True)
+        embed.add_field(name=self.opponent.display_name, value=f"🎲 **{o_roll}**", inline=True)
 
-    # roll an outcome with a reproducible seed
-    seed = f"ROUL-{rid}-{int(now_local().timestamp())}-{random.randint(1, 1_000_000)}"
-    random.seed(seed)
-    roll = random.randint(0, 36)  # 0 = green
-    red_nums = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-    if roll == 0:
-        outcome = "green"
-        multiplier = PAYOUT_GREEN
-    else:
-        outcome = "red" if roll in red_nums else "black"
-        multiplier = PAYOUT_RED_BLACK
-
-    # settle
-    total_pool = 0
-    winners = []
-    rows = []
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,))
-        rows = c.fetchall()
-        for uid, ch, stake in rows:
-            total_pool += stake
-        for uid, ch, stake in rows:
-            if ch == outcome:
-                win = int(stake * multiplier)
-                c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (win, uid))
-                c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                          (uid, "payout", win, f"roulette:{rid}|{outcome}", iso(now_local())))
-                winners.append((uid, win))
-        c.execute("UPDATE rounds SET status='RESOLVED', outcome=?, seed=?, resolved_at=? WHERE rid=?",
-                  (f"{outcome}:{roll}", seed, iso(now_local()), rid))
-    set_state(round_key(interaction.channel.id), None)
-
-    # update the original embed (remove buttons)
-    msg_id = None
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT message_id FROM rounds WHERE rid=?", (rid,))
-        r = c.fetchone()
-        if r and r[0]:
-            msg_id = int(r[0])
-
-    rlabel = ClaimView.get_round_label(rid)
-    seed_display = ClaimView.short_seed(seed, 8)
-    top_mentions = []
-    for uid, _win in sorted(winners, key=lambda x: x[1], reverse=True)[:5]:
-        m = interaction.guild.get_member(int(uid))
-        top_mentions.append(m.mention if m else f"<@{uid}>")
-
-    # Top winners as (discord_id, payout) for the helper
-    winners_top = [(str(uid), int(amount)) for uid, amount in winners][:5]
-    pool_sum = total_pool  # whatever var you use for the round pool
-    
-    await _roulette_send_result(
-        bot,
-        interaction.channel,    # or `channel` if you already have it
-        rid=rid,
-        result_color=str(outcome).upper(),  # "RED"/"BLACK"/"GREEN"
-        result_number=int(roll),
-        winners_top=winners_top,
-        pool_sum=int(pool_sum),
-        # Optional image mockup:
-        # image_path=f"assets/roulette/result_{str(outcome).lower()}.png"
-    )
-
-    #await interaction.channel.send(embed=result_embed)
-    # Ephemeral confirmation (optional)
-    sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-    await sender("Round resolved.", ephemeral=True)
-
-@bot.tree.command(name="eh_cancelround", description="(Admin) Cancel the current roulette round and refund")
-@app_commands.default_permissions(manage_guild=True)
-async def eh_cancelround(interaction: discord.Interaction):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    o = get_open_round(interaction.channel.id)
-    if not o:
-        return await interaction.response.send_message("No open round to cancel.", ephemeral=True)
-    rid, _ = o
-    set_state(round_key(interaction.channel.id), None)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT discord_id, stake FROM bets WHERE rid=?", (rid,))
-        rows = c.fetchall()
-        for uid, stake in rows:
-            c.execute("UPDATE users SET balance=balance+? WHERE discord_id=?", (stake, uid))
-            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                      (uid, "payout", stake, f"roulette:{rid}|refund", iso(now_local())))
-        c.execute("UPDATE rounds SET status='CANCELLED', resolved_at=? WHERE rid=?", (iso(now_local()), rid))
-    await interaction.response.send_message(f"Round **{ClaimView.get_round_label(rid)}** cancelled and bets refunded.", ephemeral=True)
-# ---- Lotto (configurable draw) ----
-
-# These are ONLY defaults. The real values are stored in state["lotto_config"].
-TICKET_COST     = 10_000
-LOTTO_WINNERS   = 1               # we keep 1 winner (ClaimView already assumes 1)
-LOTTO_WL_COUNT  = 10              # default WL gifts if no config saved yet
-SHOP_NAME       = "Shop YaEli"
-
-LOTTO_CONFIG_KEY = "lotto_config"
-
-def _lotto_defaults() -> dict:
-    return {
-        "day": "Saturday",                # draw day name
-        "time": "20:00",                  # HH:MM (24h)
-        "prize": LOTTO_WL_COUNT,         # WL gifts for the single winner
-        "shop_name": SHOP_NAME,
-        "shop_url": SHOP_YAELI_URL,      # from your env
-    }
-
-
-def get_lotto_config() -> dict:
-    """Read lotto config from DB, falling back to sane defaults."""
-    base = _lotto_defaults()
-    raw = get_state(LOTTO_CONFIG_KEY)
-    if not raw:
-        return base
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return base
-    for k in base.keys():
-        if k in data and data[k] not in (None, ""):
-            base[k] = data[k]
-    return base
-
-
-def set_lotto_config(cfg: dict) -> None:
-    base = _lotto_defaults()
-    base.update(cfg)
-    set_state(LOTTO_CONFIG_KEY, json.dumps(base))
-
-
-# override previous next_draw_dt with a configurable one
-def next_draw_dt(ref: datetime | None = None) -> datetime:
-    """
-    Next draw datetime using the configured day & time.
-    Always at least 'next' occurrence (never in the past).
-    """
-    cfg = get_lotto_config()
-    ref = ref or now_london()
-
-    # day of week
-    day_name = str(cfg.get("day", "Saturday")).strip().lower()
-    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    try:
-        target_wd = days.index(day_name)
-    except ValueError:
-        target_wd = 5  # Saturday fallback
-
-    # time (HH:MM 24h)
-    time_str = str(cfg.get("time", "20:00")).strip()
-    try:
-        h_str, m_str = time_str.split(":", 1)
-        hour = max(0, min(23, int(h_str)))
-        minute = max(0, min(59, int(m_str)))
-    except Exception:
-        hour, minute = 20, 0
-
-    days_ahead = (target_wd - ref.weekday()) % 7
-    candidate = (ref + timedelta(days=days_ahead)).replace(
-        hour=hour, minute=minute, second=0, microsecond=0
-    )
-    if candidate <= ref:
-        candidate += timedelta(days=7)
-    return candidate
-
-
-# --- buy tickets (unchanged coins logic) ---
-@bot.tree.command(name="eh_buyticket", description="Buy tickets for this week’s Lotto")
-@app_commands.describe(count="How many tickets (1-100)")
-async def eh_buyticket(interaction: discord.Interaction, count: int = 1):
-    if count <= 0 or count > 100:
-        return await interaction.response.send_message("You can buy between 1 and 100 tickets at once.", ephemeral=True)
-    uid = str(interaction.user.id)
-    cost = TICKET_COST * count
-    bal = get_balance(uid)
-    if bal < cost:
-        return await interaction.response.send_message(f"Not enough coins. Need **{cost}**, you have **{bal}**.", ephemeral=True)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (cost, uid))
-        c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                  (uid, "redeem", -cost, f"tickets {count}", iso(now_local())))
-        wk = week_id()
-        for _ in range(count):
-            c.execute("INSERT INTO tickets(week_id,discord_id,ts) VALUES(?,?,?)", (wk, uid, iso(now_local())))
-    await interaction.response.send_message(f"🎟️ Bought **{count}** ticket(s) for this week’s Lotto. Good luck!", ephemeral=True)
-
-
-# --- view lotto status ---
-@bot.tree.command(name="eh_lotto", description="Show weekly lotto status")
-async def eh_lotto(interaction: discord.Interaction):
-    cfg = get_lotto_config()
-    wk = week_id()
-    uid = str(interaction.user.id)
-
-    draw_dt = next_draw_dt()
-    draw_str = draw_dt.strftime("%a %d %b %Y • %H:%M %Z")
-    left = human_left(draw_dt)
-
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=?", (wk,))
-        total = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM tickets WHERE week_id=? AND discord_id=?", (wk, uid))
-        mine = c.fetchone()[0]
-
-    msg = (
-        f"🎟️ **Weekly Lotto** — Week {wk}\n"
-        f"Draw: every **{cfg['day']}** at **{cfg['time']}** "
-        f"(next draw **{draw_str}** — in {left}).\n"
-        f"Total tickets: **{total}** • Your tickets: **{mine}**\n"
-        f"Prize: **{cfg['prize']} WL gifts** from **{cfg['shop_name']}** to **1** winner."
-    )
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-# --- config modal (admin) ---
-class LottoConfigModal(discord.ui.Modal, title="Configure Weekly Lotto"):
-    day = discord.ui.TextInput(
-        label="Draw day (Mon–Sun)",
-        placeholder="Saturday",
-        max_length=10
-    )
-    time = discord.ui.TextInput(
-        label="Draw time (HH:MM 24h)",
-        placeholder="20:00",
-        max_length=5
-    )
-    prize = discord.ui.TextInput(
-        label="WL gifts for the winner",
-        placeholder="10",
-        max_length=5
-    )
-    shop = discord.ui.TextInput(
-        label="Shop name | optional URL",
-        placeholder="Shop YaEli | https://…",
-        max_length=200
-    )
-
-    def __init__(self, cfg: dict):
-        super().__init__()
-        # pre-fill current values
-        self.day.default = cfg.get("day", "Saturday")
-        self.time.default = cfg.get("time", "20:00")
-        self.prize.default = str(cfg.get("prize", LOTTO_WL_COUNT))
-        combo = cfg.get("shop_name", SHOP_NAME)
-        url = cfg.get("shop_url", SHOP_YAELI_URL)
-        if url:
-            combo = f"{combo} | {url}"
-        self.shop.default = combo
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not user_is_admin(interaction.user):
-            return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-
-        # day
-        day = str(self.day.value or "Saturday").strip()
-        if not day:
-            day = "Saturday"
-
-        # time
-        t_raw = str(self.time.value or "20:00").strip()
-        try:
-            h_str, m_str = t_raw.split(":", 1)
-            hour = max(0, min(23, int(h_str)))
-            minute = max(0, min(59, int(m_str)))
-            t_norm = f"{hour:02d}:{minute:02d}"
-        except Exception:
-            t_norm = "20:00"
-
-        # prize
-        try:
-            prize = int(str(self.prize.value or "10").strip())
-        except Exception:
-            prize = LOTTO_WL_COUNT
-        if prize <= 0:
-            prize = LOTTO_WL_COUNT
-
-        # shop name + optional URL
-        raw_shop = str(self.shop.value or SHOP_NAME).strip()
-        if "|" in raw_shop:
-            name_part, url_part = raw_shop.split("|", 1)
-            shop_name = name_part.strip() or SHOP_NAME
-            shop_url = url_part.strip() or SHOP_YAELI_URL
+        if c_roll > o_roll:
+            winner = self.challenger
+            pot = int(self.stake * 2)
+            change_balance(str(winner.id), pot, "duel_win")
+            embed.description = f"🏆 **{winner.mention} WINS THE POT OF {pot:,}!**\nBetter luck next time, {self.opponent.mention}."
+        elif o_roll > c_roll:
+            winner = self.opponent
+            pot = int(self.stake * 2)
+            change_balance(str(winner.id), pot, "duel_win")
+            embed.description = f"🏆 **{winner.mention} WINS THE POT OF {pot:,}!**\n{self.challenger.mention} just lost it all."
         else:
-            shop_name = raw_shop or SHOP_NAME
-            shop_url = SHOP_YAELI_URL
+            change_balance(str(self.challenger.id), self.stake, "duel_refund")
+            change_balance(str(self.opponent.id), self.stake, "duel_refund")
+            embed.description = "🤝 **It's a tie! Stakes refunded.**"
 
-        set_lotto_config({
-            "day": day,
-            "time": t_norm,
-            "prize": prize,
-            "shop_name": shop_name,
-            "shop_url": shop_url,
-        })
+        await itx.response.edit_message(content=None, embed=embed, view=None)
 
-        await interaction.response.send_message(
-            f"✅ Lotto updated: draw every **{day}** at **{t_norm}**, "
-            f"prize **{prize} WL gifts** from **{shop_name}**.",
-            ephemeral=True
-        )
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, itx: discord.Interaction, button: discord.ui.Button):
+        if itx.user.id != self.opponent.id: return
+        await itx.response.edit_message(content=f"❌ {self.opponent.mention} was too scared to duel.", embed=None, view=None)
 
-@bot.tree.command(name="eh_lotto_config", description="(admin) Configure lotto draw day/time & prize")
-@app_commands.default_permissions(manage_guild=True)
-async def eh_lotto_config(interaction: discord.Interaction):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    cfg = get_lotto_config()
-    await interaction.response.send_modal(LottoConfigModal(cfg))
+# ---------------- Roulette Views ----------------
 
+class RouletteBetView(discord.ui.View):
+    def __init__(self, rid: str): super().__init__(timeout=None); self.rid = rid
+    @discord.ui.button(label="RED", style=discord.ButtonStyle.danger, emoji="🎯")
+    async def bet_red(self, itx, _): await itx.response.send_modal(BetModal(self.rid, "RED"))
+    @discord.ui.button(label="BLACK", style=discord.ButtonStyle.primary, emoji="🎯")
+    async def bet_black(self, itx, _): await itx.response.send_modal(BetModal(self.rid, "BLACK"))
+    @discord.ui.button(label="GREEN", style=discord.ButtonStyle.success, emoji="🎯")
+    async def bet_green(self, itx, _): await itx.response.send_modal(BetModal(self.rid, "GREEN"))
+    @discord.ui.button(label="NUMBER", style=discord.ButtonStyle.secondary, emoji="🔢")
+    async def bet_num(self, itx, _): await itx.response.send_modal(BetModal(self.rid, "NUMBER"))
 
-# --- draw lotto (admin) ---
-@bot.tree.command(name="eh_drawlotto", description="(Admin) Draw this week’s lotto")
-@app_commands.default_permissions(manage_guild=True)
-async def eh_drawlotto(interaction: discord.Interaction):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
+class BetModal(discord.ui.Modal):
+    def __init__(self, rid, choice):
+        super().__init__(title=f"Bet: {choice}")
+        self.rid = rid; self.choice = choice
+        self.stake_input = discord.ui.TextInput(label="Stake Amount", placeholder=f"Min {ROUL_MIN_BET}", required=True)
+        self.add_item(self.stake_input)
+        if choice == "NUMBER":
+            self.num_input = discord.ui.TextInput(label="Number (0-36)", placeholder="17", max_length=2)
+            self.add_item(self.num_input)
 
-    cfg = get_lotto_config()
-    wk = week_id()
+    async def on_submit(self, itx: discord.Interaction):
+        try:
+            amt = int(self.stake_input.value)
+            target = self.choice
+            if self.choice == "NUMBER":
+                n = int(self.num_input.value)
+                if not (0 <= n <= 36): raise ValueError
+                target = f"NUM:{n}"
+        except: return await itx.response.send_message("Invalid inputs.", ephemeral=True)
 
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT id, discord_id FROM tickets WHERE week_id=?", (wk,))
-        all_tix = c.fetchall()
+        uid = str(itx.user.id)
+        if get_balance(uid) < amt: return await itx.response.send_message("You're too broke for that bet!", ephemeral=True)
+        
+        change_balance(uid, -amt, "bet", f"roulette:{self.rid}")
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT INTO bets(rid, channel_id, discord_id, choice, stake, ts) VALUES(?,?,?,?,?,?)",
+                         (self.rid, str(itx.channel_id), uid, target, amt, iso(now_local())))
+        await itx.response.send_message(f"✅ Bet of **{amt:,}** on **{target}** placed! Good luck, high roller.", ephemeral=True)
 
-    if not all_tix:
-        return await interaction.response.send_message(f"No tickets for Week {wk}.", ephemeral=True)
+class LottoConfigModal(discord.ui.Modal, title="Configure Weekly Lotto"):
+    day = discord.ui.TextInput(label="Draw Day (Mon-Sun)", placeholder="Saturday", max_length=10)
+    time = discord.ui.TextInput(label="Draw Time (HH:MM)", placeholder="20:00", max_length=5)
+    prize = discord.ui.TextInput(label="Jackpot Amount (WL Gifts)", placeholder="10", max_length=5)
+    winners = discord.ui.TextInput(label="Number of Winners", placeholder="1", max_length=2)
+    shop = discord.ui.TextInput(label="Shop Name", placeholder="Shop YaEli", max_length=50)
 
-    seed = f"LOTTO-{wk}-{int(now_local().timestamp())}-{random.randint(1, 1_000_000)}"
-    random.seed(seed)
-    winner_ticket = random.choice(all_tix)
-    winner_id = winner_ticket[1]
+    def __init__(self, current_cfg):
+        super().__init__()
+        self.day.default = current_cfg.get("day", "Saturday")
+        self.time.default = current_cfg.get("time", "20:00")
+        self.prize.default = str(current_cfg.get("prize", 10))
+        self.winners.default = str(current_cfg.get("winners", 1))
+        self.shop.default = current_cfg.get("shop_name", "Shop YaEli")
 
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO lotto_draws(week_id,run_at,winner_id,seed,status) VALUES(?,?,?,?,?)",
-                  (wk, iso(now_local()), winner_id, seed, "DONE"))
-        c.execute("""INSERT INTO prizes(winner_id,kind,amount,meta,status,created_ts,updated_ts)
-                     VALUES(?,?,?,?,?,?,?)""",
-                  (winner_id, "wl", cfg["prize"],
-                   json.dumps({"shop": cfg["shop_name"], "week": wk}),
-                   "pending", iso(now_local()), iso(now_local())))
-        prize_id = c.lastrowid
+    async def on_submit(self, itx: discord.Interaction):
+        try:
+            p = int(self.prize.value)
+            w = int(self.winners.value)
+            cfg = {"day": self.day.value, "time": self.time.value, "prize": p, "winners": max(1, w), "shop_name": self.shop.value, "shop_url": SHOP_YAELI_URL}
+            set_lotto_config(cfg)
+            await itx.response.send_message("✅ Lotto updated!", ephemeral=True)
+        except:
+            await itx.response.send_message("❌ Invalid numbers.", ephemeral=True)
 
-    member = interaction.guild.get_member(int(winner_id))
-    mention = member.mention if member else f"<@{winner_id}>"
+# ---------------- Commands (Public) ----------------
 
-    embed = discord.Embed(
-        title="🎉 Weekly Lotto Winner!",
-        description=f"{mention} wins **{cfg['prize']}** wishlist gifts from **[{cfg['shop_name']}]({cfg['shop_url']})**.",
-        color=discord.Color.gold()
-    )
+@bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
+async def eh_join(itx: discord.Interaction):
+    uid = str(itx.user.id)
+    ensure_user(uid)
+    await itx.response.send_message(f"Welcome! Total: **{get_balance(uid):,}**", ephemeral=True)
 
-    # Winner gets a claim button via Prize flow
-    await interaction.channel.send(embed=embed, view=ClaimView(prize_id))
-    await interaction.response.send_message("Winner posted.", ephemeral=True)
+@bot.tree.command(name="eh_balance", description="Check balance")
+async def eh_balance(itx: discord.Interaction, user: discord.Member = None):
+    target = user or itx.user
+    bal = get_balance(str(target.id))
+    await itx.response.send_message(f"💰 {target.display_name}: **{bal:,}** coins.", ephemeral=(user is None))
 
+@bot.tree.command(name="eh_send", description="Send coins to another player")
+async def eh_send(itx: discord.Interaction, user: discord.Member, amount: int):
+    if amount <= 0: return await itx.response.send_message("Stop being stingy.", ephemeral=True)
+    if user.id == itx.user.id: return await itx.response.send_message("You can't send money to yourself, silly.", ephemeral=True)
+    uid = str(itx.user.id)
+    if get_balance(uid) < amount: return await itx.response.send_message("You don't have enough coins!", ephemeral=True)
+    change_balance(uid, -amount, "transfer", f"to {user.id}")
+    change_balance(str(user.id), amount, "transfer", f"from {itx.user.id}")
+    await itx.response.send_message(f"💸 {itx.user.mention} sent **{amount:,}** coins to {user.mention}!")
 
-@bot.tree.command(name="eh_fulfil_done", description="(Admin) Mark a WL fulfilment done")
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.describe(queue_id="Queue ID from /eh_fulfil_next")
-async def eh_fulfil_done(interaction: discord.Interaction, queue_id: int):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT prize_id FROM prize_queue WHERE id=?", (queue_id,))
-        row = c.fetchone()
-        if not row:
-            return await interaction.response.send_message("Queue ID not found.", ephemeral=True)
-        prize_id = row[0]
-        c.execute("UPDATE prize_queue SET status='fulfilled', updated_ts=? WHERE id=?", (iso(now_local()), queue_id))
-        c.execute("UPDATE prizes SET status='fulfilled', updated_ts=? WHERE id=?", (iso(now_local()), prize_id))
-    await interaction.response.send_message(f"Marked fulfilment queue **#{queue_id}** as fulfilled ✅", ephemeral=True)
+@bot.tree.command(name="eh_coinflip", description="Double or Nothing (High Risk!)")
+async def eh_coinflip(itx: discord.Interaction, amount: int, choice: str):
+    if choice.lower() not in ["heads", "tails"]: return await itx.response.send_message("Choose heads or tails.", ephemeral=True)
+    uid = str(itx.user.id)
+    if get_balance(uid) < amount: return await itx.response.send_message("You're too broke for this bet.", ephemeral=True)
+    await itx.response.send_message(f"🪙 Flipping for **{amount:,}**...")
+    await asyncio.sleep(2)
+    outcome = random.choice(["heads", "tails"])
+    if choice.lower() == outcome:
+        new_bal = change_balance(uid, amount, "coinflip_win")
+        await itx.edit_original_response(content=f"🎉 **It's {outcome.upper()}!** You doubled your money. New balance: **{new_bal:,}**")
+    else:
+        new_bal = change_balance(uid, -amount, "coinflip_lose")
+        await itx.edit_original_response(content=f"💀 **It's {outcome.upper()}!** You lost it all. New balance: **{new_bal:,}**")
 
-# ---- Utilities ----
-@bot.tree.command(name="eh_roundreset", description="(Admin) Force-unlock this channel if a round is stuck")
-@app_commands.default_permissions(manage_guild=True)
-async def eh_roundreset(interaction: discord.Interaction):
-    if not user_is_admin(interaction.user):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-    rid = get_state(round_key(interaction.channel.id))
-    if not rid:
-        return await interaction.response.send_message("No open round to reset (state already clear).", ephemeral=True)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE rounds SET status='CANCELLED', resolved_at=? WHERE rid=?",
-                  (iso(now_local()), rid))
-    set_state(round_key(interaction.channel.id), None)
-    await interaction.response.send_message(f"Force-reset round **{ClaimView.get_round_label(rid)}** — channel unlocked.", ephemeral=True)
+@bot.tree.command(name="eh_dice_duel", description="Challenge someone for their coins! (Winner takes all)")
+async def eh_dice_duel(itx: discord.Interaction, opponent: discord.Member, stake: int):
+    if stake <= 0 or opponent.id == itx.user.id: return
+    if get_balance(str(itx.user.id)) < stake: return await itx.response.send_message("You don't have enough for this duel.", ephemeral=True)
+    view = DiceDuelView(itx.user, opponent, stake)
+    await itx.response.send_message(f"⚔️ {itx.user.mention} challenged {opponent.mention} to a **{stake:,} coin duel**! Higher roll wins the pot.", view=view)
 
-# ---------------- Sync & Ready ----------------
+@bot.tree.command(name="eh_buyticket", description="Buy Lotto tickets")
+async def eh_buyticket(itx: discord.Interaction, count: int = 1):
+    uid = str(itx.user.id); cost = TICKET_COST * count
+    if get_balance(uid) < cost: return await itx.response.send_message("Insufficient coins.", ephemeral=True)
+    change_balance(uid, -cost, "buy_ticket", f"lotto x{count}")
+    wk = now_local().strftime("%Y-%W")
+    with sqlite3.connect(DB_PATH) as conn:
+        for _ in range(count): conn.execute("INSERT INTO tickets(week_id, discord_id, ts) VALUES(?,?,?)", (wk, uid, iso(now_local())))
+    await itx.response.send_message(f"🎟️ Bought {count} tickets!", ephemeral=True)
+
+# ---------------- Commands (Admin Only) ----------------
+
+@bot.tree.command(name="eh_lotto_config", description="(Admin) Configure lotto draw")
+async def eh_lotto_config(itx: discord.Interaction):
+    if not user_is_admin(itx): return await itx.response.send_message("No permission.", ephemeral=True)
+    await itx.response.send_modal(LottoConfigModal(get_lotto_config()))
+
+@bot.tree.command(name="eh_drawlotto", description="(Admin) Draw winners with suspense!")
+async def eh_drawlotto(itx: discord.Interaction):
+    if not user_is_admin(itx): return await itx.response.send_message("No permission.", ephemeral=True)
+    wk = now_local().strftime("%Y-%W")
+    with sqlite3.connect(DB_PATH) as conn: rows = conn.execute("SELECT discord_id FROM tickets WHERE week_id=?", (wk,)).fetchall()
+    if not rows: return await itx.response.send_message("No entries.", ephemeral=True)
+    await itx.response.send_message("🔥 **STARTING DRAW...** 🥁"); msg = await itx.original_response()
+    for f in ["🔎 Searching database...", "🌪️ Shuffling tickets...", "✨ WINNERS FOUND!"]: 
+        await asyncio.sleep(1.5); await msg.edit(content=f)
+    cfg = get_lotto_config(); unique = list(set([r[0] for r in rows])); random.shuffle(unique)
+    winners = unique[:cfg["winners"]]
+    embed = discord.Embed(title="🎉 LOTTO WINNERS!", color=discord.Color.gold())
+    embed.description = "\n".join([f"🏆 <@{w}>" for w in winners]) + f"\n\nEach wins **{cfg['prize']} Gifts**!"
+    await itx.channel.send(embed=embed)
+    for w in winners: await itx.channel.send(f"Hey <@{w}>! Pick your prize choice below:", view=LottoClaimView(w, cfg["prize"]))
+
+@bot.tree.command(name="eh_openround", description="(Admin) Open roulette betting")
+async def eh_openround(itx: discord.Interaction, seconds: int = 120):
+    if not user_is_admin(itx): return await itx.response.send_message("Only admins can start Roulette, babes.", ephemeral=True)
+    rid = f"R-{itx.channel_id}-{int(time.time())}"
+    expires = now_local() + timedelta(seconds=seconds)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO rounds(rid, channel_id, status, opened_by, expires_at) VALUES(?,?,?,?,?)", (rid, str(itx.channel_id), "OPEN", str(itx.user.id), iso(expires)))
+    set_state(f"active_round:{itx.channel_id}", rid)
+    embed = discord.Embed(title="🎰 Roulette Open", description=f"Ending in <t:{int(expires.timestamp())}:R>", color=discord.Color.gold())
+    await itx.channel.send(embed=embed, view=RouletteBetView(rid))
+    await itx.response.send_message("Round opened.", ephemeral=True)
+
+@bot.tree.command(name="eh_resolve", description="(Admin) Spin the wheel!")
+async def eh_resolve(itx: discord.Interaction):
+    if not user_is_admin(itx): return await itx.response.send_message("Only admins can spin the wheel!", ephemeral=True)
+    rid = get_state(f"active_round:{itx.channel_id}")
+    if not rid: return await itx.response.send_message("No active round.", ephemeral=True)
+    await itx.response.defer(ephemeral=True)
+    roll = random.randint(0, 36)
+    color = "GREEN" if roll == 0 else ("RED" if roll in RED_NUMBERS else "BLACK")
+    winners = []
+    with sqlite3.connect(DB_PATH) as conn:
+        bets = conn.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,)).fetchall()
+        for uid, ch, st in bets:
+            payout = 0
+            if ch == color: payout = int(st * (PAYOUT_GREEN if color == "GREEN" else PAYOUT_RED_BLACK))
+            elif ch == f"NUM:{roll}": payout = int(st * PAYOUT_NUMBER)
+            if payout > 0:
+                change_balance(uid, payout, "payout", f"roulette win:{rid}")
+                winners.append(f"<@{uid}>: +{payout:,}")
+    set_state(f"active_round:{itx.channel_id}", None)
+    badge = render_chip_badge(color, roll)
+    embed = discord.Embed(title=f"🎰 Result: {color} #{roll}", color=discord.Color.green() if color=="GREEN" else discord.Color.red())
+    embed.description = "\n".join(winners) if winners else "Everyone lost! 💀"
+    if badge:
+        file = discord.File(badge, filename="res.png"); embed.set_image(url="attachment://res.png")
+        await itx.channel.send(embed=embed, file=file)
+    else: await itx.channel.send(embed=embed)
+    await itx.followup.send("Resolved.")
+
+@bot.tree.command(name="eh_leaderboard", description="Show top players")
+async def eh_leaderboard(itx: discord.Interaction, mode: str = "balance", public: bool = True):
+    await itx.response.defer(ephemeral=not public)
+    with sqlite3.connect(DB_PATH) as conn:
+        if mode == "balance": rows = conn.execute("SELECT discord_id, balance FROM users ORDER BY balance DESC LIMIT 10").fetchall()
+        else: rows = conn.execute("SELECT discord_id, SUM(amount) FROM tx WHERE kind IN ('bet','payout') GROUP BY discord_id ORDER BY SUM(amount) DESC LIMIT 10").fetchall()
+    embed = discord.Embed(title=f"🏆 Leaderboard - {mode.title()}", color=discord.Color.gold())
+    embed.description = "\n".join([f"{i+1}. <@{r[0]}> — **{r[1]:,}**" for i, r in enumerate(rows)]) or "No data."
+    await itx.followup.send(embed=embed)
+
 @bot.event
 async def on_ready():
-    print(f"[EliHaus] Logged in as {bot.user} | TZ={TIMEZONE_NAME}")
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            await bot.tree.sync(guild=guild)
-            print(f"[EliHaus] Slash commands synced to guild {GUILD_ID}")
-        else:
-            await bot.tree.sync()
-            print("[EliHaus] Slash commands synced globally")
-    except Exception as e:
-        print(f"[EliHaus] Slash sync failed: {e}")
-
-@bot.tree.command(name="eh_sync", description="(admin) Re-sync slash commands")
-async def eh_sync(interaction: discord.Interaction):
-    guild = interaction.guild
-    # user may be a User (no guild_permissions) outside guild context
-    member = interaction.user if isinstance(interaction.user, discord.Member) else None
-
-    can_manage = bool(member and member.guild_permissions.manage_guild)
-    is_owner = bool(guild and guild.owner_id == interaction.user.id)
-
-    if not (can_manage or is_owner):
-        return await interaction.response.send_message(
-            "You don’t have permission.", ephemeral=True
-        )
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        # fast guild sync (for this server)
-        if guild:
-            await bot.tree.sync(guild=guild)
-        # global sync (keeps globals in step)
-        await bot.tree.sync()
-        msg = "✅ Synced slash commands (guild + global)."
-    except Exception as e:
-        msg = f"❌ Sync error: {e!s}"
-
-    await interaction.followup.send(msg, ephemeral=True)
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    # keep prefix commands working (even though we use slash now)
-    await bot.process_commands(message)
-
-    # ignore bots/DMs/system
-    if message.author.bot or not message.guild:
-        return
-    if message.type != discord.MessageType.default:
-        return
-
-    # if there is an open round in this channel, count & bump
-    o = get_open_round(message.channel.id)
-    if not o:
-        STICKY_COUNT.pop(message.channel.id, None)
-        return
-
-    rid, exp = o
-    # don't bump if nearly done to avoid spammy last seconds
-    if (exp - now_local()).total_seconds() <= 10:
-        return
-
-    STICKY_COUNT[message.channel.id] = STICKY_COUNT.get(message.channel.id, 0) + 1
-    if STICKY_COUNT[message.channel.id] >= STICKY_AFTER_MSGS:
-        STICKY_COUNT[message.channel.id] = 0
-        try:
-            await _bump_round_message(message.channel, rid)
-        except Exception:
-            pass
-from datetime import timedelta
-
-def _mention_or_id(guild: discord.Guild | None, uid: str) -> str:
-    m = guild.get_member(int(uid)) if guild else None
-    return m.mention if m else f"<@{uid}>"
-
-@bot.tree.command(name="eh_leaderboard", description="Show top players by balance or roulette net")
-@app_commands.describe(
-    mode="balance (default), roulette_week, or roulette_all",
-    public="Post in channel (True) or show only to you (False)"
-)
-async def eh_leaderboard(
-    interaction: discord.Interaction,
-    mode: str = "balance",
-    public: bool = True
-):
-    # prevent 3s timeout
-    await interaction.response.defer(ephemeral=not public, thinking=True)
-
-    mode = (mode or "balance").lower().strip()
-    guild = interaction.guild
-
-    try:
-        if mode == "balance":
-            with db() as conn:
-                c = conn.cursor()
-                c.execute("SELECT discord_id, balance FROM users ORDER BY balance DESC LIMIT 10")
-                rows = c.fetchall()
-            title = "🏆 EliHaus Leaderboard — Balance"
-            footer = "Top 10 richest players"
-            items = [(_mention_or_id(guild, uid), bal) for uid, bal in rows]
-
-        elif mode in ("roulette_week", "roulette_all"):
-            # net = payouts − bets; bets are stored negative already
-            q_time = ""
-            params = ()
-            if mode == "roulette_week":
-                since = (now_local() - timedelta(days=7)).isoformat()
-                q_time = "AND ts >= ?"
-                params = (since,)
-
-            with db() as conn:
-                c = conn.cursor()
-                c.execute(f"""
-                    SELECT discord_id, COALESCE(SUM(amount),0) AS net
-                    FROM tx
-                    WHERE kind IN ('bet','payout') {q_time}
-                    GROUP BY discord_id
-                    HAVING net != 0
-                    ORDER BY net DESC
-                    LIMIT 10
-                """, params)
-                rows = c.fetchall()
-
-            title = "🎰 Roulette Leaderboard — Weekly Net" if mode == "roulette_week" \
-                    else "🎰 Roulette Leaderboard — All-Time Net"
-            footer = "Net = payouts − bets"
-            items = [(_mention_or_id(guild, uid), net) for uid, net in rows]
-
-        else:
-            await interaction.followup.send(
-                "Unknown mode. Use `balance`, `roulette_week`, or `roulette_all`.",
-                ephemeral=not public
-            )
-            return
-
-        e = discord.Embed(title=title, color=discord.Color.gold(), timestamp=now_local())
-        if not items:
-            e.description = "_No data yet._"
-        else:
-            medals = ["🥇","🥈","🥉"]
-            lines = []
-            for i, (name, val) in enumerate(items, start=1):
-                tag = medals[i-1] if i <= 3 else f"{i:>2}."
-                lines.append(f"{tag} {name} — **{val:,}**")
-            e.description = "\n".join(lines)
-        e.set_footer(text=footer)
-
-        await interaction.channel.send(embed=e, ephemeral=not public)
-
-    except Exception as e:
-        # surface the exact error to you ephemerally
-        await interaction.followup.send(
-            f"⚠️ Leaderboard error: `{type(e).__name__}: {e}`",
-            ephemeral=True
-        )
-# =========================
-# 🎰 Emoji Slots (Shared Pot) — FULL ADD-ON
-# =========================
-
-# ---- Config ----
-SLOTS_COST = int(os.getenv("SLOTS_COST", "500"))            # coins per spin
-SLOTS_SEED = int(os.getenv("SLOTS_SEED", "1000"))           # minimum pot floor per channel
-SLOTS_MAX_SPINS = int(os.getenv("SLOTS_MAX_SPINS", "5"))    # spins per modal submission
-SLOTS_EMOJIS = ["🍒", "🍋", "🍇", "🍀", "⭐", "💎", "7️⃣"]
-
-# payout rules (from the pot; pot never goes below seed)
-SLOTS_PAYOUT_TRIPLE = float(os.getenv("SLOTS_PAYOUT_TRIPLE", "0.80"))  # 80% of (pot - seed)
-SLOTS_PAYOUT_DOUBLE = int(os.getenv("SLOTS_PAYOUT_DOUBLE", "2000"))    # flat, capped by available
-
-# ---- DB bootstrap (safe to call multiple times) ----
-def _init_slots_tables():
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS slots_spins(
-            id INTEGER PRIMARY KEY,
-            channel_id TEXT,
-            discord_id TEXT,
-            r1 TEXT, r2 TEXT, r3 TEXT,
-            win INTEGER,            -- amount paid out
-            pot_before INTEGER,     -- pot before paying win
-            ts TEXT
-        )""")
-
-# call it once at import
-_init_slots_tables()
-
-# ---- State keys ----
-def _slots_pot_key(channel_id: int) -> str:
-    return f"slots:pot:{channel_id}"
-
-def _slots_msg_key(channel_id: int) -> str:
-    return f"slots:msg:{channel_id}"
-
-# ---- Pot helpers ----
-def _outcome_from_spin(n: int) -> str:
-    red = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-    if n == 0:
-        return "green"
-    return "red" if n in red else "black"
-
-def _format_winners_lines(guild: discord.Guild, winners: list[tuple[str, int]], limit: int = 5) -> str:
-    """
-    winners: list of (discord_id, payout)
-    Returns up to top N lines like '@User — 2500'.
-    """
-    if not winners:
-        return "—"
-    # sort by payout desc, then take top N
-    winners = sorted(winners, key=lambda x: x[1], reverse=True)[:limit]
-    lines = []
-    for uid, amount in winners:
-        m = guild.get_member(int(uid))
-        who = m.mention if m else f"<@{uid}>"
-        lines.append(f"{who} — **{amount}**")
-    return "\n".join(lines)
-
-     
-def edit_round_message(bot, channel, rid: int, embed, view=None):
-    """Safe from non-async code: schedules the edit on the loop."""
-    return asyncio.create_task(_edit_round_message(bot, channel, rid, embed, view))
-
-
-# ---- UI: Modal + View ----
-class SlotsModal(discord.ui.Modal, title="Spin the Slots"):
-    spins = discord.ui.TextInput(
-        label=f"How many spins? (1–{SLOTS_MAX_SPINS})",
-        placeholder="1",
-        required=True,
-        max_length=2
-    )
-
-    def __init__(self, channel_id: int):
-        super().__init__(timeout=180)
-        self.channel_id = channel_id
-
-    
-    # inside class SlotsModal(...)
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        sent = False
-        try:
-            # parse spins
-            try:
-                n = int(str(self.spins.value).strip())
-            except Exception:
-                await interaction.followup.send("Enter a valid number of spins (1–5).", ephemeral=True)
-                return
-            if n < 1 or n > SLOTS_MAX_SPINS:
-                await interaction.followup.send(f"Spins must be between 1 and {SLOTS_MAX_SPINS}.", ephemeral=True)
-                return
-    
-            # user + balance checks
-            uid = str(interaction.user.id)
-            ensure_user(uid)
-    
-            total_cost = SLOTS_COST * n
-            bal = get_balance(uid)
-            if bal < total_cost:
-                await interaction.followup.send(
-                    f"Insufficient coins. **{total_cost}** required for {n} spin(s). Balance **{bal}**.",
-                    ephemeral=True
-                )
-                return
-    
-            # charge upfront
-            with db() as conn:
-                c = conn.cursor()
-                c.execute("UPDATE users SET balance = balance - ? WHERE discord_id = ?", (total_cost, uid))
-                c.execute(
-                    "INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                    (uid, "bet", -total_cost, f"slots|entry x{n}", iso(now_local()))
-                )
-    
-            # add to pot
-            pot = get_slots_pot(self.channel_id) + total_cost
-            set_slots_pot(self.channel_id, pot)
-    
-            # run spins
-            total_win = 0
-            lines = []
-            last_roll = "-"
-            last_win = 0
-    
-            for _ in range(n):
-                r1 = random.choice(SLOTS_EMOJIS)
-                r2 = random.choice(SLOTS_EMOJIS)
-                r3 = random.choice(SLOTS_EMOJIS)
-    
-                available = max(0, pot - SLOTS_SEED)
-                win = 0
-                if r1 == r2 == r3:
-                    win = int(available * SLOTS_PAYOUT_TRIPLE)
-                elif (r1 == r2) or (r1 == r3) or (r2 == r3):
-                    win = min(SLOTS_PAYOUT_DOUBLE, available)
-    
-                pot_before = pot
-                if win > 0:
-                    pot -= win
-                    set_slots_pot(self.channel_id, pot)
-                    total_win += win
-    
-                with db() as conn:
-                    c = conn.cursor()
-                    c.execute(
-                        "INSERT INTO slots_spins(channel_id,discord_id,r1,r2,r3,win,pot_before,ts) VALUES(?,?,?,?,?,?,?,?)",
-                        (str(self.channel_id), uid, r1, r2, r3, win, pot_before, iso(now_local()))
-                    )
-    
-                sign = f"+{win}" if win else "–"
-                lines.append(f"{r1} {r2} {r3}   {sign}")
-                last_roll = f"{r1}{r2}{r3}"
-                last_win = win
-    
-            # pay out bundle if any
-            if total_win > 0:
-                with db() as conn:
-                    c = conn.cursor()
-                    c.execute("UPDATE users SET balance = balance + ? WHERE discord_id = ?", (total_win, uid))
-                    c.execute(
-                        "INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                        (uid, "payout", total_win, f"slots|bundle x{n}", iso(now_local()))
-                    )
-    
-            # refresh the panel (safe)
-            try:
-                mid = get_state(_slots_msg_key(self.channel_id))
-                if mid:
-                    panel = await interaction.channel.fetch_message(int(mid))
-                    e = panel.embeds[0] if panel.embeds else discord.Embed(color=discord.Color.gold())
-                    e.title = "🎰 Emoji Slots — Shared Pot"
-                    e.clear_fields()
-                    e.description = (
-                        f"Entry: **{SLOTS_COST}** coins per spin.\n"
-                        f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
-                        f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**.\n"
-                        f"Pot never drops below seed **{SLOTS_SEED}**."
-                    )
-                    e.add_field(name="Pot",  value=str(get_slots_pot(self.channel_id)), inline=True)
-                    e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
-                    e.add_field(
-                        name="Last roll",
-                        value=f"{last_roll} {'+'+str(last_win) if last_win else '–'}",
-                        inline=False
-                    )
-                    await panel.edit(embed=e, view=SlotsView(self.channel_id))
-            except Exception as e:
-                print("SLOTS panel refresh error:", e)
-    
-            # ephemeral summary (single send)
-            show = 6
-            body = "\n".join(lines[:show]) + (f"\n.. and {len(lines)-show} more." if len(lines) > show else "")
-            await interaction.followup.send(
-                f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
-                ephemeral=True
-            )
-            sent = True
-    
-        except Exception:
-            import traceback
-            print("SLOTS on_submit fatal:\n", traceback.format_exc())
-            if not sent:
-                await interaction.followup.send("❌ Something went wrong running your spins.", ephemeral=True)
-
-        # --- results & output ---
-        try:
-            # EPHEMERAL SUMMARY
-            show = 6
-            body = "\n".join(lines[:show]) + (f"\n.. and {len(lines)-show} more." if len(lines) > show else "")
-            await interaction.followup.send(
-                f"**Spins:** {n}\n{body}\n\n**Total won:** {total_win}\n**Pot now:** {get_slots_pot(self.channel_id)}",
-                ephemeral=True
-            )
-            sent = True
-        
-            # PUBLIC attachment (optional)
-            import io, time
-            details = []
-            details.append(f"User: {interaction.user} ({interaction.user.id})")
-            details.append(f"Spins: {n}")
-            details.extend(lines)
-            details.append("")
-            details.append(f"Total won: {total_win}")
-            details.append(f"Pot now: {get_slots_pot(self.channel_id)}")
-            txt = "\n".join(details)
-        
-            buf = io.BytesIO(txt.encode("utf-8"))
-            filename = f"slots_{interaction.user.id}_{int(time.time())}.txt"
-            file = discord.File(buf, filename=filename)
-        
-            public_summary = (
-                f"{interaction.user.mention} spun **{n}x** • "
-                f"{'+'+str(total_win) if total_win else 'no win'} • "
-                f"Pot **{get_slots_pot(self.channel_id)}**"
-            )
-            await interaction.followup.send(public_summary, file=file)
-        
-        except Exception as e:
-            import traceback
-            print("SLOTS results send error:\n", traceback.format_exc())
-            if not sent:
-                await interaction.followup.send("❌ Something went wrong sending your result.", ephemeral=True)
-                sent = True
-        finally:
-            if not sent:
-                try:
-                    await interaction.followup.send("✅ Done.", ephemeral=True)
-                except Exception:
-                    pass
-
-
-class SlotsView(discord.ui.View):
-    def __init__(self, channel_id: int, timeout: int | None = None):
-        super().__init__(timeout=timeout or None)
-        self.channel_id = channel_id
-
-    @discord.ui.button(label="Spin 🎰", style=discord.ButtonStyle.primary)
-    async def spin(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SlotsModal(self.channel_id))
-
-# ---- Slash Commands ----
-# (admin) open a panel in the current channel
-from discord import app_commands
-import discord
-
-# Optional: scope to your guild for instant updates (set GUILD_ID earlier)
-# @app_commands.guilds(discord.Object(id=GUILD_ID))
-@bot.tree.command(name="slots_open", description="(admin) Open a Shared-Pot Emoji Slots panel here")
-async def slots_open(interaction: discord.Interaction):
-    # basic admin gate
-    if not (interaction.user.guild_permissions.manage_guild or interaction.guild.owner_id == interaction.user.id):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-
-    # 1) ACK within 3s so Discord doesn't expire the interaction
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    try:
-        pot = get_slots_pot(interaction.channel.id)
-
-        e = discord.Embed(
-            title="🎰 Emoji Slots — Shared Pot",
-            description=(
-                f"Entry: **{SLOTS_COST}** coins per spin.\n"
-                f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
-                f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**.\n"
-                f"Pot never drops below seed **{SLOTS_SEED}**."
-            ),
-            color=discord.Color.gold()
-        )
-        e.add_field(name="Pot",  value=str(get_slots_pot(interaction.channel.id)), inline=True)
-        e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
-
-
-        view = SlotsView(interaction.channel.id)
-        msg = await interaction.channel.send(embed=e, view=view)
-
-        set_state(_slots_msg_key(interaction.channel.id), str(msg.id))
-        try:
-            await msg.pin(reason="EliHaus Slots panel")
-        except Exception:
-            pass
-
-        # 3) Final reply
-        await interaction.followup.send("Slots panel posted.", ephemeral=True)
-
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed to post panel: {e}", ephemeral=True)
-
-
-# user: get a jump link to panel
-@bot.tree.command(name="slots_panel", description="Get a jump link to the Slots panel")
-async def slots_panel(interaction: discord.Interaction):
-    mid = get_state(_slots_msg_key(interaction.channel.id))
-    if not mid:
-        return await interaction.response.send_message("No Slots panel in this channel.", ephemeral=True)
-    url = f"https://discord.com/channels/{interaction.guild.id}/{interaction.channel.id}/{mid}"
-    await interaction.response.send_message(f"⤵️ Jump to Slots panel:\n{url}", ephemeral=True)
-
-# (admin) reset pot to seed & refresh the panel
-@bot.tree.command(name="slots_reset", description="(admin) Reset the Slots pot to the seed amount")
-async def slots_reset(interaction: discord.Interaction):
-    if not (interaction.user.guild_permissions.manage_guild or interaction.guild.owner_id == interaction.user.id):
-        return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-
-    # set pot
-    set_slots_pot(interaction.channel.id, SLOTS_SEED)
-
-    # refresh the panel
-    try:
-        mid = get_state(_slots_msg_key(interaction.channel.id))
-        if mid:
-            panel = await interaction.channel.fetch_message(int(mid))
-            # get (or build) embed
-            if panel.embeds:
-                e = panel.embeds[0]
-            else:
-                e = discord.Embed(color=discord.Color.gold())
-                e.title = "🎰 Emoji Slots — Shared Pot"
-
-            # (optional) pull last roll; safe fallback if none
-            last_roll = "-"
-            last_win = 0
-            try:
-                with db() as conn:
-                    c = conn.cursor()
-                    row = c.execute(
-                        "SELECT r1,r2,r3,win FROM slots_spins WHERE channel_id=? ORDER BY ts DESC LIMIT 1",
-                        (str(interaction.channel.id),)
-                    ).fetchone()
-                    if row:
-                        r1, r2, r3, w = row
-                        last_roll = f"{r1}{r2}{r3}"
-                        last_win = int(w or 0)
-            except Exception:
-                pass  # ignore if table empty, etc.
-
-            # rebuild embed
-            e.clear_fields()
-            e.description = (
-                f"Entry: **{SLOTS_COST}** coins per spin.\n"
-                f"Triples pay **{int(SLOTS_PAYOUT_TRIPLE*100)}%** of available pot.\n"
-                f"Doubles pay **{SLOTS_PAYOUT_DOUBLE}**×.\n"
-                f"Pot never drops below seed **{SLOTS_SEED}**."
-            )
-            e.add_field(name="Pot", value=str(get_slots_pot(interaction.channel.id)), inline=True)
-            e.add_field(name="Seed", value=str(SLOTS_SEED), inline=True)
-            e.add_field(
-                name="Last roll",
-                value=f"{last_roll} {'+'+str(last_win) if last_win else '–'}",
-                inline=False
-            )
-            await panel.edit(embed=e, view=SlotsView(interaction.channel.id))
-    except Exception as e:
-        print("slots_reset panel refresh error:", e)
-
-    # final ack
-    await interaction.response.send_message("Slots pot reset to seed.", ephemeral=True)
-
-
-# top winners (by total coins won) in this channel
-@bot.tree.command(name="slots_top", description="Show top Slots winners (by total coins won) for this channel")
-async def slots_top(interaction: discord.Interaction):
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""SELECT discord_id, COALESCE(SUM(win),0) AS total
-                     FROM slots_spins
-                     WHERE channel_id=?
-                     GROUP BY discord_id
-                     HAVING total>0
-                     ORDER BY total DESC
-                     LIMIT 10""", (str(interaction.channel.id),))
-        rows = c.fetchall()
-    if not rows:
-        return await interaction.response.send_message("No wins yet.", ephemeral=True)
-    lines = []
-    for i, (uid, total) in enumerate(rows, start=1):
-        m = interaction.guild.get_member(int(uid))
-        name = m.mention if m else f"<@{uid}>"
-        lines.append(f"{i}. {name} — **{total}**")
-    await interaction.response.send_message("**Slots Top Winners**\n" + "\n".join(lines), ephemeral=True)
-
-
-# =========================
-# 💸 Withdraw → WL Gifts (Modal + Ticket + Admin Approve)
-# =========================
-
-# --- Config (uses your existing env defaults) ---
-# WL_COINS_PER_GIFT, MIN_WL_GIFTS, MAX_WL_GIFTS, SHOP_NAME, SHOP_YAELI_URL,
-# TICKETS_STAFF_ROLE_ID must already exist in your file (they do).
-
-# --- DB bootstrap ---
-def _init_withdraw_tables():
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS withdraw_requests(
-            id INTEGER PRIMARY KEY,
-            discord_id TEXT,
-            coins INTEGER,
-            gifts INTEGER,
-            imvu_name TEXT,
-            imvu_profile TEXT,  -- wishlist or profile URL
-            note TEXT,
-            status TEXT,        -- 'pending','approved','rejected'
-            ticket_channel_id TEXT,
-            message_id TEXT,    -- review message id inside ticket
-            reviewer_id TEXT,   -- admin who approved/rejected
-            review_note TEXT,
-            created_ts TEXT,
-            updated_ts TEXT
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_withdraw_user_status ON withdraw_requests(discord_id, status)")
-_init_withdraw_tables()
-
-# --- Slash: open withdraw modal ---
-@bot.tree.command(name="eh_withdraw", description="Convert your coins to WL gifts (opens a ticket; admin approval)")
-async def eh_withdraw(interaction: discord.Interaction):
-    await interaction.response.send_modal(WithdrawWLModal())
-
-
-# --- Modal: player fills details; creates ticket only if valid ---
-class WithdrawWLModal(discord.ui.Modal, title="Withdraw → WL Gifts"):
-    amount_coins = discord.ui.TextInput(
-        label=f"Coins to convert (multiple of {WL_COINS_PER_GIFT})",
-        placeholder=str(WL_COINS_PER_GIFT),
-        required=True,
-        max_length=12
-    )
-    imvu_handle_or_url = discord.ui.TextInput(
-        label="IMVU Username or Profile URL",
-        placeholder="e.g. YaEli   or   https://www.imvu.com/…",
-        required=True,
-        max_length=200
-    )
-    note = discord.ui.TextInput(
-        label="Notes for staff (optional)",
-        required=False,
-        style=discord.TextStyle.paragraph,
-        max_length=200
-    )
-
-    def _extract_username(self, text: str):
-        raw = (text or "").strip()
-        if not raw: return None, None, None
-        if raw.startswith(("http://","https://")):
-            import urllib.parse as _u
-            try:
-                p = _u.urlparse(raw)
-                q = _u.parse_qs(p.query)
-                if "av" in q and q["av"]:
-                    uname = q["av"][0]
-                else:
-                    uname = p.path.strip("/").split("/")[-1] or None
-            except Exception:
-                uname = None
-            profile_url = raw
-        else:
-            uname = raw
-            profile_url = f"https://www.imvu.com/catalog/web_mypage.php?av={uname}"
-        wishlist_url = f"https://www.imvu.com/catalog/web_wishlist.php?av={uname}" if uname else None
-        return uname, profile_url, wishlist_url
-
-    async def on_submit(self, interaction: discord.Interaction):
-        uid = str(interaction.user.id)
-        ensure_user(uid)
-
-        # Parse/validate amount
-        try:
-            coins = int(str(self.amount_coins).strip().replace("_",""))
-        except Exception:
-            return await interaction.response.send_message("Enter a valid number of coins.", ephemeral=True)
-        if coins <= 0 or coins % WL_COINS_PER_GIFT != 0:
-            return await interaction.response.send_message(
-                f"Amount must be a positive multiple of **{WL_COINS_PER_GIFT}**.", ephemeral=True
-            )
-        gifts = coins // WL_COINS_PER_GIFT
-        if gifts < MIN_WL_GIFTS or gifts > MAX_WL_GIFTS:
-            return await interaction.response.send_message(
-                f"Gift count must be between **{MIN_WL_GIFTS}** and **{MAX_WL_GIFTS}**.", ephemeral=True
-            )
-
-        # Balance check
-        bal = get_balance(uid)
-        if bal < coins:
-            return await interaction.response.send_message(
-                f"Insufficient coins. Need **{coins}**, you have **{bal}**.", ephemeral=True
-            )
-
-        # Block duplicate pending
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM withdraw_requests WHERE discord_id=? AND status='pending'", (uid,))
-            if c.fetchone()[0] > 0:
-                return await interaction.response.send_message(
-                    "You already have a pending withdrawal ticket. Please wait for staff to process it.",
-                    ephemeral=True
-                )
-
-        # Parse IMVU handle/link
-        uname, profile_url, wishlist_url = self._extract_username(str(self.imvu_handle_or_url))
-        if not uname:
-            return await interaction.response.send_message("Please enter a valid IMVU username or profile link.", ephemeral=True)
-
-        # Create DB request
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""INSERT INTO withdraw_requests(discord_id,coins,gifts,imvu_name,imvu_profile,note,status,created_ts,updated_ts)
-                         VALUES(?,?,?,?,?,?,?,?,?)""",
-                      (uid, coins, gifts, uname, wishlist_url or profile_url or "", str(self.note or ""),
-                       "pending", iso(now_local()), iso(now_local())))
-            req_id = c.lastrowid
-
-        # Create private ticket (user + staff)
-        cat = await _get_or_create_tickets_category(interaction.guild)
-        if not cat:
-            return await interaction.response.send_message("Could not create a ticket channel. Please ping an admin.", ephemeral=True)
-
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
-        }
-        # add staff role if you have one...
-        if TICKETS_STAFF_ROLE_ID:
-            role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
-        
-        # ✅ add this line:
-        overwrites[interaction.guild.me] = discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, embed_links=True, attach_files=True, read_message_history=True, use_application_commands=True
-        )
-
-        if TICKETS_STAFF_ROLE_ID:
-            role = interaction.guild.get_role(TICKETS_STAFF_ROLE_ID)
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
-
-        ticket = await interaction.guild.create_text_channel(
-            f"wl-withdraw-{interaction.user.name[:16].lower()}-{req_id}",
-            category=cat, overwrites=overwrites, reason="WL withdraw request"
-        )
-
-        # Post admin review panel
-        embed = discord.Embed(
-            title=f"WL Withdraw Request #{req_id}",
-            description=(f"User: <@{uid}>\n"
-                         f"Coins → WL: **{coins} → {gifts}** (rate {WL_COINS_PER_GIFT}/WL)\n"
-                         f"IMVU: **{uname}**\n"
-                         f"[Profile/Wishlist]({wishlist_url or profile_url})"),
-            color=discord.Color.gold(),
-            timestamp=now_local()
-        )
-        if self.note:
-            embed.add_field(name="User note", value=str(self.note)[:200], inline=False)
-        embed.set_footer(text="Staff: review and approve or reject below.")
-
-        view = AdminWithdrawReviewView(req_id)
-        msg = await ticket.send(
-            content=(f"<@&{TICKETS_STAFF_ROLE_ID}>" if TICKETS_STAFF_ROLE_ID else "@here"),
-            embed=embed,
-            view=view
-        )
-
-        # Save ticket/message refs
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE withdraw_requests SET ticket_channel_id=?, message_id=?, updated_ts=? WHERE id=?",
-                      (str(ticket.id), str(msg.id), iso(now_local()), req_id))
-
-        # Final ack to user
-        await interaction.response.send_message(
-            f"✅ Request submitted. A private ticket was opened: {ticket.mention}",
-            ephemeral=True
-        )
-
-
-# --- Admin buttons inside the ticket ---
-class AdminWithdrawReviewView(discord.ui.View):
-    def __init__(self, request_id: int):
-        super().__init__(timeout=None)
-        self.request_id = request_id
-
-    @discord.ui.button(label="Approve & Deduct", style=discord.ButtonStyle.success, emoji="✅")
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-        await interaction.response.send_modal(AdminApproveWithdrawModal(self.request_id))
-
-    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="🛑")
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message("You don’t have permission.", ephemeral=True)
-        await interaction.response.send_modal(AdminRejectWithdrawModal(self.request_id))
-
-
-class DisabledReviewView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        for label, style in [("Approved", discord.ButtonStyle.success),
-                             ("Rejected", discord.ButtonStyle.danger)]:
-            self.add_item(discord.ui.Button(label=label, style=style, disabled=True))
-
-
-# --- Admin approve modal: deducts coins, creates prize & queue, marks approved ---
-class AdminApproveWithdrawModal(discord.ui.Modal, title="Approve WL Withdraw"):
-    coins = discord.ui.TextInput(
-        label="Confirm coins to deduct",
-        placeholder="e.g. 20000",
-        required=True,
-        max_length=12
-    )
-    note = discord.ui.TextInput(
-        label="Internal note (optional)",
-        required=False,
-        style=discord.TextStyle.paragraph,
-        max_length=200
-    )
-
-    def __init__(self, request_id: int):
-        super().__init__(timeout=180)
-        self.request_id = request_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message("You don’t have permission to approve.", ephemeral=True)
-
-        # Load request
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""SELECT discord_id, coins, gifts, status, ticket_channel_id, message_id, imvu_name, imvu_profile
-                         FROM withdraw_requests WHERE id=?""", (self.request_id,))
-            row = c.fetchone()
-        if not row:
-            return await interaction.response.send_message("Request not found.", ephemeral=True)
-
-        uid, coins_req, gifts_req, status, tchid, mid, uname, prof = row
-        if status != "pending":
-            return await interaction.response.send_message(f"Request is already **{status}**.", ephemeral=True)
-
-        # Parse confirmed coins
-        try:
-            coins_final = int(str(self.coins).strip().replace("_",""))
-        except Exception:
-            return await interaction.response.send_message("Enter a valid coin amount.", ephemeral=True)
-        if coins_final <= 0 or coins_final % WL_COINS_PER_GIFT != 0:
-            return await interaction.response.send_message(
-                f"Amount must be a positive multiple of **{WL_COINS_PER_GIFT}**.", ephemeral=True
-            )
-        gifts_final = coins_final // WL_COINS_PER_GIFT
-        if gifts_final < MIN_WL_GIFTS or gifts_final > MAX_WL_GIFTS:
-            return await interaction.response.send_message(
-                f"Gift count must be between **{MIN_WL_GIFTS}** and **{MAX_WL_GIFTS}**.", ephemeral=True
-            )
-
-        # Balance check at approval time
-        bal = get_balance(uid)
-        if bal < coins_final:
-            return await interaction.response.send_message(
-                f"User balance changed. Needs **{coins_final}**, has **{bal}**. Adjust and try again.", ephemeral=True
-            )
-
-        # Deduct & create prize + queue; mark approved
-        with db() as conn:
-            c = conn.cursor()
-            # deduct
-            c.execute("UPDATE users SET balance=balance-? WHERE discord_id=?", (coins_final, uid))
-            c.execute("INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                      (uid, "adjust", -coins_final, f"withdraw_to_wl:{gifts_final} gifts", iso(now_local())))
-            # prize + queue
-            c.execute("""INSERT INTO prizes(winner_id,kind,amount,meta,status,created_ts,updated_ts)
-                         VALUES(?,?,?,?,?,?,?)""",
-                      (uid, "wl", gifts_final, json.dumps({"shop": SHOP_NAME, "source": "user_withdraw"}), "pending",
-                       iso(now_local()), iso(now_local())))
-            prize_id = c.lastrowid
-            c.execute("""INSERT INTO prize_queue(prize_id,winner_id,imvu_name,imvu_profile,note,status,created_ts,updated_ts)
-                         VALUES(?,?,?,?,?,?,?,?)""",
-                      (prize_id, uid, uname, prof or "", str(self.note or ""), "ready", iso(now_local()), iso(now_local())))
-            # mark request
-            c.execute("""UPDATE withdraw_requests SET status='approved', reviewer_id=?, review_note=?, coins=?, gifts=?, updated_ts=?
-                         WHERE id=?""",
-                      (str(interaction.user.id), str(self.note or ""), coins_final, gifts_final, iso(now_local()), self.request_id))
-
-        # Update ticket panel & freeze buttons
-        try:
-            channel = interaction.guild.get_channel(int(tchid)) if tchid else None
-            if channel and mid:
-                msg = await channel.fetch_message(int(mid))
-                e = msg.embeds[0] if msg.embeds else discord.Embed(color=discord.Color.gold())
-                e.add_field(name="Status", value=f"✅ **Approved** by {interaction.user.mention}\nCoins: {coins_final} → WL: {gifts_final}", inline=False)
-                await msg.edit(embed=e, view=DisabledReviewView())
-        except Exception:
-            pass
-
-        await interaction.response.send_message("Approved and deducted. Prize queued for fulfilment. ✅", ephemeral=True)
-
-# --- Admin reject modal: marks rejected (no balance change) ---
-class AdminRejectWithdrawModal(discord.ui.Modal, title="Reject WL Withdraw"):
-    reason = discord.ui.TextInput(label="Reason (shown to user)", required=True, max_length=200)
-
-    def __init__(self, request_id: int):
-        super().__init__(timeout=180)
-        self.request_id = request_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not _is_admin_member(interaction.guild, interaction.user):
-            return await interaction.response.send_message("You don’t have permission to reject.", ephemeral=True)
-
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""SELECT ticket_channel_id, message_id, status FROM withdraw_requests WHERE id=?""",
-                      (self.request_id,))
-            row = c.fetchone()
-        if not row:
-            return await interaction.response.send_message("Request not found.", ephemeral=True)
-
-        tchid, mid, status = row
-        if status != "pending":
-            return await interaction.response.send_message(f"Request is already **{status}**.", ephemeral=True)
-
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("""UPDATE withdraw_requests SET status='rejected', reviewer_id=?, review_note=?, updated_ts=?
-                         WHERE id=?""",
-                      (str(interaction.user.id), str(self.reason), iso(now_local()), self.request_id))
-
-        try:
-            channel = interaction.guild.get_channel(int(tchid)) if tchid else None
-            if channel and mid:
-                msg = await channel.fetch_message(int(mid))
-                e = msg.embeds[0] if msg.embeds else discord.Embed(color=discord.Color.gold())
-                e.add_field(name="Status", value=f"❌ **Rejected** by {interaction.user.mention}\nReason: {str(self.reason)}", inline=False)
-                await msg.edit(embed=e, view=DisabledReviewView())
-        except Exception:
-            pass
-
-        await interaction.response.send_message("Rejected and left balance unchanged. ❌", ephemeral=True)
-@bot.event
-async def setup_hook():
-    # Register handlers for the custom_id buttons so old messages keep working after restarts
-    bot.add_view(RouletteBetView(0))   # rid here is a dummy; you’ll attach a fresh view to live rounds
-
-from discord import app_commands
-
-@bot.tree.command(name="eh_deposit", description="(owner-only) Deposit coins to a user")
-@app_commands.describe(
-    user="Member to receive coins",
-    amount="How many coins to deposit (positive integer)",
-    reason="Note (optional)"
-)
-async def eh_deposit(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    amount: int,
-    reason: str | None = None
-):
-    # --- PERMISSION: strictly you only ---
-    if interaction.user.id != DEPOSITOR_ID:
-        return await interaction.response.send_message("You can’t use this command.", ephemeral=True)
-
-    if amount <= 0:
-        return await interaction.response.send_message("Amount must be a positive number.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    # ensure recipient exists
-    uid = str(user.id)
-    ensure_user(uid)
-
-    try:
-        with db() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE users SET balance = balance + ? WHERE discord_id = ?", (amount, uid))
-            meta = f"deposit|by:{interaction.user.id}" + (f"|reason:{reason}" if reason else "")
-            c.execute(
-                "INSERT INTO tx(discord_id,kind,amount,meta,ts) VALUES(?,?,?,?,?)",
-                (uid, "deposit", amount, meta, iso(now_local()))
-            )
-        new_bal = get_balance(uid)
-    except Exception as e:
-        import traceback; print("DEPOSIT ERROR:\n", traceback.format_exc())
-        return await interaction.followup.send(f"❌ Deposit failed: {e}", ephemeral=True)
-
-    # confirm to you (ephemeral)
-    await interaction.followup.send(
-        f"✅ Deposited **{amount}** coins to {user.mention}. New balance: **{new_bal}**.",
-        ephemeral=True
-    )
-
-    # (optional) public log — delete if you want it silent
-    try:
-        await interaction.channel.send(
-            f"💰 Admin deposit: {user.mention} received **{amount}** coins."
-            + (f" _({reason})_" if reason else "")
-        )
-    except Exception:
-        pass
+    print(f"Logged in as {bot.user}"); await bot.tree.sync()
 
 bot.run(DISCORD_TOKEN)
-
