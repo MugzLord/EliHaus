@@ -34,6 +34,7 @@ DAILY_AMOUNT = 1_800
 WEEKLY_AMOUNT = 6_000
 STARTER_AMOUNT = 5_000
 TICKET_COST = 10_000
+WL_COINS_PER_GIFT = 100000  # Used for prize conversion
 
 # Roulette Config
 ROUND_SECONDS_DEFAULT = 120
@@ -45,6 +46,8 @@ ROUL_MAX_BET = 999_999_999_999_999 # Effectively no limit
 
 # Roles & Channels
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
+SHOP_YAELI_URL = os.getenv("SHOP_YAELI_URL", "")
+SHOP_NAME = "EliHaus Shop"
 
 # Paths
 DB_PATH = os.getenv("ELI_DB_PATH") or "elihaus.db"
@@ -78,7 +81,6 @@ init_db()
 # ---------------- Helpers ----------------
 
 def user_is_admin(itx: discord.Interaction) -> bool:
-    """Helper to check for Administrator permission or specific Admin role."""
     if itx.user.guild_permissions.administrator:
         return True
     if itx.user.guild_permissions.manage_guild:
@@ -97,9 +99,11 @@ def get_balance(uid: str) -> int:
 def change_balance(uid: str, delta: int, kind: str, meta: str = "") -> int:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
+        # Ensure user exists and update balance
         c.execute("""INSERT INTO users(discord_id, balance, joined_at) VALUES(?,?,?)
                      ON CONFLICT(discord_id) DO UPDATE SET balance = balance + ?""", 
                   (str(uid), delta, iso(now_local()), delta))
+        # Record transaction
         c.execute("INSERT INTO tx(discord_id, kind, amount, meta, ts) VALUES(?,?,?,?,?)",
                   (str(uid), kind, delta, meta, iso(now_local())))
         c.execute("SELECT balance FROM users WHERE discord_id=?", (str(uid),))
@@ -127,19 +131,12 @@ def get_lotto_config() -> dict:
     raw = get_state("lotto_config")
     if raw:
         return json.loads(raw)
-    return {
-        "day": "Saturday", 
-        "time": "20:00", 
-        "prize": 10, 
-        "winners": 1, 
-        "shop_name": "EliHaus Shop", 
-        "shop_url": ""
-    }
+    return {"day": "Saturday", "time": "20:00", "prize": 10, "winners": 1, "shop_name": "EliHaus Shop", "shop_url": ""}
 
 def set_lotto_config(cfg: dict):
     set_state("lotto_config", json.dumps(cfg))
 
-# ---------------- Claim System ----------------
+# ---------------- UI Components ----------------
 
 class LottoClaimModal(discord.ui.Modal, title="Claim Prize as WL Gifts"):
     imvu = discord.ui.TextInput(label="IMVU Username", placeholder="e.g. YaEli", required=True)
@@ -169,58 +166,6 @@ class LottoClaimView(discord.ui.View):
     @discord.ui.button(label="Claim WL Gifts", style=discord.ButtonStyle.primary, emoji="🎁")
     async def claim_wl(self, itx: discord.Interaction, button: discord.ui.Button):
         await itx.response.send_modal(LottoClaimModal(self.prize_count))
-
-# ---------------- PVP Dice Duel View ----------------
-
-class DiceDuelView(discord.ui.View):
-    def __init__(self, challenger, opponent, stake):
-        super().__init__(timeout=60)
-        self.challenger = challenger
-        self.opponent = opponent
-        self.stake = stake
-
-    @discord.ui.button(label="Accept Duel", style=discord.ButtonStyle.success, emoji="⚔️")
-    async def accept(self, itx: discord.Interaction, button: discord.ui.Button):
-        if itx.user.id != self.opponent.id:
-            return await itx.response.send_message("You weren't challenged, stay back!", ephemeral=True)
-        
-        if get_balance(str(self.challenger.id)) < self.stake or get_balance(str(self.opponent.id)) < self.stake:
-            return await itx.response.send_message("One of you is too broke to duel now.", ephemeral=True)
-
-        self.stop()
-        change_balance(str(self.challenger.id), -self.stake, "duel_stake", f"vs {self.opponent.id}")
-        change_balance(str(self.opponent.id), -self.stake, "duel_stake", f"vs {self.challenger.id}")
-
-        c_roll = random.randint(1, 100)
-        o_roll = random.randint(1, 100)
-        
-        embed = discord.Embed(title="⚔️ Dice Duel Results", color=discord.Color.gold())
-        embed.add_field(name=self.challenger.display_name, value=f"🎲 **{c_roll}**", inline=True)
-        embed.add_field(name=self.opponent.display_name, value=f"🎲 **{o_roll}**", inline=True)
-
-        if c_roll > o_roll:
-            winner = self.challenger
-            pot = int(self.stake * 2)
-            change_balance(str(winner.id), pot, "duel_win")
-            embed.description = f"🏆 **{winner.mention} WINS THE POT OF {pot:,}!**\nBetter luck next time, {self.opponent.mention}."
-        elif o_roll > c_roll:
-            winner = self.opponent
-            pot = int(self.stake * 2)
-            change_balance(str(winner.id), pot, "duel_win")
-            embed.description = f"🏆 **{winner.mention} WINS THE POT OF {pot:,}!**\n{self.challenger.mention} just lost it all."
-        else:
-            change_balance(str(self.challenger.id), self.stake, "duel_refund")
-            change_balance(str(self.opponent.id), self.stake, "duel_refund")
-            embed.description = "🤝 **It's a tie! Stakes refunded.**"
-
-        await itx.response.edit_message(content=None, embed=embed, view=None)
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
-    async def decline(self, itx: discord.Interaction, button: discord.ui.Button):
-        if itx.user.id != self.opponent.id: return
-        await itx.response.edit_message(content=f"❌ {self.opponent.mention} was too scared to duel.", embed=None, view=None)
-
-# ---------------- Roulette Views ----------------
 
 class RouletteBetView(discord.ui.View):
     def __init__(self, rid: str): super().__init__(timeout=None); self.rid = rid
@@ -255,55 +200,30 @@ class BetModal(discord.ui.Modal):
 
         uid = str(itx.user.id)
         if get_balance(uid) < amt: return await itx.response.send_message("You're too broke for that bet!", ephemeral=True)
-        
-        if amt < ROUL_MIN_BET:
-            return await itx.response.send_message(f"Minimum bet is {ROUL_MIN_BET:,} coins!", ephemeral=True)
+        if amt < ROUL_MIN_BET: return await itx.response.send_message(f"Minimum bet is {ROUL_MIN_BET:,}!", ephemeral=True)
 
         change_balance(uid, -amt, "bet", f"roulette:{self.rid}")
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("INSERT INTO bets(rid, channel_id, discord_id, choice, stake, ts) VALUES(?,?,?,?,?,?)",
                          (self.rid, str(itx.channel_id), uid, target, amt, iso(now_local())))
-        await itx.response.send_message(f"✅ Bet of **{amt:,}** on **{target}** placed! Good luck, high roller.", ephemeral=True)
+        await itx.response.send_message(f"✅ Bet of **{amt:,}** on **{target}** placed!", ephemeral=True)
 
-class LottoConfigModal(discord.ui.Modal, title="Configure Weekly Lotto"):
-    day = discord.ui.TextInput(label="Draw Day (Mon-Sun)", placeholder="Saturday", max_length=10)
-    time = discord.ui.TextInput(label="Draw Time (HH:MM)", placeholder="20:00", max_length=5)
-    prize = discord.ui.TextInput(label="Jackpot Amount (WL Gifts)", placeholder="10", max_length=5)
-    winners = discord.ui.TextInput(label="Number of Winners", placeholder="1", max_length=2)
-    shop = discord.ui.TextInput(label="Shop Name", placeholder="EliHaus Shop", max_length=50)
-
-    def __init__(self, current_cfg):
-        super().__init__()
-        self.day.default = current_cfg.get("day", "Saturday")
-        self.time.default = current_cfg.get("time", "20:00")
-        self.prize.default = str(current_cfg.get("prize", 10))
-        self.winners.default = str(current_cfg.get("winners", 1))
-        self.shop.default = current_cfg.get("shop_name", "EliHaus Shop")
-
-    async def on_submit(self, itx: discord.Interaction):
-        try:
-            p = int(self.prize.value)
-            w = int(self.winners.value)
-            cfg = {
-                "day": self.day.value, 
-                "time": self.time.value, 
-                "prize": p, 
-                "winners": max(1, w), 
-                "shop_name": self.shop.value, 
-                "shop_url": ""
-            }
-            set_lotto_config(cfg)
-            await itx.response.send_message("✅ Lotto updated!", ephemeral=True)
-        except:
-            await itx.response.send_message("❌ Invalid numbers.", ephemeral=True)
-
-# ---------------- Commands (Public) ----------------
+# ---------------- Commands ----------------
 
 @bot.tree.command(name="eh_join", description="Join EliHaus and get starter coins")
 async def eh_join(itx: discord.Interaction):
     uid = str(itx.user.id)
-    ensure_user(uid)
-    await itx.response.send_message(f"Welcome! Total: **{get_balance(uid):,}**", ephemeral=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        res = conn.execute("SELECT 1 FROM tx WHERE discord_id=? AND kind='starter' LIMIT 1", (uid,)).fetchone()
+    
+    if res:
+        return await itx.response.send_message(f"You've already joined! Balance: **{get_balance(uid):,}**", ephemeral=True)
+    
+    new_bal = change_balance(uid, STARTER_AMOUNT, "starter", "Initial join bonus")
+    await itx.response.send_message(
+        f"Welcome to EliHaus! 🥂 You've received **{STARTER_AMOUNT:,}** starter coins.\nTotal balance: **{new_bal:,}**", 
+        ephemeral=True
+    )
 
 @bot.tree.command(name="eh_balance", description="Check balance")
 async def eh_balance(itx: discord.Interaction, user: discord.Member = None):
@@ -311,92 +231,64 @@ async def eh_balance(itx: discord.Interaction, user: discord.Member = None):
     bal = get_balance(str(target.id))
     await itx.response.send_message(f"💰 {target.display_name}: **{bal:,}** coins.", ephemeral=(user is None))
 
-@bot.tree.command(name="eh_send", description="Send coins to another player")
-async def eh_send(itx: discord.Interaction, user: discord.Member, amount: int):
-    if amount <= 0: return await itx.response.send_message("Stop being stingy.", ephemeral=True)
-    if user.id == itx.user.id: return await itx.response.send_message("You can't send money to yourself, silly.", ephemeral=True)
+@bot.tree.command(name="eh_daily", description="Claim your daily coins")
+async def eh_daily(itx: discord.Interaction):
     uid = str(itx.user.id)
-    if get_balance(uid) < amount: return await itx.response.send_message("You don't have enough coins!", ephemeral=True)
-    change_balance(uid, -amount, "transfer", f"to {user.id}")
-    change_balance(str(user.id), amount, "transfer", f"from {itx.user.id}")
-    await itx.response.send_message(f"💸 {itx.user.mention} sent **{amount:,}** coins to {user.mention}!")
-
-@bot.tree.command(name="eh_coinflip", description="Double or Nothing (High Risk!)")
-async def eh_coinflip(itx: discord.Interaction, amount: int, choice: str):
-    if choice.lower() not in ["heads", "tails"]: return await itx.response.send_message("Choose heads or tails.", ephemeral=True)
-    uid = str(itx.user.id)
-    if get_balance(uid) < amount: return await itx.response.send_message("You're too broke for this bet.", ephemeral=True)
-    await itx.response.send_message(f"🪙 Flipping for **{amount:,}**...")
-    await asyncio.sleep(2)
-    outcome = random.choice(["heads", "tails"])
-    if choice.lower() == outcome:
-        new_bal = change_balance(uid, amount, "coinflip_win")
-        await itx.edit_original_response(content=f"🎉 **It's {outcome.upper()}!** You doubled your money. New balance: **{new_bal:,}**")
-    else:
-        new_bal = change_balance(uid, -amount, "coinflip_lose")
-        await itx.edit_original_response(content=f"💀 **It's {outcome.upper()}!** You lost it all. New balance: **{new_bal:,}**")
-
-@bot.tree.command(name="eh_dice_duel", description="Challenge someone for their coins! (Winner takes all)")
-async def eh_dice_duel(itx: discord.Interaction, opponent: discord.Member, stake: int):
-    if stake <= 0 or opponent.id == itx.user.id: return
-    if get_balance(str(itx.user.id)) < stake: return await itx.response.send_message("You don't have enough for this duel.", ephemeral=True)
-    view = DiceDuelView(itx.user, opponent, stake)
-    await itx.response.send_message(f"⚔️ {itx.user.mention} challenged {opponent.mention} to a **{stake:,} coin duel**! Higher roll wins the pot.", view=view)
-
-@bot.tree.command(name="eh_buyticket", description="Buy Lotto tickets")
-async def eh_buyticket(itx: discord.Interaction, count: int = 1):
-    uid = str(itx.user.id); cost = TICKET_COST * count
-    if get_balance(uid) < cost: return await itx.response.send_message("Insufficient coins.", ephemeral=True)
-    change_balance(uid, -cost, "buy_ticket", f"lotto x{count}")
-    wk = now_local().strftime("%Y-%W")
+    ensure_user(uid)
     with sqlite3.connect(DB_PATH) as conn:
-        for _ in range(count): conn.execute("INSERT INTO tickets(week_id, discord_id, ts) VALUES(?,?,?)", (wk, uid, iso(now_local())))
-    await itx.response.send_message(f"🎟️ Bought {count} tickets!", ephemeral=True)
+        r = conn.execute("SELECT last_daily FROM users WHERE discord_id=?", (uid,)).fetchone()
+        last = datetime.fromisoformat(r[0]) if r and r[0] else None
+        if last and (now_local() - last) < timedelta(hours=24):
+            rem = timedelta(hours=24) - (now_local() - last)
+            h, m = divmod(int(rem.total_seconds()), 3600); m //= 60
+            return await itx.response.send_message(f"Try again in **{h}h {m}m**.", ephemeral=True)
+        
+        new_bal = change_balance(uid, DAILY_AMOUNT, "claim", "daily")
+        conn.execute("UPDATE users SET last_daily=? WHERE discord_id=?", (iso(now_local()), uid))
+    await itx.response.send_message(f"💰 Daily coins claimed! **+{DAILY_AMOUNT:,}** balance.", ephemeral=True)
 
-# ---------------- Commands (Admin Only) ----------------
+@bot.tree.command(name="eh_leaderboard", description="Show top players")
+async def eh_leaderboard(itx: discord.Interaction, mode: str = "balance", public: bool = True):
+    await itx.response.defer(ephemeral=not public)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if mode == "balance":
+                rows = conn.execute("SELECT discord_id, balance FROM users ORDER BY balance DESC LIMIT 10").fetchall()
+                title = "🏆 EliHaus Leaderboard — Balance"
+            else:
+                rows = conn.execute("SELECT discord_id, SUM(amount) FROM tx WHERE kind IN ('bet','payout') GROUP BY discord_id ORDER BY SUM(amount) DESC LIMIT 10").fetchall()
+                title = "🎰 Leaderboard — Roulette Net"
 
-@bot.tree.command(name="eh_lotto_config", description="(Admin) Configure lotto draw")
-async def eh_lotto_config(itx: discord.Interaction):
-    if not user_is_admin(itx): return await itx.response.send_message("No permission.", ephemeral=True)
-    await itx.response.send_modal(LottoConfigModal(get_lotto_config()))
-
-@bot.tree.command(name="eh_drawlotto", description="(Admin) Draw winners with suspense!")
-async def eh_drawlotto(itx: discord.Interaction):
-    if not user_is_admin(itx): return await itx.response.send_message("No permission.", ephemeral=True)
-    wk = now_local().strftime("%Y-%W")
-    with sqlite3.connect(DB_PATH) as conn: rows = conn.execute("SELECT discord_id FROM tickets WHERE week_id=?", (wk,)).fetchall()
-    if not rows: return await itx.response.send_message("No entries.", ephemeral=True)
-    await itx.response.send_message("🔥 **STARTING DRAW...** 🥁"); msg = await itx.original_response()
-    for f in ["🔎 Searching database...", "🌪️ Shuffling tickets...", "✨ WINNERS FOUND!"]: 
-        await asyncio.sleep(1.5); await msg.edit(content=f)
-    cfg = get_lotto_config(); unique = list(set([r[0] for r in rows])); random.shuffle(unique)
-    winners = unique[:cfg["winners"]]
-    embed = discord.Embed(title="🎉 LOTTO WINNERS!", color=discord.Color.gold())
-    embed.description = "\n".join([f"🏆 <@{w}>" for w in winners]) + f"\n\nEach wins **{cfg['prize']} Gifts**!"
-    await itx.channel.send(embed=embed)
-    for w in winners: await itx.channel.send(f"Hey <@{w}>! Click below to claim your prize:", view=LottoClaimView(w, cfg["prize"]))
+        embed = discord.Embed(title=title, color=discord.Color.gold())
+        lines = [f"{i+1}. <@{r[0]}> — **{r[1]:,}**" for i, r in enumerate(rows)]
+        embed.description = "\n".join(lines) if lines else "No data yet."
+        await itx.followup.send(embed=embed)
+    except Exception as e:
+        await itx.followup.send(f"⚠️ Leaderboard error: `{e}`")
 
 @bot.tree.command(name="eh_openround", description="(Admin) Open roulette betting")
 async def eh_openround(itx: discord.Interaction, seconds: int = 120):
-    if not user_is_admin(itx): return await itx.response.send_message("Only admins can start Roulette, babes.", ephemeral=True)
+    if not user_is_admin(itx): return await itx.response.send_message("No permission.", ephemeral=True)
     rid = f"R-{itx.channel_id}-{int(time.time())}"
     expires = now_local() + timedelta(seconds=seconds)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("INSERT INTO rounds(rid, channel_id, status, opened_by, expires_at) VALUES(?,?,?,?,?)", (rid, str(itx.channel_id), "OPEN", str(itx.user.id), iso(expires)))
     set_state(f"active_round:{itx.channel_id}", rid)
-    embed = discord.Embed(title="🎰 Roulette Open", description=f"Ending in <t:{int(expires.timestamp())}:R>", color=discord.Color.gold())
+    embed = discord.Embed(title="🎰 Roulette Open", description=f"Place your bets! Ending in <t:{int(expires.timestamp())}:R>", color=discord.Color.gold())
     await itx.channel.send(embed=embed, view=RouletteBetView(rid))
     await itx.response.send_message("Round opened.", ephemeral=True)
 
 @bot.tree.command(name="eh_resolve", description="(Admin) Spin the wheel!")
 async def eh_resolve(itx: discord.Interaction):
-    if not user_is_admin(itx): return await itx.response.send_message("Only admins can spin the wheel!", ephemeral=True)
+    if not user_is_admin(itx): return await itx.response.send_message("No permission.", ephemeral=True)
     rid = get_state(f"active_round:{itx.channel_id}")
     if not rid: return await itx.response.send_message("No active round.", ephemeral=True)
+    
     await itx.response.defer(ephemeral=True)
     roll = random.randint(0, 36)
     color = "GREEN" if roll == 0 else ("RED" if roll in RED_NUMBERS else "BLACK")
     color_emoji = "🟩" if color == "GREEN" else ("🟥" if color == "RED" else "⬛")
+    
     winners = []
     with sqlite3.connect(DB_PATH) as conn:
         bets = conn.execute("SELECT discord_id, choice, stake FROM bets WHERE rid=?", (rid,)).fetchall()
@@ -404,28 +296,19 @@ async def eh_resolve(itx: discord.Interaction):
             payout = 0
             if ch == color: payout = int(st * (PAYOUT_GREEN if color == "GREEN" else PAYOUT_RED_BLACK))
             elif ch == f"NUM:{roll}": payout = int(st * PAYOUT_NUMBER)
+            
             if payout > 0:
                 change_balance(uid, payout, "payout", f"roulette win:{rid}")
                 winners.append(f"<@{uid}>: +{payout:,}")
+
     set_state(f"active_round:{itx.channel_id}", None)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE rounds SET status='RESOLVED', outcome=? WHERE rid=?", (f"{color}:{roll}", rid))
     
-    embed = discord.Embed(
-        title=f"🎰 Roulette Result: {color_emoji} {color} #{roll}", 
-        color=discord.Color.green() if color=="GREEN" else (discord.Color.red() if color=="RED" else discord.Color.dark_grey())
-    )
+    embed = discord.Embed(title=f"🎰 Result: {color_emoji} {color} #{roll}", color=discord.Color.gold())
     embed.description = "**Winners:**\n" + ("\n".join(winners) if winners else "Everyone lost! 💀")
     await itx.channel.send(embed=embed)
     await itx.followup.send("Resolved.")
-
-@bot.tree.command(name="eh_leaderboard", description="Show top players")
-async def eh_leaderboard(itx: discord.Interaction, mode: str = "balance", public: bool = True):
-    await itx.response.defer(ephemeral=not public)
-    with sqlite3.connect(DB_PATH) as conn:
-        if mode == "balance": rows = conn.execute("SELECT discord_id, balance FROM users ORDER BY balance DESC LIMIT 10").fetchall()
-        else: rows = conn.execute("SELECT discord_id, SUM(amount) FROM tx WHERE kind IN ('bet','payout') GROUP BY discord_id ORDER BY SUM(amount) DESC LIMIT 10").fetchall()
-    embed = discord.Embed(title=f"🏆 Leaderboard - {mode.title()}", color=discord.Color.gold())
-    embed.description = "\n".join([f"{i+1}. <@{r[0]}> — **{r[1]:,}**" for i, r in enumerate(rows)]) or "No data."
-    await itx.followup.send(embed=embed)
 
 @bot.event
 async def on_ready():
